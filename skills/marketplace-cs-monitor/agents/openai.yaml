@@ -1,0 +1,7 @@
+﻿interface:
+  display_name: "마켓 CS 통합 모니터"
+  short_description: "스마트스토어·지그재그·에이블리 CS 변경 수집"
+  default_prompt: "Use $marketplace-cs-monitor to collect today's changed marketplace inquiries and prepare a masked review report."
+
+policy:
+  allow_implicit_invocation: true
