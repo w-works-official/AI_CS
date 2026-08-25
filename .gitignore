@@ -1,6 +1,7 @@
 node_modules/
 .next/
 dist/
+pages-dist/
 .wrangler/
 .vinext/
 .env
@@ -10,4 +11,3 @@ dist/
 *.zip
 .DS_Store
 Thumbs.db
-

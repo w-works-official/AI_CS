@@ -38,5 +38,4 @@ AI 초안의 `APPROVED`, `REJECTED`, `USED`는 내부 검수 상태이며 쇼핑
 
 ## 배포
 
-프론트에는 비밀 키를 사용하는 서버 라우트가 있으므로 정적 GitHub Pages만으로는 실데이터 연결을 유지할 수 없습니다. 소스는 GitHub에서 관리하고 실행 페이지는 서버 라우트를 지원하는 호스팅에 배포합니다.
-
+공개 검수 UI는 `https://w-works-official.github.io/AI_CS/`에서 정적 GitHub Pages로 제공합니다. GitHub Pages는 서버 라우트나 비밀 키를 실행할 수 없으므로, 브라우저는 별도 읽기 전용 프록시를 호출합니다. 프록시만 Apps Script 키를 보유하며 공개 프론트에는 키와 운영 Sheet ID가 포함되지 않습니다.

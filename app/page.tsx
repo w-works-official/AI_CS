@@ -2,6 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+declare global {
+  interface Window {
+    __CS_API_BASE_URL__?: string;
+  }
+}
+
 type CaseStatus = 'unanswered' | 'ai-ready' | 'review' | 'no-reply' | 'replied';
 type RawRow = Record<string, unknown>;
 type Message = { actor: 'customer' | 'seller'; time: string; text: string; image?: boolean };
@@ -103,8 +109,13 @@ function statusQuery(filter: 'all' | CaseStatus) {
   const state = { unanswered: 'NEEDS_REPLY', review: 'REVIEW', 'no-reply': 'NO_REPLY_REQUIRED', replied: 'ANSWERED' }[filter];
   return state ? `&reply_state=${state}` : '';
 }
+function apiPath(path: string) {
+  const publicApi = typeof window === 'undefined' ? '' : text(window.__CS_API_BASE_URL__);
+  if (!publicApi || !path.startsWith('/api/cs')) return path;
+  return `${publicApi}${path.slice('/api/cs'.length)}`;
+}
 async function getJson(path: string, signal?: AbortSignal) {
-  const response = await fetch(path, { cache: 'default', signal }); const payload = await response.json().catch(() => null);
+  const response = await fetch(apiPath(path), { cache: 'default', signal }); const payload = await response.json().catch(() => null);
   if (!response.ok || !payload?.ok) throw new Error(payload?.error ?? 'DATA_LOAD_FAILED'); return payload;
 }
 

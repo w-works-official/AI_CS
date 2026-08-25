@@ -8,12 +8,15 @@ type CacheEntry = { expiresAt: number; payload: unknown };
 const cacheScope = globalThis as typeof globalThis & { __pinkRocketCsCache?: Map<string, CacheEntry> };
 const responseCache = cacheScope.__pinkRocketCsCache ?? new Map<string, CacheEntry>();
 cacheScope.__pinkRocketCsCache = responseCache;
+const publicWebOrigin = process.env.CS_PUBLIC_WEB_ORIGIN ?? 'https://w-works-official.github.io';
 
 function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
   return NextResponse.json(body, {
     status,
     headers: {
       'Cache-Control': cacheSeconds > 0 ? `private, max-age=${cacheSeconds}, stale-while-revalidate=60` : 'private, no-store, max-age=0',
+      'Access-Control-Allow-Origin': publicWebOrigin,
+      'Vary': 'Origin',
       'X-Content-Type-Options': 'nosniff',
     },
   });

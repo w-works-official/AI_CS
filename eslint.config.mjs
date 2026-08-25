@@ -8,6 +8,7 @@ const eslintConfig = defineConfig([
   globalIgnores([
     '.next/**',
     'dist/**',
+    'pages-dist/**',
     'out/**',
     'build/**',
     'apps-script/**',

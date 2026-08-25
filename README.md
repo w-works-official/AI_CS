@@ -10,6 +10,14 @@
 - `docs/marketplace-cs-monitor-manual.md` — 실행 모드와 추천 프롬프트
 - `docs/ARCHITECTURE.md` — 데이터 흐름, 안전 경계, 배포 구조
 - `docs/CLAUDE-CODE.md` — Claude Code 포팅 범위와 설치 체크리스트
+- `github-pages/` — 공개 GitHub Pages 프론트 진입점
+- `.github/workflows/pages.yml` — `main` 변경 시 GitHub Pages 자동 배포
+
+## 공개 페이지
+
+- GitHub Pages: <https://w-works-official.github.io/AI_CS/>
+- 공개 정적 프론트에는 API 키나 시트 ID를 포함하지 않습니다.
+- 마스킹된 CS 데이터는 읽기 전용 프록시를 통해 조회합니다.
 
 ## 안전 경계
 
@@ -57,4 +65,3 @@ Copy-Item -Recurse -Force .\skills\marketplace-cs-monitor "$env:USERPROFILE\.cod
 ## 환경 설정
 
 Google Apps Script 설정과 시트 계약은 [apps-script/README.md](apps-script/README.md)를 참고하세요. 전체 구조는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)에 정리되어 있습니다.
-
