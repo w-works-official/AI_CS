@@ -24,12 +24,12 @@ assert.equal(config.name, "ai-cs-mcp-development");
 assert.equal(config.main, "worker/mcp-development.ts");
 assert.equal(config.workers_dev, true);
 assert.equal(config.preview_urls, false);
-assert.equal(config.limits?.cpu_ms, 10);
-assert.equal(config.vars?.AI_CS_RUNTIME_ENVIRONMENT, "development");
-assert.equal(config.vars?.AI_CS_PRODUCTION_ENABLED, "false");
-assert.equal(Object.keys(config.vars ?? {}).some((key) => key.startsWith("AI_CS_PROD_")), false);
+assert.equal(Object.hasOwn(config, "limits"), false);
+assert.equal(config.observability?.enabled, false);
+assert.equal(Object.hasOwn(config, "vars"), false);
+assert.equal(Object.hasOwn(config, "secrets"), false);
 
-for (const forbiddenBinding of ["ai", "d1_databases", "durable_objects", "kv_namespaces", "queues", "r2_buckets", "services", "triggers", "vectorize", "workflows"]) {
+for (const forbiddenBinding of ["ai", "analytics_engine_datasets", "browser", "d1_databases", "durable_objects", "hyperdrive", "kv_namespaces", "queues", "r2_buckets", "services", "tail_consumers", "triggers", "vectorize", "workflows"] ) {
   assert.equal(Object.hasOwn(config, forbiddenBinding), false, `Forbidden Cloudflare binding found: ${forbiddenBinding}`);
 }
 
@@ -40,6 +40,11 @@ console.log(JSON.stringify({
   free_worker_limit_bytes: maxFreeWorkerBytes,
   frontend_markers: 0,
   paid_bindings: 0,
+  plain_text_vars: 0,
+  secrets: 0,
+  observability: false,
+  free_plan_cpu_ms: 10,
+  cpu_limit_source: "workers_free_plan",
   environment: "development",
   production_enabled: false,
 }));

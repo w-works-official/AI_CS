@@ -8,26 +8,5 @@
   "preview_urls": false,
   "observability": {
     "enabled": false
-  },
-  "limits": {
-    "cpu_ms": 10
-  },
-  "vars": {
-    "NODE_ENV": "production",
-    "AI_CS_RUNTIME_ENVIRONMENT": "development",
-    "AI_CS_PUBLIC_ORIGIN": "https://ai-cs-mcp-development.REPLACE_WORKERS_SUBDOMAIN.workers.dev",
-    "AI_CS_RESOURCE_URL": "https://ai-cs-mcp-development.REPLACE_WORKERS_SUBDOMAIN.workers.dev/mcp",
-    "AI_CS_OAUTH_ISSUER": "https://REPLACE_OAUTH_ISSUER",
-    "AI_CS_OAUTH_JWKS_URL": "https://REPLACE_OAUTH_ISSUER/.well-known/jwks.json",
-    "AI_CS_OAUTH_AUDIENCE": "https://ai-cs-mcp-development.REPLACE_WORKERS_SUBDOMAIN.workers.dev/mcp",
-    "AI_CS_ALLOWED_ORIGINS": "https://chatgpt.com",
-    "AI_CS_PRODUCTION_ENABLED": "false"
-  },
-  "secrets": {
-    "required": [
-      "AI_CS_DEV_ALLOWED_SUBJECTS",
-      "AI_CS_DEV_APPS_SCRIPT_URL",
-      "AI_CS_DEV_APPS_SCRIPT_KEY"
-    ]
   }
 }
