@@ -119,6 +119,14 @@ function statusQuery(filter: 'all' | CaseStatus) {
   const state = { unanswered: 'NEEDS_REPLY', review: 'REVIEW', 'no-reply': 'NO_REPLY_REQUIRED', replied: 'ANSWERED' }[filter];
   return state ? `&reply_state=${state}` : '';
 }
+
+function sortCasesRecent(items: CsCase[]) {
+  return [...items].sort((a, b) => {
+    const aTime = Date.parse(a.updatedRaw || '');
+    const bTime = Date.parse(b.updatedRaw || '');
+    return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+  });
+}
 function apiPath(path: string) {
   const publicApi = typeof window === 'undefined' ? '' : text(window.__CS_API_BASE_URL__);
   if (!publicApi || !path.startsWith('/api/cs')) return path;
@@ -165,10 +173,10 @@ export default function Home() {
       setSelectedId((current) => first.items.some((item) => item.id === current) ? current : (first.items[0]?.id ?? ''));
       const [overviewPayload, rest] = await Promise.all([
         getJson('/api/cs?action=overview&fresh=1'),
-        first.total > first.items.length ? fetchCases(activeFilter, 47, 3, undefined, true) : Promise.resolve({ items: [], total: first.total }),
+        first.total > first.items.length ? fetchCases(activeFilter, 197, 3, undefined, true) : Promise.resolve({ items: [], total: first.total }),
       ]);
       if (requestId !== listRequestId.current) return;
-      setOverviewPayload(overviewPayload); setCases([...first.items, ...rest.items]); setLoadingMore(false);
+      setOverviewPayload(overviewPayload); setCases(sortCasesRecent([...first.items, ...rest.items])); setLoadingMore(false);
     } catch (cause) {
       if (requestId === listRequestId.current) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
     } finally {
@@ -185,10 +193,10 @@ export default function Home() {
         setSelectedId((current) => first.items.some((item) => item.id === current) ? current : (first.items[0]?.id ?? ''));
         const [payload, rest] = await Promise.all([
           getJson('/api/cs?action=overview', controller.signal),
-          first.total > first.items.length ? fetchCases(activeFilter, 47, 3, controller.signal) : Promise.resolve({ items: [], total: first.total }),
+          first.total > first.items.length ? fetchCases(activeFilter, 197, 3, controller.signal) : Promise.resolve({ items: [], total: first.total }),
         ]);
         if (requestId !== listRequestId.current) return;
-        setOverviewPayload(payload); setCases([...first.items, ...rest.items]); setLoadingMore(false);
+        setOverviewPayload(payload); setCases(sortCasesRecent([...first.items, ...rest.items])); setLoadingMore(false);
       }).catch((cause) => {
         if (requestId === listRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
       }).finally(() => { if (requestId === listRequestId.current) { setLoading(false); setLoadingMore(false); } });
@@ -243,7 +251,7 @@ export default function Home() {
       {error && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
       <section className="status-strip" aria-label="문의 상태 요약">{filters.slice(1).map((filter) => { const meta = statusMeta[filter.key as CaseStatus]; return <button key={filter.key} className={`stat-card ${activeFilter === filter.key ? 'selected' : ''}`} onClick={() => selectFilter(filter.key as CaseStatus)}><span className="stat-dot" style={{ background: meta.dot }} /><span>{filter.label}</span><strong>{countFor(filter.key as CaseStatus).toLocaleString()}</strong></button>; })}</section>
       <div className="desk-grid">
-        <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최근 {cases.length || 50}건 표시 {loadingMore ? '· 나머지 불러오는 중' : ''} · 민감정보 마스킹</p></div>
+        <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최신순 최대 {cases.length || 200}건 표시 {loadingMore ? '· 나머지 불러오는 중' : ''} · 민감정보 마스킹</p></div>
           <div className="case-list">{loading && !cases.length && <div className="empty-list loading-list"><span>⌁</span><strong>문의 목록을 불러오는 중입니다.</strong><p>구글시트 동기화 상태에 따라 약 5~15초 걸릴 수 있어요.</p></div>}{filteredCases.map((item) => { const meta = statusMeta[item.status]; return <button key={item.id} className={`case-item ${selected?.id === item.id ? 'active' : ''}`} onClick={() => selectCase(item.id)}><div className="case-item-top"><span className={`status-pill ${meta.tone}`}>{meta.shortLabel}</span><time>{item.updatedAt}</time></div><div className="case-title-row"><strong>{item.customer}</strong></div><p className="case-product">{item.product}</p><p className="case-preview">{item.preview}</p><div className="case-meta"><span className={`surface-tag ${item.surface}`}>{item.surface === 'chat' ? '● 채팅형' : '▤ 게시글형'}</span><span>{item.channel}</span><span>{item.category}</span></div></button>; })}{!loading && !filteredCases.length && <div className="empty-list">조건에 맞는 문의가 없습니다.</div>}</div>
         </section>
         <section className="conversation-column" aria-label="전체 대화">{!selected ? <div className="panel-empty"><span>⌁</span><strong>표시할 문의가 없습니다.</strong><p>상태 필터를 바꾸거나 데이터를 다시 불러와 주세요.</p></div> : <>
