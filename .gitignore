@@ -7,6 +7,9 @@ pages-dist/
 .env
 .env.local
 .env.*.local
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
 plugins/ai-cs/.app.json
 plugins/ai-cs/dist/
 plugins/ai-cs/*.zip

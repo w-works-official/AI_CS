@@ -40,4 +40,12 @@ AI 초안의 `APPROVED`, `REJECTED`, `USED`는 내부 검수 상태이며 쇼핑
 
 ## 배포
 
-플러그인과 MCP는 `.openai/hosting.json`의 기존 Sites 프로젝트를 재사용합니다. 개발 배포와 운영 배포는 같은 저장소를 사용하더라도 서로 다른 서버 비밀값과 OAuth 클라이언트를 가져야 합니다. GitHub Pages 정적 UI는 MCP/OAuth 서버가 아니며, 비밀값이나 운영 데이터 접근 권한을 포함해서는 안 됩니다.
+배포 표면은 서로 독립적으로 유지합니다.
+
+- 검수 UI: `main` 브랜치의 기존 GitHub Pages
+- 기존 검수 API: 현재 Sites production 배포(교체하거나 변경하지 않음)
+- development MCP: `mcp-development` 브랜치의 Cloudflare Workers Free 전용 Worker
+
+Cloudflare Worker는 `worker/mcp-development.ts`만 엔트리로 사용합니다. React, Next, Vinext, GitHub Pages 정적 자산과 Sites 설정은 Worker 번들에 포함하지 않습니다. Worker에는 development Apps Script 연결만 존재하며 `AI_CS_PRODUCTION_ENABLED=false`를 강제합니다. KV, D1, R2, Durable Objects, Queues, Workers AI, Cron Trigger 및 커스텀 도메인은 사용하지 않습니다.
+
+`.openai/hosting.json`, GitHub Pages 빌드 설정, 기존 Sites 배포와 기존 검수 API는 MCP 배포 대상이 아닙니다.
