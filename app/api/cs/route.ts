@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { normalizeReviewRequest } from './policy';
+import { normalizeReviewRequest, normalizeSyncRequest } from './policy';
 
 export const dynamic = 'force-dynamic';
 
@@ -97,16 +97,17 @@ export async function POST(request: NextRequest) {
   let target: ReturnType<typeof webTarget>;
   try {
     target = webTarget();
-    if (target.environment !== 'development') throw new Error('DEVELOPMENT_REVIEW_ONLY');
+    if (target.environment !== 'development') throw new Error('DEVELOPMENT_WRITE_ONLY');
   } catch (error) {
     return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_REVIEW_NOT_CONFIGURED', environment: 'unconfigured', auto_send: false }, 403);
   }
 
-  let review: ReturnType<typeof normalizeReviewRequest>;
+  let writeRequest: ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeSyncRequest>;
   try {
-    review = normalizeReviewRequest(await request.json());
+    const raw = await request.json() as Record<string, unknown>;
+    writeRequest = raw?.action === 'syncRun' ? normalizeSyncRequest(raw) : normalizeReviewRequest(raw);
   } catch (error) {
-    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'INVALID_REVIEW_REQUEST', environment: target.environment, auto_send: false }, 400);
+    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'INVALID_WRITE_REQUEST', environment: target.environment, auto_send: false }, 400);
   }
 
   try {
@@ -115,18 +116,18 @@ export async function POST(request: NextRequest) {
       cache: 'no-store',
       redirect: 'follow',
       headers: { Accept: 'application/json', 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ ...review, api_key: target.apiKey, environment: target.environment }),
+      body: JSON.stringify({ ...writeRequest, api_key: target.apiKey, environment: target.environment }),
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload || payload.ok === false) {
       return privateJson({ ok: false, error: payload?.error ?? `UPSTREAM_HTTP_${response.status}` }, response.status >= 400 ? response.status : 502);
     }
-    if (payload.environment !== 'development' || payload.auto_send !== false || Number(payload.marketplace_write_actions ?? 0) !== 0) {
+    if ((payload.environment && payload.environment !== 'development') || (payload.auto_send !== undefined && payload.auto_send !== false) || Number(payload.marketplace_write_actions ?? 0) !== 0) {
       return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: 'development', auto_send: false }, 502);
     }
     responseCache.clear();
     return privateJson(payload);
   } catch {
-    return privateJson({ ok: false, error: 'CS_REVIEW_CONNECTION_FAILED', environment: 'development', auto_send: false }, 502);
+    return privateJson({ ok: false, error: 'CS_WRITE_CONNECTION_FAILED', environment: 'development', auto_send: false }, 502);
   }
 }
