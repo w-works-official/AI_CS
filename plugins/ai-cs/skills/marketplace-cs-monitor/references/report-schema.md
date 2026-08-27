@@ -39,6 +39,9 @@ Required fields:
 - `reply_state`: `NEEDS_REPLY`, `ANSWERED`, `NO_REPLY`, or `REVIEW`
 - `ai_draft`: empty unless an AI draft was explicitly generated
 - `ai_draft_origin`: `AI` when populated
+- `ai_draft_purpose`: `REPLY` for `NEEDS_REPLY`, or `EVAL` for an explicitly requested `ANSWERED` shadow evaluation
+- `ai_draft_required_checks`: explicit human checks, or why no reference example was available
+- `ai_draft_pii_scan`: `PASS` only after the generated text is scanned again
 - `pii_scan`: `PASS` or `REVIEW`
 
 `source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time and run duration.
@@ -64,4 +67,4 @@ The top-level report also includes total duration, prepared count, duplicate cou
 
 Compare only records returned inside the same locked scope. A previous record absent from the current scope is `NOT_SEEN`; do not archive, delete, or label it deleted.
 
-Google Sheets or Notion persistence must store normalized masked records only. Keep human replies and `ai_draft` in separate columns so reviewers can always distinguish them.
+Google Sheets or Notion persistence must store normalized masked records only. Keep human replies and `ai_draft` in separate columns so reviewers can always distinguish them. An `EVAL` draft remains comparison-only: it must not change `reply_state`, reply-needed counts, or the verified human-answer library.

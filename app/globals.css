@@ -546,6 +546,16 @@ button {
 .collection-gap strong { display: block; font-size: 11px; }
 .collection-gap p { margin: 5px 0 0; font-size: 9px; line-height: 1.55; }
 
+.collection-gap.loading {
+  border-color: #ddd6f7;
+  background: #f8f6ff;
+  color: #6f5cab;
+}
+
+.collection-gap.loading > span {
+  background: #8067d2;
+}
+
 .conversation-column {
   display: flex;
   flex-direction: column;

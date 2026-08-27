@@ -294,7 +294,13 @@ function prepareMessages_(record, now) {
 
 function prepareDraft_(record, existingDrafts, draftIds, now, request) {
   const text = String(record.ai_draft || '').trim();
-  if (!text || mapReplyState_(record.reply_state) !== 'NEEDS_REPLY') return { object: null, isNew: false };
+  if (!text) return { object: null, isNew: false };
+  const replyState = mapReplyState_(record.reply_state);
+  const requestedPurpose = String(record.ai_draft_purpose || '').toUpperCase();
+  const purpose = requestedPurpose || (replyState === 'NEEDS_REPLY' ? 'REPLY' : '');
+  const isReplyDraft = replyState === 'NEEDS_REPLY' && purpose === 'REPLY';
+  const isEvaluationDraft = replyState === 'ANSWERED' && purpose === 'EVAL';
+  if (!isReplyDraft && !isEvaluationDraft) throw new Error('AI_DRAFT_REPLY_STATE_MISMATCH');
   if (String(record.ai_draft_origin || '') !== 'AI') throw new Error('AI_DRAFT_ORIGIN_REQUIRED');
   if (String(record.ai_draft_pii_scan || '') !== 'PASS') throw new Error('AI_DRAFT_PII_SCAN_REQUIRED');
   assertMaskedText_(text, 'ai_draft');
@@ -309,7 +315,7 @@ function prepareDraft_(record, existingDrafts, draftIds, now, request) {
     isNew: !draftIds[draftId],
     object: {
       draft_id: draftId,
-      record_type: 'LIVE',
+      record_type: isEvaluationDraft ? 'EVAL' : 'LIVE',
       case_key: String(record.source_key),
       version: (versions.length ? Math.max.apply(null, versions) : 0) + 1,
       generated_at: now,
@@ -317,7 +323,7 @@ function prepareDraft_(record, existingDrafts, draftIds, now, request) {
       prompt_version: String(request.prompt_version || 'marketplace-cs-monitor-v1'),
       draft_text: text,
       required_checks: String(record.ai_draft_required_checks || '사람 검토 필수 · 자동 전송 금지'),
-      draft_state: 'READY',
+      draft_state: isEvaluationDraft ? 'EVAL' : 'READY',
       pii_scan: 'PASS',
       reviewed_at: '',
       review_note: '',

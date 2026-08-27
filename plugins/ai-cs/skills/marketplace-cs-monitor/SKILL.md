@@ -1,104 +1,79 @@
 ---
 name: marketplace-cs-monitor
-description: Collect and compare customer-service inquiries from Smartstore, Zigzag/KakaoStyle, and ABLY in the user's signed-in browser session, maintain a verified human-answer reference library, and prepare grounded AI reply drafts for review. Use for multi-market CS monitoring, scraping, sync checks, recurring report runs, or AI answer recommendations. Never send replies or change operational inquiry status.
+description: Run the existing local Playwright marketplace CS macro, mask and deduplicate collected inquiries, prepare grounded AI reply drafts, and sync review-only data to the configured development Sheet. Use for CS collection, recurring monitoring, AI draft preparation, or sync checks. Never send marketplace replies or change inquiry state.
 ---
 
 # Marketplace CS Monitor
 
-Collect seven CS channels into one masked, deduplicated review report:
+Use the existing Playwright macro as the normal collection engine. Do not build another Chrome collector and do not drive Chrome interactively for an ordinary run.
 
-- Smartstore: 문의 관리, 고객문의 관리, 고객센터 문의 관리, 톡톡 상담
-- Zigzag/KakaoStyle: 주문 문의, 상품 문의
-- ABLY: 문의 관리
+## Current rollout gate
 
-## Browser boundary
+Smartstore is temporarily paused until the account holder can complete Naver reauthentication in the dedicated CS Chrome. The active vertical slice is ABLY `문의 관리` plus Zigzag/KakaoStyle `주문 문의` and `상품 문의`. Keep runs limited to today's changes until collection and masking are verified. Generate operational `REPLY` drafts only for real `NEEDS_REPLY` records. When the user explicitly requests training or skill verification, answered records may receive separate `EVAL` shadow drafts under the evaluation rules below. Do not treat a verified zero as a selector failure.
 
-1. Load and follow `chrome:control-chrome`; use the user's existing signed-in browser session.
-2. On this user's laptop, Chrome and Whale may run side by side. Treat the browser named by the user as authoritative and verify the actual application, profile, URL, and login state instead of inferring from a window title. A prior Chrome/Whale mix-up is device-specific, not a general marketplace restriction.
-3. Unless the user names another browser, use the configured signed-in Google Chrome profile. Reuse exact open tabs when available and navigate only inside the verified profile. If the named browser cannot be controlled with the available tool, stop and report that limitation rather than silently switching browsers.
-4. Stop on login, CAPTCHA, two-factor authentication, or account verification. Never automate credentials.
-5. The remote MCP server cannot see or control the user's local Chrome. Browser collection is available only when the official Chrome capability is connected in the same ChatGPT session. If it is unavailable, do not claim that collection ran; report `LOCAL_CHROME_PLUGIN_REQUIRED`.
+Canonical local macro:
 
-The workflow is operationally read-only in every marketplace. Opening an unread Smartstore TalkTalk conversation may change only its read marker; that observational side effect is authorized for this installation and must be counted separately.
+- working directory: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs`
+- script: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs/smartstore_cs_macro.mjs`
+- command: `npm run scrape`
 
-- Never type into a reply field.
-- Never click reply, send, edit reply, complete, close inquiry, refund, exchange, cancel, or order-change controls.
-- Do not inspect cookies, storage, passwords, tokens, or network credentials.
-- DOM text is primary. Use screenshots/OCR only after one DOM retry fails.
-- Keep `AUTO_SEND` disabled.
+Read [references/local-playwright-macro.md](references/local-playwright-macro.md) before running it. Read [references/report-schema.md](references/report-schema.md) before changing the masked report and [references/answer-library.md](references/answer-library.md) before generating drafts. Read [references/sheet-sync.md](references/sheet-sync.md) before any health or sync request.
 
-## Run modes
+## Browser and profile boundary
 
-Default to `changes_today` unless the user supplies another range.
+- The macro attaches with Playwright `chromium.connectOverCDP()` to the user-selected active CS Chrome session. Do not hard-code a person's name, Chrome profile directory, window title, tab index, or process ID.
+- A user starts or reuses the dedicated local session with `scripts/start-cs-chrome.cmd`. The launcher records only a loopback CDP URL, process ID, non-secret browser instance ID, and timestamp in `%LOCALAPPDATA%/PinkRocketCS/active-browser.json`; it never reads cookies, passwords, or tokens.
+- `SMARTSTORE_CDP_URL` is an optional explicit local override. Both the session file and override accept loopback HTTP addresses only. The macro rejects Whale and non-Chrome endpoints.
+- Scheduled runs may reuse an already active session but must not launch a browser, scan ports, guess among profiles, or switch browsers automatically.
+- If the active session is missing, stale, logged out, or ambiguous, stop and ask the current collection operator to start the CS Chrome and sign in. Different review users do not need a collection browser.
+- Allow only one local collector run at a time. The deterministic lock is local; Sheet idempotency remains responsible for duplicate runs from different PCs.
+- Stop on login, CAPTCHA, two-factor authentication, or account verification. Never automate credentials.
+- Normal collection runs the macro; use `chrome:control-chrome` only when the user explicitly asks to diagnose a selector or visible browser state.
 
-- `changes_today`: read list metadata for all seven channels, keep today's records and open only details required to establish a stable key, content hash, and response state.
-- `unanswered`: collect every currently unanswered/open record plus list counts for completed records.
-- `backfill`: collect the explicit user-supplied date range. Do not infer deletion from a range-limited run.
+## Safety boundary
 
-Read [references/channels.md](references/channels.md) before browser collection. Read [references/report-schema.md](references/report-schema.md) before normalizing, comparing, or persisting results.
+- Marketplace access is read-only. Never type into a reply field or click reply, send, edit, complete, close, cancel, refund, exchange, memo, tag, or order-change controls.
+- Smartstore TalkTalk unread-to-read transitions remain the only authorized observational side effect when that channel is later enabled; report the count separately.
+- Raw collection values remain inside the macro process. Only the masked report may be written to `output/`, displayed, or synchronized.
+- Keep `AUTO_SEND` disabled and require `marketplace_write_actions=0` in every result.
 
-## Required workflow
+## Vertical-slice workflow
 
-1. Record run start time, market, route, selected tab/filter, visible total, and sort before opening a detail.
-2. Attempt all seven channels. Distinguish a verified zero-state from selector failure.
-3. Collect stable source IDs from the list or detail route:
-   - Smartstore uses its existing channel IDs and thread IDs.
-   - Zigzag uses the numeric ID in `/detail/<id>`.
-   - ABLY uses `문의방 번호`.
-4. Preserve existing seller replies and message direction. Do not treat an acknowledgement such as `감사합니다` or `넵` as needing another reply.
-5. For Smartstore TalkTalk, open unread conversations when detail collection is needed. This installation authorizes unread-to-read transitions caused by opening a conversation. Preserve the pre-open unread count when visible and report `read_state_transition_count`; this authorization does not include replies, completion, tags, memos, or any order action.
-6. Normalize and mask the raw in-memory collection with `scripts/report-core.mjs`. Never write or display the unmasked collection.
-7. Compare by `source_key` and `content_hash`:
-   - missing key: `NEW`
-   - same key, different hash: `CHANGED`
-   - same key and hash: `UNCHANGED`
-   - absence from the current limited range is `NOT_SEEN`, never deletion.
-8. When answered records contain both a real customer question and a real seller reply, refresh the verified reference library using [references/answer-library.md](references/answer-library.md). Include the approved three-month Notion archive by parsing each answered page's `메시지 흐름` with `scripts/notion-answer-adapter.mjs`; its empty preview properties do not mean the page has no conversation. Never use seller-only previews, system messages, acknowledgements, or AI drafts as human-answer examples.
-9. Generate an AI draft only for `reply_state=NEEDS_REPLY`. Read [references/answer-library.md](references/answer-library.md), retrieve up to three enabled `USE` examples with `scripts/answer-library-core.mjs`, and combine them with active rules. Store the draft separately from seller replies, include reference IDs and required checks, label it as AI-generated, and run a second PII scan. Never send it.
-10. Persist only when the user or configured workflow names a destination. The OAuth-fixed server environment owns the destination: `development` may use only its test Sheet, while `production` may use `Pink Rocket CS 운영 데이터 v1` only after explicit cutover approval. Read [references/sheet-sync.md](references/sheet-sync.md) before syncing. Do not attach raw JSON or fall back to sensitive local files.
-11. Return a short Korean report with duration, per-channel totals, new/changed/unchanged/reply-needed counts, TalkTalk read-state transitions, reference-library refresh counts, draft counts, failures, and manual actions.
+1. Confirm the current collection operator has started the local CS Chrome and signed in. Resolve the active session file or the explicit loopback `SMARTSTORE_CDP_URL`; do not inspect cookies, tokens, saved passwords, or browser storage.
+2. Run the existing macro in `prepare` mode with the explicitly requested channels, today's range, and `CS_KEEP_MASKED_OUTPUT=1`. The current gate uses `CS_CHANNELS=ably_inquiry,zigzag_order_inquiry,zigzag_item_question`. This prepares a masked JSON report and performs no Sheet write.
+3. Check that only the requested channels have `attempted=true`. Verify visible totals, verified zero states, source keys, content hashes, PII scan, counts, and `marketplace_write_actions=0`.
+4. For each `reply_state=NEEDS_REPLY`, retrieve at most three enabled `USE` examples from the development `06_ANSWER_LIBRARY` through `searchVerifiedAnswers` in `scripts/sync-client.mjs`. For an explicitly requested answered-case evaluation, hold the actual seller answer out while generating and set `ai_draft_purpose=EVAL`.
+5. Generate a cautious AI draft using only those examples and current inquiry facts. Do not claim live price, stock, order, shipment, refund, compensation, or policy state without an explicit human check.
+6. Attach drafts with `applyAiDrafts(report, drafts)` from `scripts/report-core.mjs`. Every draft must set `ai_draft_origin=AI`, `ai_draft_purpose=REPLY|EVAL`, required checks, and `ai_draft_pii_scan=PASS`; the helper recalculates `content_hash`. `EVAL` is valid only for `ANSWERED`, never changes `reply_state`, and never contributes to reply-needed or ready-to-send counts.
+7. Load the existing local sync config, require `environment=development`, and call `readCsData("health")`. Stop before sync unless health returns `ok=true`, `environment=development`, `auto_send=false`, and `marketplace_write_actions=0`.
+8. Call `syncReport(finalReport, config)` once. Do not retry browser collection when sync fails. Reusing the same deterministic run ID must be idempotent.
+9. Verify the development review frontend shows the masked post and distinctly labels an operational draft as `AI 추천답변` or an answered-case shadow draft as `AI 검증 초안`. `EVAL` is comparison-only: disable approval/rejection and compare it with the actual human answer. The frontend never sends a marketplace reply.
+10. Return a short Korean report with duration, collected count, new/changed/unchanged/reply-needed counts, draft count, PII result, sync result, and prohibited write count.
 
-## Deterministic core
+## Deterministic helpers
 
-Resolve the directory that contains this loaded `SKILL.md` from the host's available-skill entry, then import the core from that absolute path in the persistent JavaScript environment. A plugin-installed skill may live under a plugin cache, so do not assume `$CODEX_HOME/skills`:
+Use the installed skill directory from the available-skills entry:
 
 ```js
-var marketCsSkillRoot = "<absolute directory containing the loaded marketplace-cs-monitor SKILL.md>";
-var marketCsCore = await import(`${marketCsSkillRoot}/scripts/report-core.mjs`);
-var report = marketCsCore.buildReport(rawCollection, previousRecords);
+var marketCsCore = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/report-core.mjs");
+var marketCsSync = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/sync-client.mjs");
+var answerLibraryCore = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/answer-library-core.mjs");
 ```
 
-Keep `rawCollection` in memory only. `report.records` is masked and safe for the configured review destination.
-
-## AI answer grounding
-
-For answer-library refreshes, import the deterministic helper. For normal plugin draft generation, call `search_verified_answers` with masked inquiry text and use only the returned examples:
+The macro already calls `buildReport()`. After generating drafts, call:
 
 ```js
-var answerLibraryCore = await import(`${marketCsSkillRoot}/scripts/answer-library-core.mjs`);
-var libraryCandidates = answerLibraryCore.buildAnswerLibrary(report.records);
-var draftContext = answerLibraryCore.buildDraftContext(needsReplyRecord, libraryRows, { limit: 3 });
+var finalReport = marketCsCore.applyAiDrafts(maskedReport, aiDrafts);
 ```
 
-The canonical reference sheet is `06_ANSWER_LIBRARY` in the OAuth-fixed environment's Sheet. Development must use its test library; production may use the library in `Pink Rocket CS 운영 데이터 v1` only after cutover approval. Only enabled `USE` rows with `pii_scan=PASS` may ground a draft. A retrieved example never authorizes copying customer data or asserting current price, stock, order, shipping, refund, or compensation state.
+Never recompute hashes ad hoc and never append directly to Sheet tabs.
 
-## Sheet synchronization
+## Implemented collection scope
 
-After all completion checks pass, call the plugin's `sync_masked_cs_run` MCP tool with the masked report. Do not pass an environment, Apps Script URL, API key, arbitrary action, or arbitrary URL. The server derives the target environment from the verified OAuth subject and derives the deterministic `run_id` from the report. `scripts/sync-client.mjs` remains only for legacy local tests and must not be used by the web plugin.
+- Existing standalone Playwright macro: Smartstore 문의 관리, 고객문의 관리, 고객센터 문의 관리, 톡톡 상담; Zigzag/KakaoStyle 주문 문의 and 상품 문의; ABLY 문의 관리.
+- ABLY detail collection preserves customer/seller message direction. Zigzag uses the numeric detail route ID and reads existing seller replies without using reply inputs.
+- Smartstore remains disabled in the current run until Naver reauthentication is completed by the account holder.
 
-The Apps Script server, not the browser collector, is authoritative for case/message/draft upsert and change state. Never append directly to `01_CASES` through `04_SYNC_RUNS`. The bounded `06_ANSWER_LIBRARY` maintenance exception is defined in [references/answer-library.md](references/answer-library.md). Treat a repeated `run_id` as an idempotent replay, verify `marketplace_write_actions=0`, and report a sync failure without rerunning browser collection unless the user explicitly asks. `marketplace_write_actions` counts prohibited operational actions; authorized TalkTalk read-marker transitions are reported separately.
+## Completion gate
 
-## Completion checks
-
-Before reporting success, verify:
-
-- all seven channels were attempted;
-- visible nonzero totals reconcile to collected or explicitly skipped records for the locked range;
-- every prepared record has nonempty `source_key` and `content_hash`;
-- no duplicate `source_key` exists in the prepared batch;
-- new + changed + unchanged equals prepared count;
-- prohibited marketplace write actions equal zero;
-- Smartstore TalkTalk unread-to-read transitions are allowed when caused by authorized detail inspection and are reported separately;
-- AI drafts are clearly separated from human replies and were not sent.
-- reference examples came from complete human question-answer pairs and passed PII checks;
-- every populated AI draft records its reference IDs, required checks, `ai_draft_origin=AI`, and second PII scan result.
+Collection and masking have passed for a real answered ABLY record. Answered records may be used in a bounded `EVAL` shadow-draft run (normally 1–10 records) without changing operational state or promoting the AI output into the verified answer library. The next operational gate remains one real `NEEDS_REPLY` record from an enabled ABLY or Zigzag channel passing grounded AI drafting, development sync, frontend display, and separate human review. Smartstore can resume only after the account holder authenticates. Marketplace reply transmission must remain zero.

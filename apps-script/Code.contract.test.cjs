@@ -61,6 +61,19 @@ assert.equal(draft.object.draft_text, record.ai_draft);
 assert.equal(draft.object.draft_state, "READY");
 assert.equal(draft.object.content_hash, undefined);
 
+const evaluationRecord = {
+  ...record,
+  status: "답변완료",
+  reply_state: "ANSWERED",
+  last_actor: "seller",
+  ai_draft_purpose: "EVAL",
+};
+const evaluationDraft = context.prepareDraft_(evaluationRecord, [], {}, new Date("2026-08-25T01:02:00Z"), {});
+assert.equal(evaluationDraft.isNew, true);
+assert.equal(evaluationDraft.object.record_type, "EVAL");
+assert.equal(evaluationDraft.object.draft_state, "EVAL");
+assert.throws(() => context.prepareDraft_({ ...evaluationRecord, ai_draft_purpose: "REPLY" }, [], {}, new Date(), {}), /AI_DRAFT_REPLY_STATE_MISMATCH/);
+
 const caseObject = context.caseObjectFromRecord_(record, null, "NEW", draft.object, new Date("2026-08-25T01:01:00Z"));
 assert.equal(caseObject.subject, record.subject);
 assert.equal(caseObject.preview, record.preview);

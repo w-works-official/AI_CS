@@ -113,7 +113,16 @@ function normalizeRecord(market, channel, raw) {
   const customer = raw.customer_name ?? raw.customer ?? raw.customer_id ?? raw.customer_id_masked ?? "";
   const replyState = inferReplyState(raw.status, lastActor, lastMessage?.text ?? raw.last_message ?? "");
   const aiDraft = maskSensitiveText(raw.ai_draft);
-  if (aiDraft && replyState === "NEEDS_REPLY" && raw.ai_draft_origin !== "AI") {
+  const requestedDraftPurpose = compact(raw.ai_draft_purpose).toUpperCase();
+  const aiDraftPurpose = aiDraft
+    ? (requestedDraftPurpose || (replyState === "NEEDS_REPLY" ? "REPLY" : ""))
+    : "";
+  const draftAllowed = (replyState === "NEEDS_REPLY" && aiDraftPurpose === "REPLY")
+    || (replyState === "ANSWERED" && aiDraftPurpose === "EVAL");
+  if (aiDraft && !draftAllowed) {
+    throw new Error("AI_DRAFT_REPLY_STATE_MISMATCH");
+  }
+  if (aiDraft && raw.ai_draft_origin !== "AI") {
     throw new Error("AI_DRAFT_ORIGIN_REQUIRED");
   }
   const masked = {
@@ -134,10 +143,11 @@ function normalizeRecord(market, channel, raw) {
     seller_replies: sellerReplies,
     last_actor: ["customer", "seller", "automatic", "system"].includes(lastActor) ? lastActor : "unknown",
     reply_state: replyState,
-    ai_draft: replyState === "NEEDS_REPLY" ? aiDraft : "",
-    ai_draft_origin: replyState === "NEEDS_REPLY" && aiDraft ? "AI" : "",
-    ai_draft_required_checks: replyState === "NEEDS_REPLY" && aiDraft ? maskSensitiveText(raw.ai_draft_required_checks) : "",
-    ai_draft_pii_scan: replyState === "NEEDS_REPLY" && aiDraft && raw.ai_draft_pii_scan === "PASS" ? "PASS" : "REVIEW",
+    ai_draft: draftAllowed ? aiDraft : "",
+    ai_draft_origin: draftAllowed && aiDraft ? "AI" : "",
+    ai_draft_purpose: draftAllowed && aiDraft ? aiDraftPurpose : "",
+    ai_draft_required_checks: draftAllowed && aiDraft ? maskSensitiveText(raw.ai_draft_required_checks) : "",
+    ai_draft_pii_scan: draftAllowed && aiDraft && raw.ai_draft_pii_scan === "PASS" ? "PASS" : "REVIEW",
     pii_scan: "PASS",
   };
   masked.content_hash = sha256(stableJson({ ...masked, content_hash: undefined, change_state: undefined }));
@@ -213,6 +223,45 @@ export function buildReport(rawCollection, previousRecords = []) {
     throw new Error("Report comparison totals do not reconcile");
   }
   return report;
+}
+
+export function applyAiDrafts(report, drafts = []) {
+  if (!report || Number(report.schema_version) !== 1 || !Array.isArray(report.records)) {
+    throw new Error("INVALID_REPORT_SCHEMA");
+  }
+  const draftByKey = new Map();
+  for (const draft of drafts) {
+    const sourceKey = compact(draft?.source_key);
+    if (!sourceKey) throw new Error("AI_DRAFT_SOURCE_KEY_REQUIRED");
+    if (draftByKey.has(sourceKey)) throw new Error(`DUPLICATE_AI_DRAFT:${sourceKey}`);
+    draftByKey.set(sourceKey, draft);
+  }
+
+  const next = structuredClone(report);
+  for (const record of next.records) {
+    const draft = draftByKey.get(record.source_key);
+    if (!draft) continue;
+    const purpose = compact(draft.ai_draft_purpose).toUpperCase()
+      || (record.reply_state === "NEEDS_REPLY" ? "REPLY" : "");
+    const allowed = (record.reply_state === "NEEDS_REPLY" && purpose === "REPLY")
+      || (record.reply_state === "ANSWERED" && purpose === "EVAL");
+    if (!allowed) throw new Error(`AI_DRAFT_REPLY_STATE_MISMATCH:${record.source_key}`);
+    if (draft.ai_draft_origin !== "AI") throw new Error("AI_DRAFT_ORIGIN_REQUIRED");
+    if (draft.ai_draft_pii_scan !== "PASS") throw new Error("AI_DRAFT_PII_SCAN_REQUIRED");
+    const text = maskSensitiveText(draft.ai_draft);
+    if (!text) throw new Error("AI_DRAFT_TEXT_REQUIRED");
+    record.ai_draft = text;
+    record.ai_draft_origin = "AI";
+    record.ai_draft_purpose = purpose;
+    record.ai_draft_required_checks = maskSensitiveText(draft.ai_draft_required_checks);
+    record.ai_draft_pii_scan = "PASS";
+    record.content_hash = sha256(stableJson({ ...record, content_hash: undefined, change_state: undefined }));
+    draftByKey.delete(record.source_key);
+  }
+  if (draftByKey.size) throw new Error(`AI_DRAFT_CASE_NOT_FOUND:${[...draftByKey.keys()][0]}`);
+  next.summary.reply_draft_count = next.records.filter((row) => row.ai_draft_purpose === "REPLY").length;
+  next.summary.eval_draft_count = next.records.filter((row) => row.ai_draft_purpose === "EVAL").length;
+  return next;
 }
 
 export { CHANNEL_KEYS, maskSensitiveText, normalizeRecord };

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AppsScriptClient } from "./apps-script-client.ts";
 import { maskedReportSchema, syncRunInputSchema } from "./schemas.ts";
-import { assertSafeSync, makeRunId } from "./safety.ts";
+import { assertSafeSync, makeRunId, safeToolError } from "./safety.ts";
 
 const emptyChannel = {
   attempted: true,
@@ -59,6 +59,13 @@ test("deterministic run id is stable and safe report passes", () => {
   assert.match(makeRunId(report), /^SYNC_[a-f0-9]{24}$/);
 });
 
+test("upstream failures are classified without exposing credentials or URLs", () => {
+  assert.equal(safeToolError(new Error("APPS_SCRIPT_REJECTED:INVALID_API_KEY")), "UPSTREAM_AUTH_FAILED");
+  assert.equal(safeToolError(new Error("APPS_SCRIPT_REJECTED:INVALID_SECRET")), "UPSTREAM_AUTH_FAILED");
+  assert.equal(safeToolError(new Error("fetch failed for https://secret.example/exec")), "UPSTREAM_CONNECTION_FAILED");
+  assert.equal(safeToolError(new Error("token verification failed")), "TOOL_FAILED");
+});
+
 test("PII scan blocks an unmasked phone before Apps Script", () => {
   const report = emptyReport();
   const unsafe = {
@@ -98,18 +105,23 @@ test("PII scan blocks an unmasked phone before Apps Script", () => {
 test("Apps Script client allowlists params and enforces environment response", async () => {
   let requested = "";
   let init: RequestInit | undefined;
+  let fetchUsedGlobalThis = false;
+  const fetchImpl = async function (this: unknown, input: RequestInfo | URL, requestInit?: RequestInit) {
+    fetchUsedGlobalThis = this === globalThis;
+    requested = String(input);
+    init = requestInit;
+    return Response.json({ ok: true, environment: "development", auto_send: false, marketplace_write_actions: 0, total_live: 0 });
+  } as typeof fetch;
   const client = new AppsScriptClient({
     name: "development",
     appsScriptUrl: "https://script.google.com/macros/s/dev/exec",
     appsScriptKey: "dev-secret",
-  }, async (input, requestInit) => {
-    requested = String(input);
-    init = requestInit;
-    return Response.json({ ok: true, environment: "development", auto_send: false, marketplace_write_actions: 0, total_live: 0 });
-  });
+  }, fetchImpl);
   await client.read("overview", { limit: 10 });
+  assert.equal(fetchUsedGlobalThis, true);
   assert.equal(requested, "https://script.google.com/macros/s/dev/exec");
   assert.equal(init?.method, "POST");
+  assert.equal("cache" in (init ?? {}), false);
   const body = JSON.parse(String(init?.body));
   assert.deepEqual(body, { action: "overview", api_key: "dev-secret", environment: "development", limit: 10 });
   assert.doesNotMatch(requested, /dev-secret/);
@@ -121,4 +133,18 @@ test("Apps Script client allowlists params and enforces environment response", a
     appsScriptKey: "dev-secret",
   }, async () => Response.json({ ok: true, environment: "production", auto_send: false, marketplace_write_actions: 0 }));
   await assert.rejects(() => mismatch.read("health"), /UPSTREAM_ENVIRONMENT_MISMATCH/);
+});
+
+test("Apps Script fetch failures expose only a safe error class", async () => {
+  const failure = Object.assign(new TypeError("fetch failed for https://secret.example/exec"), {
+    cause: { code: "ECONNRESET" },
+  });
+  const client = new AppsScriptClient(
+    { name: "development", appsScriptUrl: "https://script.google.com/macros/s/test/exec", appsScriptKey: "secret" },
+    async () => { throw failure; },
+  );
+  await assert.rejects(
+    () => client.read("health"),
+    (error: Error) => error.message === "APPS_SCRIPT_FETCH_FAILED:TypeError:ECONNRESET:fetch failed for <url>",
+  );
 });

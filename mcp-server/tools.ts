@@ -20,15 +20,16 @@ import {
 import { assertMaskedHumanRevision, assertSafeSync, makeRunId, safeToolError } from "./safety.ts";
 
 type JsonObject = Record<string, unknown>;
+type OutputSchema = { parse(value: unknown): JsonObject };
 
-function success(principal: Principal, payload: JsonObject) {
-  const structuredContent = {
+function success(principal: Principal, payload: JsonObject, outputSchema: OutputSchema) {
+  const structuredContent = outputSchema.parse({
     ...payload,
     environment: principal.target.name,
     auto_send: false as const,
     marketplace_write_actions: 0 as const,
     browser_collection: "LOCAL_CHROME_PLUGIN_REQUIRED" as const,
-  };
+  });
   return {
     content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }],
     structuredContent,
@@ -96,7 +97,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
   }, async () => {
     try {
       requireScope(principal, "cs:read");
-      return success(principal, await client.read("health"));
+      return success(principal, await client.read("health"), healthOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }
@@ -112,7 +113,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
   }, async () => {
     try {
       requireScope(principal, "cs:read");
-      return success(principal, await client.read("overview"));
+      return success(principal, await client.read("overview"), overviewOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }
@@ -128,7 +129,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
   }, async (input) => {
     try {
       requireScope(principal, "cs:read");
-      return success(principal, await client.read("cases", input));
+      return success(principal, await client.read("cases", input), listCasesOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }
@@ -144,7 +145,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
   }, async (input) => {
     try {
       requireScope(principal, "cs:read");
-      return success(principal, await client.read("case", input));
+      return success(principal, await client.read("case", input), getCaseOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }
@@ -161,7 +162,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
     try {
       requireScope(principal, "cs:read");
       assertMaskedHumanRevision(input.query);
-      return success(principal, await client.read("answerLibrary", input));
+      return success(principal, await client.read("answerLibrary", input), searchAnswersOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }
@@ -180,7 +181,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
       assertSafeSync(input);
       const runId = makeRunId(input.report);
       if (input.run_id && input.run_id !== runId) throw new Error("RUN_ID_CONTENT_MISMATCH");
-      return success(principal, await client.write("syncRun", { ...input, run_id: runId }));
+      return success(principal, await client.write("syncRun", { ...input, run_id: runId }), syncRunOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }
@@ -197,7 +198,7 @@ export function createCsMcpServer(principal: Principal, client = new AppsScriptC
     try {
       requireScope(principal, "cs:review");
       assertMaskedHumanRevision(input.human_revision);
-      return success(principal, await client.write("reviewDraft", input));
+      return success(principal, await client.write("reviewDraft", input), reviewDraftOutputSchema);
     } catch (error) {
       return failure(error, principal);
     }

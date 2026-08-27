@@ -58,6 +58,8 @@ export function makeRunId(report: SyncRunInput["report"]): string {
 
 export function safeToolError(error: unknown): string {
   const message = error instanceof Error ? error.message : "TOOL_FAILED";
-  if (/https?:\/\//i.test(message) || /token|secret|api[_ -]?key/i.test(message)) return "TOOL_FAILED";
+  if (/https?:\/\//i.test(message)) return "UPSTREAM_CONNECTION_FAILED";
+  if (/api[_ -]?key|secret/i.test(message)) return "UPSTREAM_AUTH_FAILED";
+  if (/token/i.test(message)) return "TOOL_FAILED";
   return message.slice(0, 300);
 }

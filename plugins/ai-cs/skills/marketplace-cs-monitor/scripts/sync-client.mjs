@@ -7,6 +7,8 @@ export const DEFAULT_SYNC_CONFIG = fileURLToPath(
 );
 
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
+const READ_ACTIONS = new Set(["health", "overview", "cases", "case", "answerLibrary"]);
+const READ_PARAMS = new Set(["case_key", "record_type", "market", "channel", "ui_type", "reply_state", "ai_draft_state", "limit", "cursor", "query", "intent"]);
 
 export function makeRunId(report) {
   const identity = [
@@ -31,8 +33,12 @@ export function validateSyncReport(report) {
 
 export function buildSyncRequest(report, options = {}) {
   validateSyncReport(report);
+  if (options.environment !== "development" && options.environment !== "production") {
+    throw new Error("SYNC_ENVIRONMENT_NOT_CONFIGURED");
+  }
   return {
     action: "syncRun",
+    environment: options.environment,
     run_id: options.runId ?? makeRunId(report),
     report,
     model: options.model ?? "Codex",
@@ -53,19 +59,24 @@ export async function loadSyncConfig({
   }
   const syncUrl = env.MARKETPLACE_CS_SYNC_URL;
   const syncKey = env.MARKETPLACE_CS_SYNC_KEY;
+  const environment = env.MARKETPLACE_CS_SYNC_ENVIRONMENT;
   return {
     ...file,
     web_app_url: syncUrl || file.web_app_url || "",
     api_key: syncKey || "",
+    environment: environment || file.environment || "",
   };
 }
 
 export async function syncReport(report, config, { fetchImpl = globalThis.fetch, ...options } = {}) {
   if (!config?.web_app_url) throw new Error("MARKETPLACE_CS_SYNC_URL_NOT_CONFIGURED");
   if (!config?.api_key) throw new Error("MARKETPLACE_CS_SYNC_KEY_NOT_CONFIGURED");
+  if (config?.environment !== "development" && config?.environment !== "production") {
+    throw new Error("MARKETPLACE_CS_SYNC_ENVIRONMENT_NOT_CONFIGURED");
+  }
   if (typeof fetchImpl !== "function") throw new Error("FETCH_NOT_AVAILABLE");
 
-  const payload = buildSyncRequest(report, { ...options, apiKey: config.api_key });
+  const payload = buildSyncRequest(report, { ...options, apiKey: config.api_key, environment: config.environment });
   const response = await fetchImpl(config.web_app_url, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -86,4 +97,41 @@ export async function syncReport(report, config, { fetchImpl = globalThis.fetch,
     throw new Error("UNSAFE_SYNC_RESPONSE");
   }
   return parsed;
+}
+
+export async function readCsData(action, params, config, { fetchImpl = globalThis.fetch } = {}) {
+  if (!READ_ACTIONS.has(action)) throw new Error("CS_READ_ACTION_NOT_ALLOWED");
+  if (!config?.web_app_url) throw new Error("MARKETPLACE_CS_SYNC_URL_NOT_CONFIGURED");
+  if (!config?.api_key) throw new Error("MARKETPLACE_CS_SYNC_KEY_NOT_CONFIGURED");
+  if (config?.environment !== "development" && config?.environment !== "production") {
+    throw new Error("MARKETPLACE_CS_SYNC_ENVIRONMENT_NOT_CONFIGURED");
+  }
+  if (typeof fetchImpl !== "function") throw new Error("FETCH_NOT_AVAILABLE");
+  const body = { action, environment: config.environment, api_key: config.api_key };
+  for (const [key, value] of Object.entries(params ?? {})) {
+    if (!READ_PARAMS.has(key)) throw new Error(`CS_READ_PARAM_NOT_ALLOWED:${key}`);
+    if (value !== undefined && value !== null && value !== "") body[key] = value;
+  }
+  const response = await fetchImpl(config.web_app_url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8", Accept: "application/json" },
+    body: JSON.stringify(body),
+    redirect: "follow",
+  });
+  const raw = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`CS_READ_RESPONSE_NOT_JSON:${response.status}`);
+  }
+  if (!response.ok || !parsed.ok) throw new Error(`CS_READ_FAILED:${parsed.error || response.status}`);
+  if (parsed.environment !== config.environment || parsed.auto_send !== false || Number(parsed.marketplace_write_actions ?? 0) !== 0) {
+    throw new Error("UNSAFE_READ_RESPONSE");
+  }
+  return parsed;
+}
+
+export function searchVerifiedAnswers(params, config, options) {
+  return readCsData("answerLibrary", { ...params, limit: Math.min(3, Number(params?.limit ?? 3) || 3) }, config, options);
 }

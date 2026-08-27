@@ -18,6 +18,23 @@ const readParams = new Set([
   "intent",
 ]);
 
+function safeFetchFailure(error: unknown): string {
+  const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const cause = value.cause && typeof value.cause === "object" ? value.cause as Record<string, unknown> : {};
+  const parts = [value.name, cause.name, cause.code]
+    .map((part) => String(part ?? ""))
+    .filter((part) => /^[A-Za-z0-9_.-]{1,64}$/.test(part));
+  const message = String(value.message ?? "")
+    .replace(/https?:\/\/[^\s"'<>]+/gi, "<url>")
+    .replace(/(api[_ -]?key|secret|token)\s*[:=]\s*[^\s,;]+/gi, "$1=<redacted>")
+    .replace(/[A-Za-z0-9_-]{32,}/g, "<redacted>")
+    .replace(/[^\x20-\x7E]/g, " ")
+    .trim()
+    .slice(0, 160);
+  if (message) parts.push(message);
+  return parts.join(":") || "UNKNOWN";
+}
+
 export class AppsScriptClient {
   private readonly target: EnvironmentTarget;
   private readonly fetchImpl: typeof fetch;
@@ -28,6 +45,14 @@ export class AppsScriptClient {
   ) {
     this.target = target;
     this.fetchImpl = fetchImpl;
+  }
+
+  private async request(init: RequestInit): Promise<Response> {
+    try {
+      return await this.fetchImpl.call(globalThis, this.target.appsScriptUrl, init);
+    } catch (error) {
+      throw new Error(`APPS_SCRIPT_FETCH_FAILED:${safeFetchFailure(error)}`);
+    }
   }
 
   private assertSafeResponse(payload: JsonObject): JsonObject {
@@ -51,12 +76,11 @@ export class AppsScriptClient {
       if (!readParams.has(key)) throw new Error(`APPS_SCRIPT_PARAM_NOT_ALLOWED:${key}`);
       if (raw !== undefined && raw !== null && raw !== "") body[key] = raw;
     }
-    const response = await this.fetchImpl(this.target.appsScriptUrl, {
+    const response = await this.request({
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8", Accept: "application/json" },
       body: JSON.stringify(body),
       redirect: "follow",
-      cache: "no-store",
     });
     return this.parse(response);
   }
@@ -66,7 +90,7 @@ export class AppsScriptClient {
     if ("api_key" in body || "environment" in body || "action" in body) {
       throw new Error("APPS_SCRIPT_RESERVED_PARAM");
     }
-    const response = await this.fetchImpl(this.target.appsScriptUrl, {
+    const response = await this.request({
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8", Accept: "application/json" },
       body: JSON.stringify({
@@ -76,7 +100,6 @@ export class AppsScriptClient {
         ...body,
       }),
       redirect: "follow",
-      cache: "no-store",
     });
     return this.parse(response);
   }

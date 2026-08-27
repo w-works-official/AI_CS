@@ -21,7 +21,16 @@ async function connected(scopes?: string[]) {
   const calls: Array<{ action: string; body: Record<string, unknown> }> = [];
   const fake = {
     async read(action: string) {
-      if (action === "health") return { ok: true, service: "test", schema_version: "cs-sheet-v1", write_policy: "MASKED_SYNC_AND_DRAFT_REVIEW_ONLY", environment: "development", auto_send: false };
+      if (action === "health") return {
+        ok: true,
+        service: "test",
+        schema_version: "cs-sheet-v1",
+        write_policy: "MASKED_SYNC_AND_DRAFT_REVIEW_ONLY",
+        environment: "development",
+        auto_send: false,
+        write_key_configured: true,
+        now: "2026-08-27T00:00:00.000Z",
+      };
       if (action === "answerLibrary") return {
         ok: true,
         reference_source: "VERIFIED_HUMAN_ANSWER_ONLY",
@@ -93,6 +102,8 @@ test("health reports the fixed environment and never-send boundary", async () =>
     assert.equal(output.auto_send, false);
     assert.equal(output.marketplace_write_actions, 0);
     assert.equal(output.browser_collection, "LOCAL_CHROME_PLUGIN_REQUIRED");
+    assert.equal("write_key_configured" in output, false);
+    assert.equal("now" in output, false);
   } finally {
     await client.close();
     await server.close();

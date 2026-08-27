@@ -64,3 +64,14 @@ For each normalized record with `reply_state=NEEDS_REPLY`:
 7. Never copy customer identifiers from an example and never send the draft.
 
 If no example reaches the retrieval threshold, do not force a match. Produce a conservative draft from active rules only and label the missing reference evidence for human review.
+
+## Answered-case shadow evaluation
+
+Use this only when the user explicitly asks for training data or skill verification, normally on a bounded sample of 1–10 `ANSWERED` records with `pii_scan=PASS`.
+
+1. Build the generation prompt from the customer question, product context, active rules, and verified answer-library examples only.
+2. Hold the actual seller reply out until generation is complete. Never let it leak into the proposed wording.
+3. Store the generated text with `ai_draft_origin=AI`, `ai_draft_purpose=EVAL`, and `ai_draft_pii_scan=PASS`.
+4. Preserve `reply_state=ANSWERED`; do not increment reply-needed or operational AI-ready counts.
+5. After generation, compare the `EVAL` draft with the actual human reply for omissions, unsupported claims, tone, and required checks.
+6. Never approve, send, or promote the `EVAL` draft into `06_ANSWER_LIBRARY`. Only the actual verified human reply may become a reference example.

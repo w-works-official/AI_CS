@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { buildReport } from "./report-core.mjs";
+import { applyAiDrafts, buildReport } from "./report-core.mjs";
 
 const base = {
   mode: "changes_today",
@@ -60,5 +60,42 @@ assert.match(draftRecord.ai_draft_required_checks, /출고/);
 const missingOrigin = structuredClone(withDraft);
 missingOrigin.channels.zigzag_order_inquiry.records[0].ai_draft_origin = "";
 assert.throws(() => buildReport(missingOrigin, []), /AI_DRAFT_ORIGIN_REQUIRED/);
+
+const target = first.records.find((row) => row.reply_state === "NEEDS_REPLY");
+const draftedAfterCollection = applyAiDrafts(first, [{
+  source_key: target.source_key,
+  ai_draft: "안녕하세요. 확인 후 안내드리겠습니다.",
+  ai_draft_origin: "AI",
+  ai_draft_required_checks: "실제 주문 상태 확인",
+  ai_draft_pii_scan: "PASS",
+}]);
+const attached = draftedAfterCollection.records.find((row) => row.source_key === target.source_key);
+assert.equal(attached.ai_draft_origin, "AI");
+assert.equal(attached.ai_draft_purpose, "REPLY");
+assert.equal(attached.ai_draft_pii_scan, "PASS");
+assert.notEqual(attached.content_hash, target.content_hash);
+assert.throws(() => applyAiDrafts(first, [{ source_key: target.source_key, ai_draft: "초안", ai_draft_origin: "AI", ai_draft_pii_scan: "REVIEW" }]), /AI_DRAFT_PII_SCAN_REQUIRED/);
+
+const answered = first.records.find((row) => row.reply_state === "ANSWERED");
+const evaluated = applyAiDrafts(first, [{
+  source_key: answered.source_key,
+  ai_draft: "안녕하세요. 확인 후 안내드리겠습니다.",
+  ai_draft_origin: "AI",
+  ai_draft_purpose: "EVAL",
+  ai_draft_required_checks: "학습·검증용 · 실제 사람 답변과 비교 · 자동 전송 금지",
+  ai_draft_pii_scan: "PASS",
+}]);
+const evalRecord = evaluated.records.find((row) => row.source_key === answered.source_key);
+assert.equal(evalRecord.reply_state, "ANSWERED");
+assert.equal(evalRecord.ai_draft_purpose, "EVAL");
+assert.equal(evaluated.summary.eval_draft_count, 1);
+assert.equal(evaluated.summary.needs_reply_count, first.summary.needs_reply_count);
+assert.throws(() => applyAiDrafts(first, [{
+  source_key: answered.source_key,
+  ai_draft: "초안",
+  ai_draft_origin: "AI",
+  ai_draft_purpose: "REPLY",
+  ai_draft_pii_scan: "PASS",
+}]), /AI_DRAFT_REPLY_STATE_MISMATCH/);
 
 console.log("marketplace-cs-monitor report core: PASS");

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 declare global {
   interface Window {
     __CS_API_BASE_URL__?: string;
+    __CS_REVIEW_ENABLED__?: boolean;
   }
 }
 
@@ -27,7 +28,8 @@ type CsCase = {
   alert?: string;
   postTitle?: string;
   messages: Message[];
-  ai?: { text: string; reason: string; generatedAt: string; risk: '낮음' | '중간' | '높음' };
+  draftId?: string;
+  ai?: { text: string; reason: string; generatedAt: string; risk: '낮음' | '중간' | '높음'; mode: 'reply' | 'eval' };
   humanRevision?: { text: string; state: string; reviewedAt: string };
   actualReply?: { text: string; sentAt: string; verifiedAt: string };
 };
@@ -101,8 +103,12 @@ function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[]): C
   }).filter((message): message is Message => message !== null);
   if (!item.messages.length && item.bodyCollected) item.messages.push({ actor: 'customer', time: item.updatedAt, text: item.preview });
   if (item.actualReply && !item.messages.some((message) => message.actor === 'seller')) item.messages.push({ actor: 'seller', time: item.actualReply.sentAt, text: item.actualReply.text });
-  const draft = draftRows.find((row) => ['READY', 'APPROVED'].includes(text(row.draft_state).toUpperCase()));
-  if (draft && text(draft.draft_text)) item.ai = { text: text(draft.draft_text), reason: draftReason(draft.required_checks), generatedAt: formatDate(draft.generated_at), risk: riskLevel(draft.pii_scan) };
+  const draft = draftRows.find((row) => ['READY', 'APPROVED', 'EVAL'].includes(text(row.draft_state).toUpperCase()));
+  if (draft && text(draft.draft_text)) {
+    const draftState = text(draft.draft_state).toUpperCase();
+    item.draftId = text(draft.draft_id);
+    item.ai = { text: text(draft.draft_text), reason: draftReason(draft.required_checks), generatedAt: formatDate(draft.generated_at), risk: riskLevel(draft.pii_scan), mode: draftState === 'EVAL' ? 'eval' : 'reply' };
+  }
   const reviewedDraft = draftRows.find((row) => text(row.human_revision));
   if (reviewedDraft) item.humanRevision = { text: text(reviewedDraft.human_revision), state: text(reviewedDraft.draft_state, '검토됨'), reviewedAt: formatDate(reviewedDraft.reviewed_at) };
   return item;
@@ -113,6 +119,14 @@ function statusQuery(filter: 'all' | CaseStatus) {
   const state = { unanswered: 'NEEDS_REPLY', review: 'REVIEW', 'no-reply': 'NO_REPLY_REQUIRED', replied: 'ANSWERED' }[filter];
   return state ? `&reply_state=${state}` : '';
 }
+
+function sortCasesRecent(items: CsCase[]) {
+  return [...items].sort((a, b) => {
+    const aTime = Date.parse(a.updatedRaw || '');
+    const bTime = Date.parse(b.updatedRaw || '');
+    return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+  });
+}
 function apiPath(path: string) {
   const publicApi = typeof window === 'undefined' ? '' : text(window.__CS_API_BASE_URL__);
   if (!publicApi || !path.startsWith('/api/cs')) return path;
@@ -122,6 +136,12 @@ async function getJson(path: string, signal?: AbortSignal): Promise<Record<strin
   const response = await fetch(apiPath(path), { cache: 'default', signal }); const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
   if (!response.ok || !payload?.ok) throw new Error(text(payload?.error, 'DATA_LOAD_FAILED')); return payload;
 }
+async function postJson(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiPath(path), { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!response.ok || !payload?.ok) throw new Error(text(payload?.error, 'REVIEW_SAVE_FAILED'));
+  return payload;
+}
 
 export default function Home() {
   const [activeFilter, setActiveFilter] = useState<'all' | CaseStatus>('all');
@@ -129,6 +149,7 @@ export default function Home() {
   const [selectedDetail, setSelectedDetail] = useState<CsCase | null>(null); const [overview, setOverview] = useState<Overview>(EMPTY_OVERVIEW);
   const [environment, setEnvironment] = useState<EnvironmentName>('unconfigured');
   const [search, setSearch] = useState(''); const [editor, setEditor] = useState(''); const [toast, setToast] = useState('');
+  const [reviewSaving, setReviewSaving] = useState(false);
   const [loading, setLoading] = useState(true); const [loadingMore, setLoadingMore] = useState(false); const [detailLoading, setDetailLoading] = useState(false); const [error, setError] = useState('');
   const listRequestId = useRef(0); const detailRequestId = useRef(0);
 
@@ -152,10 +173,10 @@ export default function Home() {
       setSelectedId((current) => first.items.some((item) => item.id === current) ? current : (first.items[0]?.id ?? ''));
       const [overviewPayload, rest] = await Promise.all([
         getJson('/api/cs?action=overview&fresh=1'),
-        first.total > first.items.length ? fetchCases(activeFilter, 47, 3, undefined, true) : Promise.resolve({ items: [], total: first.total }),
+        first.total > first.items.length ? fetchCases(activeFilter, 197, 3, undefined, true) : Promise.resolve({ items: [], total: first.total }),
       ]);
       if (requestId !== listRequestId.current) return;
-      setOverviewPayload(overviewPayload); setCases([...first.items, ...rest.items]); setLoadingMore(false);
+      setOverviewPayload(overviewPayload); setCases(sortCasesRecent([...first.items, ...rest.items])); setLoadingMore(false);
     } catch (cause) {
       if (requestId === listRequestId.current) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
     } finally {
@@ -172,10 +193,10 @@ export default function Home() {
         setSelectedId((current) => first.items.some((item) => item.id === current) ? current : (first.items[0]?.id ?? ''));
         const [payload, rest] = await Promise.all([
           getJson('/api/cs?action=overview', controller.signal),
-          first.total > first.items.length ? fetchCases(activeFilter, 47, 3, controller.signal) : Promise.resolve({ items: [], total: first.total }),
+          first.total > first.items.length ? fetchCases(activeFilter, 197, 3, controller.signal) : Promise.resolve({ items: [], total: first.total }),
         ]);
         if (requestId !== listRequestId.current) return;
-        setOverviewPayload(payload); setCases([...first.items, ...rest.items]); setLoadingMore(false);
+        setOverviewPayload(payload); setCases(sortCasesRecent([...first.items, ...rest.items])); setLoadingMore(false);
       }).catch((cause) => {
         if (requestId === listRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
       }).finally(() => { if (requestId === listRequestId.current) { setLoading(false); setLoadingMore(false); } });
@@ -207,6 +228,21 @@ export default function Home() {
   };
   const selectCase = (id: string) => { if (id === selectedId) return; detailRequestId.current += 1; setEditor(''); setDetailLoading(true); setSelectedId(id); };
   const countFor = (status: CaseStatus) => ({ unanswered: overview.needs_reply, 'ai-ready': overview.ai_ready, review: overview.review, 'no-reply': overview.no_reply_required, replied: overview.answered })[status];
+  const localReviewEnabled = typeof window !== 'undefined' && !text(window.__CS_API_BASE_URL__) && window.__CS_REVIEW_ENABLED__ !== false && environment === 'development';
+  const saveReview = async (draftState: 'APPROVED' | 'REJECTED') => {
+    if (!selected?.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || reviewSaving) return;
+    setReviewSaving(true); setError('');
+    try {
+      const revision = draftState === 'APPROVED' ? editor.trim() : '';
+      await postJson('/api/cs', { draft_id: selected.draftId, draft_state: draftState, review_note: draftState === 'APPROVED' ? '개발 프론트에서 사람 검수 완료' : '개발 프론트에서 AI 초안 거절', human_revision: revision });
+      setSelectedDetail({ ...selected, humanRevision: revision ? { text: revision, state: draftState, reviewedAt: formatDate(new Date().toISOString()) } : selected.humanRevision });
+      notify(draftState === 'APPROVED' ? '사람 수정본을 개발 Sheet에 저장했습니다.' : 'AI 초안을 거절로 기록했습니다.');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'REVIEW_SAVE_FAILED');
+    } finally {
+      setReviewSaving(false);
+    }
+  };
 
   return <main className="app-shell">
     <aside className="nav-rail"><div className="brand-mark">PR</div><nav aria-label="주 메뉴"><button className="rail-button active"><span>◫</span><small>검수함</small></button><button className="rail-button"><span>⌁</span><small>통계</small></button><button className="rail-button"><span>⚙</span><small>설정</small></button></nav><div className="rail-footer">LIVE</div></aside>
@@ -215,19 +251,19 @@ export default function Home() {
       {error && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
       <section className="status-strip" aria-label="문의 상태 요약">{filters.slice(1).map((filter) => { const meta = statusMeta[filter.key as CaseStatus]; return <button key={filter.key} className={`stat-card ${activeFilter === filter.key ? 'selected' : ''}`} onClick={() => selectFilter(filter.key as CaseStatus)}><span className="stat-dot" style={{ background: meta.dot }} /><span>{filter.label}</span><strong>{countFor(filter.key as CaseStatus).toLocaleString()}</strong></button>; })}</section>
       <div className="desk-grid">
-        <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최근 {cases.length || 50}건 표시 {loadingMore ? '· 나머지 불러오는 중' : ''} · 민감정보 마스킹</p></div>
+        <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최신순 최대 {cases.length || 200}건 표시 {loadingMore ? '· 나머지 불러오는 중' : ''} · 민감정보 마스킹</p></div>
           <div className="case-list">{loading && !cases.length && <div className="empty-list loading-list"><span>⌁</span><strong>문의 목록을 불러오는 중입니다.</strong><p>구글시트 동기화 상태에 따라 약 5~15초 걸릴 수 있어요.</p></div>}{filteredCases.map((item) => { const meta = statusMeta[item.status]; return <button key={item.id} className={`case-item ${selected?.id === item.id ? 'active' : ''}`} onClick={() => selectCase(item.id)}><div className="case-item-top"><span className={`status-pill ${meta.tone}`}>{meta.shortLabel}</span><time>{item.updatedAt}</time></div><div className="case-title-row"><strong>{item.customer}</strong></div><p className="case-product">{item.product}</p><p className="case-preview">{item.preview}</p><div className="case-meta"><span className={`surface-tag ${item.surface}`}>{item.surface === 'chat' ? '● 채팅형' : '▤ 게시글형'}</span><span>{item.channel}</span><span>{item.category}</span></div></button>; })}{!loading && !filteredCases.length && <div className="empty-list">조건에 맞는 문의가 없습니다.</div>}</div>
         </section>
         <section className="conversation-column" aria-label="전체 대화">{!selected ? <div className="panel-empty"><span>⌁</span><strong>표시할 문의가 없습니다.</strong><p>상태 필터를 바꾸거나 데이터를 다시 불러와 주세요.</p></div> : <>
           <header className="case-header"><div><div className="case-heading-line"><span className={`status-pill ${statusMeta[selected.status].tone}`}>{statusMeta[selected.status].label}</span><span className={`surface-label ${selected.surface}`}>{selected.surface === 'chat' ? '● 채팅형 문의' : '▤ 게시글형 문의'}</span><span className="case-id">{selected.id}</span></div><h2>{selected.product}</h2><p>{selected.channel} · 고객 {selected.customer}</p></div><button className="icon-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && window.open(selected.sourceUrl, '_blank', 'noopener,noreferrer')}>원문 열기 ↗</button></header>
           {selected.alert && <div className="warning-banner"><span>!</span><div><strong>사람 검토가 필요한 문의입니다.</strong><p>{selected.alert} · 자동 전송 금지</p></div></div>}{detailLoading && <div className="detail-loading">상세 메시지를 불러오는 중…</div>}
-          {selected.surface === 'chat' ? <div className="conversation-scroll chat-surface"><div className="chat-notice">수집된 대화 · 시간순 메시지</div><div className="date-divider"><span>최근 대화</span></div>{selected.messages.length ? selected.messages.map((message, index) => <div key={`${selected.id}-${index}`} className={`message-row ${message.actor}`}><div className="avatar">{message.actor === 'seller' ? 'P' : 'C'}</div><div className="message-wrap"><div className="message-label"><strong>{message.actor === 'seller' ? '판매자 실제 답변' : '고객'}</strong><time>{message.time}</time></div><div className="message-bubble">{message.image && <div className="image-placeholder">▧ 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div></div></div>) : <div className="collection-gap"><span>!</span><strong>과거 이관분이라 문의 본문이 없습니다.</strong><p>고객·상품·문의유형만 이관된 기록입니다. 신규 수집 건부터 실제 대화가 표시됩니다.</p></div>}</div>
-          : <div className="post-scroll"><article className="post-card"><div className="post-card-label"><span>문의 게시글</span><span>공개여부 미수집</span></div><h3>{selected.postTitle ?? selected.category}</h3><dl className="post-meta-grid"><div><dt>작성자</dt><dd>{selected.customer}</dd></div><div><dt>등록 시각</dt><dd>{customerMessages[0]?.time ?? selected.updatedAt}</dd></div><div><dt>문의 유형</dt><dd>{selected.category}</dd></div><div><dt>상품</dt><dd>{selected.product}</dd></div></dl><div className="post-body">{customerMessages.length ? customerMessages.map((message, index) => <div key={`${selected.id}-post-${index}`}>{message.image && <div className="post-attachment">▧ 고객 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div>) : <div className="collection-gap"><span>!</span><strong>과거 이관분이라 문의 본문이 없습니다.</strong><p>신규 수집 건부터 게시글 원문이 표시됩니다.</p></div>}</div></article><section className="board-answer"><div className="board-answer-title"><div><span className="answer-icon">P</span><div><strong>판매자 답변</strong><small>쇼핑몰에서 수집된 실제 답변</small></div></div>{sellerMessages[0] && <time>{sellerMessages[0].time}</time>}</div>{sellerMessages.length ? <div className="board-answer-body">{sellerMessages.map((message, index) => <p key={`${selected.id}-answer-${index}`}>{message.text}</p>)}</div> : <div className="board-answer-empty">아직 수집된 판매자 답변이 없습니다.</div>}</section></div>}
+          {selected.surface === 'chat' ? <div className="conversation-scroll chat-surface"><div className="chat-notice">수집된 대화 · 시간순 메시지</div><div className="date-divider"><span>최근 대화</span></div>{selected.messages.length ? selected.messages.map((message, index) => <div key={`${selected.id}-${index}`} className={`message-row ${message.actor}`}><div className="avatar">{message.actor === 'seller' ? 'P' : 'C'}</div><div className="message-wrap"><div className="message-label"><strong>{message.actor === 'seller' ? '판매자 실제 답변' : '고객'}</strong><time>{message.time}</time></div><div className="message-bubble">{message.image && <div className="image-placeholder">▧ 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div></div></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 열기에서 쇼핑몰의 문의 내용을 확인해 주세요.</p></div>}</div>
+          : <div className="post-scroll"><article className="post-card"><div className="post-card-label"><span>문의 게시글</span><span>공개여부 미수집</span></div><h3>{selected.postTitle ?? selected.category}</h3><dl className="post-meta-grid"><div><dt>작성자</dt><dd>{selected.customer}</dd></div><div><dt>등록 시각</dt><dd>{customerMessages[0]?.time ?? selected.updatedAt}</dd></div><div><dt>문의 유형</dt><dd>{selected.category}</dd></div><div><dt>상품</dt><dd>{selected.product}</dd></div></dl><div className="post-body">{customerMessages.length ? customerMessages.map((message, index) => <div key={`${selected.id}-post-${index}`}>{message.image && <div className="post-attachment">▧ 고객 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 열기에서 쇼핑몰의 문의 내용을 확인해 주세요.</p></div>}</div></article><section className="board-answer"><div className="board-answer-title"><div><span className="answer-icon">P</span><div><strong>판매자 답변</strong><small>쇼핑몰에서 수집된 실제 답변</small></div></div>{sellerMessages[0] && <time>{sellerMessages[0].time}</time>}</div>{sellerMessages.length ? <div className="board-answer-body">{sellerMessages.map((message, index) => <p key={`${selected.id}-answer-${index}`}>{message.text}</p>)}</div> : <div className="board-answer-empty">아직 수집된 판매자 답변이 없습니다.</div>}</section></div>}
           <footer className="source-footer"><span>🔒 고객정보 마스킹됨</span><span>{selected.surface === 'chat' ? '채팅형' : '게시글형'} · 읽기 전용 수집 기록</span><span>원본 확인 {selected.updatedAt}</span></footer></>}
         </section>
         <aside className="reply-column" aria-label="답변 검수">{!selected ? <div className="panel-empty"><strong>문의를 선택해 주세요.</strong></div> : <><div className="reply-scroll">
-          <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>AI 추천답변</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">사람 답변과 구분 · 자동 전송되지 않은 참고 문장</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>필수 확인사항</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · 저장된 AI 초안</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button><button className="purple-button" onClick={() => setEditor(selected.ai!.text)}>수정란에 적용</button></div></> : <div className="empty-draft"><span>✦</span><strong>저장된 AI 추천답변이 없습니다.</strong><p>AI 초안이 생성되면 사람 답변과 분리되어 여기에 표시됩니다.</p></div>}</section>
-          <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>사람 수정본</h3></div><span className="draft-status">{selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력'}</span></div><label className="editor-label" htmlFor="human-draft">쇼핑몰에 복사할 최종 문장을 확인하세요.</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} placeholder="AI 추천을 적용하거나 직접 답변을 작성하세요."/><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" onClick={() => notify('저장은 ChatGPT 플러그인의 review_ai_draft에서만 수행합니다.')}>저장 안내</button><button className="primary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">이 화면에서는 쇼핑몰로 답변을 전송하지 않습니다.</p></section>
+          <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>{selected.ai?.mode === 'eval' ? 'AI 검증 초안' : 'AI 추천답변'}</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">{selected.ai?.mode === 'eval' ? '답변 완료 후 생성된 학습·검증용 초안 · 실제 사람 답변과 비교' : '사람 답변과 구분 · 자동 전송되지 않은 참고 문장'}</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>{selected.ai.mode === 'eval' ? '검증 조건' : '필수 확인사항'}</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · {selected.ai.mode === 'eval' ? 'EVAL 섀도 초안' : '저장된 AI 초안'}</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button>{selected.ai.mode !== 'eval' && <button className="purple-button" onClick={() => setEditor(selected.ai!.text)}>수정란에 적용</button>}</div></> : <div className="empty-draft"><span>✦</span><strong>저장된 AI 추천답변이 없습니다.</strong><p>AI 초안이 생성되면 사람 답변과 분리되어 여기에 표시됩니다.</p></div>}</section>
+          <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>{selected.ai?.mode === 'eval' ? '검증 메모' : '사람 수정본'}</h3></div><span className="draft-status">{selected.ai?.mode === 'eval' ? 'EVAL · 실제 답변과 비교' : (selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력')}</span></div><label className="editor-label" htmlFor="human-draft">{selected.ai?.mode === 'eval' ? '학습·검증용 초안은 실제 답변과 비교만 합니다.' : '쇼핑몰에 복사할 최종 문장을 확인하세요.'}</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} disabled={selected.ai?.mode === 'eval'} placeholder={selected.ai?.mode === 'eval' ? '아래 실제 사람 답변과 AI 검증 초안을 비교해 주세요.' : 'AI 추천을 적용하거나 직접 답변을 작성하세요.'}/><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" disabled={!selected.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || reviewSaving} onClick={() => saveReview('REJECTED')}>초안 거절</button><button className="primary-button" disabled={!selected.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || !editor.trim() || reviewSaving} onClick={() => saveReview('APPROVED')}>{reviewSaving ? '저장 중' : '검수 저장'}</button><button className="secondary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">{selected.ai?.mode === 'eval' ? '학습·검증용 섀도 초안입니다. 운영 상태와 쇼핑몰 답변에는 영향을 주지 않습니다.' : (localReviewEnabled ? '개발 Sheet에 사람 검수본만 저장합니다. 쇼핑몰로는 전송하지 않습니다.' : '검수 저장은 로컬 development 화면에서만 사용할 수 있습니다. 쇼핑몰로는 전송하지 않습니다.')}</p></section>
           <section className={`reply-section actual-section ${selected.actualReply ? 'verified' : ''}`}><div className="section-title"><div><span className="section-kicker actual">실제</span><h3>쇼핑몰 실제 답변</h3></div>{selected.actualReply ? <span className="verified-label">✓ 확인 완료</span> : <span className="unverified-label">미확인</span>}</div>{selected.actualReply ? <><div className="draft-card actual-draft">{selected.actualReply.text}</div><div className="verification-meta"><span>답변 시각 {selected.actualReply.sentAt}</span><span>최근 수집 확인 {selected.actualReply.verifiedAt}</span></div></> : <div className="verification-empty"><span className="scan-icon">⌁</span><div><strong>판매자 답변이 아직 확인되지 않았습니다.</strong><p>다음 수집에서 쇼핑몰 메시지와 답변 상태를 다시 확인합니다.</p></div></div>}</section>
         </div><div className="reply-bottom-bar"><div><span className="reply-state-dot" style={{ background: statusMeta[selected.status].dot }}/><strong>{statusMeta[selected.status].label}</strong></div><button onClick={() => notify('이 버튼은 아직 수집 매크로를 실행하지 않습니다.')}>답변 재확인 준비중</button></div></>}</aside>
       </div>

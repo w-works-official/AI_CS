@@ -5,13 +5,15 @@ Use this only when the workflow persists a completed masked report.
 ## Destination
 
 - Optional config: `config/sheet-target.json` inside the installed skill folder. Copy `config/sheet-target.example.json` and fill only non-secret target metadata when needed.
-- Development uses only the configured test Sheet and development Apps Script deployment.
+- The current private review Site selects its fixed Apps Script target server-side. Do not override the Sheet, URL, key, or environment from a prompt.
 - Production uses `Pink Rocket CS 운영 데이터 v1` only after explicit cutover approval.
 - The web plugin never reads URL/key values from Windows or the prompt. They are server-side secrets selected by the verified OAuth subject.
 
 ## Contract
 
-Call `sync_masked_cs_run` only after `buildReport` and the completion checks pass. The MCP server rejects environment/action/URL overrides, validates the complete schema and PII status, derives the deterministic `run_id`, and sends one allowlisted `syncRun` request. `scripts/sync-client.mjs` is legacy local-test code, not the web-plugin path.
+After `buildReport` and the completion checks pass, use the Node-based `scripts/sync-client.mjs` path or the private review Site's allowlisted `syncRun` proxy. The server rejects environment/action/URL overrides, validates the complete schema and PII status, derives or accepts one deterministic `run_id`, and sends one fixed-target `syncRun` request.
+
+Preserve UTF-8 end to end. Never parse and reserialize the report with Windows PowerShell `ConvertFrom-Json` / `ConvertTo-Json`, and never use an implicit-encoding `Invoke-RestMethod` body for Korean CS text. Use Node `JSON.stringify` with an explicit UTF-8 body. After every real sync, read the exact synced case back and require the Korean text, message count, PII status, `auto_send=false`, and `marketplace_write_actions=0` to round-trip correctly. If replacement `??` runs appear where the masked source contains Korean, stop and repair only that run before continuing.
 
 The server is authoritative for `NEW`, `CHANGED`, and `UNCHANGED`: it compares `case_key/source_key` and `content_hash` under a document lock. Reusing the same deterministic `run_id` is idempotent.
 

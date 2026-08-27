@@ -1,0 +1,144 @@
+const ALLOWED_REVIEW_STATES = new Set(["APPROVED", "REJECTED"]);
+const ALLOWED_REVIEW_KEYS = new Set(["draft_id", "draft_state", "review_note", "human_revision"]);
+const ALLOWED_SYNC_KEYS = new Set(["action", "run_id", "report", "model", "prompt_version"]);
+const ALLOWED_REPORT_KEYS = new Set(["schema_version", "mode", "range", "collected_at", "duration_ms", "summary", "channels", "records"]);
+const ALLOWED_RECORD_KEYS = new Set([
+  "market", "channel", "source_key", "occurred_at", "status", "category", "customer_masked",
+  "subject", "preview", "product_id", "product_name", "order_no_masked", "product_order_no_masked",
+  "messages", "seller_replies", "last_actor", "reply_state", "ai_draft", "ai_draft_origin",
+  "ai_draft_purpose", "ai_draft_required_checks", "ai_draft_pii_scan", "pii_scan", "content_hash", "change_state",
+]);
+const ALLOWED_MESSAGE_KEYS = new Set(["direction", "actor", "at", "text", "image_count"]);
+
+function safeText(value: unknown, maxLength: number): string {
+  return String(value ?? "").trim().slice(0, maxLength);
+}
+
+export function assertMaskedReviewText(value: string): void {
+  if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(value)) throw new Error("UNMASKED_PHONE");
+  if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)) throw new Error("UNMASKED_EMAIL");
+  if (/\b\d{12,}\b/.test(value)) throw new Error("UNMASKED_LONG_NUMBER");
+}
+
+export function normalizeReviewRequest(input: unknown) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("INVALID_REVIEW_REQUEST");
+  const raw = input as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!ALLOWED_REVIEW_KEYS.has(key)) throw new Error(`REVIEW_PARAM_NOT_ALLOWED:${key}`);
+  }
+  const draftId = safeText(raw.draft_id, 300);
+  const draftState = safeText(raw.draft_state, 20).toUpperCase();
+  const reviewNote = safeText(raw.review_note, 1000);
+  const humanRevision = safeText(raw.human_revision, 4000);
+  if (!draftId) throw new Error("DRAFT_ID_REQUIRED");
+  if (!ALLOWED_REVIEW_STATES.has(draftState)) throw new Error("INVALID_DRAFT_STATE");
+  if (draftState === "APPROVED" && !humanRevision) throw new Error("HUMAN_REVISION_REQUIRED");
+  assertMaskedReviewText(reviewNote);
+  assertMaskedReviewText(humanRevision);
+  return {
+    action: "reviewDraft" as const,
+    draft_id: draftId,
+    draft_state: draftState as "APPROVED" | "REJECTED",
+    review_note: reviewNote,
+    human_revision: humanRevision,
+  };
+}
+
+function plainObject(value: unknown, error: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(error);
+  return value as Record<string, unknown>;
+}
+
+function assertOnlyKeys(raw: Record<string, unknown>, allowed: Set<string>, error: string): void {
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) throw new Error(`${error}:${key}`);
+  }
+}
+
+function normalizedMessage(value: unknown): Record<string, unknown> {
+  const raw = plainObject(value, "INVALID_MESSAGE");
+  assertOnlyKeys(raw, ALLOWED_MESSAGE_KEYS, "MESSAGE_PARAM_NOT_ALLOWED");
+  const text = safeText(raw.text, 8000);
+  assertMaskedReviewText(text);
+  return {
+    ...(raw.direction !== undefined ? { direction: safeText(raw.direction, 20) } : {}),
+    ...(raw.actor !== undefined ? { actor: safeText(raw.actor, 20) } : {}),
+    at: safeText(raw.at, 50),
+    text,
+    image_count: Math.max(0, Math.min(Number(raw.image_count) || 0, 100)),
+  };
+}
+
+function normalizedRecord(value: unknown): Record<string, unknown> {
+  const raw = plainObject(value, "INVALID_RECORD");
+  assertOnlyKeys(raw, ALLOWED_RECORD_KEYS, "RECORD_PARAM_NOT_ALLOWED");
+  const sourceKey = safeText(raw.source_key, 500);
+  const contentHash = safeText(raw.content_hash, 200);
+  if (!sourceKey) throw new Error("SOURCE_KEY_REQUIRED");
+  if (!contentHash) throw new Error("CONTENT_HASH_REQUIRED");
+  if (safeText(raw.pii_scan, 20).toUpperCase() !== "PASS") throw new Error("PII_SCAN_PASS_REQUIRED");
+
+  const customerMasked = safeText(raw.customer_masked, 500);
+  if (customerMasked && !customerMasked.includes("*")) throw new Error("CUSTOMER_NOT_MASKED");
+  const textFields = ["customer_masked", "subject", "preview", "product_name", "ai_draft", "ai_draft_required_checks"] as const;
+  for (const field of textFields) assertMaskedReviewText(safeText(raw[field], field === "ai_draft" ? 8000 : 2000));
+  for (const field of ["order_no_masked", "product_order_no_masked"] as const) {
+    if (/^\d{10,}$/.test(safeText(raw[field], 200))) throw new Error(`UNMASKED_LONG_NUMBER:${field}`);
+  }
+
+  const replyState = safeText(raw.reply_state, 30).toUpperCase();
+  const draftText = safeText(raw.ai_draft, 8000);
+  const draftPurpose = safeText(raw.ai_draft_purpose, 20).toUpperCase();
+  if (draftText) {
+    if (safeText(raw.ai_draft_origin, 20).toUpperCase() !== "AI") throw new Error("AI_DRAFT_ORIGIN_REQUIRED");
+    if (safeText(raw.ai_draft_pii_scan, 20).toUpperCase() !== "PASS") throw new Error("AI_DRAFT_PII_SCAN_REQUIRED");
+    const replyDraft = replyState === "NEEDS_REPLY" && draftPurpose === "REPLY";
+    const evalDraft = replyState === "ANSWERED" && draftPurpose === "EVAL";
+    if (!replyDraft && !evalDraft) throw new Error("AI_DRAFT_REPLY_STATE_MISMATCH");
+  }
+
+  const messages = Array.isArray(raw.messages) ? raw.messages.map(normalizedMessage) : [];
+  const sellerReplies = Array.isArray(raw.seller_replies) ? raw.seller_replies.map(normalizedMessage) : [];
+  return {
+    market: safeText(raw.market, 50), channel: safeText(raw.channel, 100), source_key: sourceKey,
+    occurred_at: safeText(raw.occurred_at, 50), status: safeText(raw.status, 100), category: safeText(raw.category, 300),
+    customer_masked: customerMasked, subject: safeText(raw.subject, 2000), preview: safeText(raw.preview, 2000),
+    product_id: safeText(raw.product_id, 300), product_name: safeText(raw.product_name, 2000),
+    order_no_masked: safeText(raw.order_no_masked, 300), product_order_no_masked: safeText(raw.product_order_no_masked, 300),
+    messages, seller_replies: sellerReplies, last_actor: safeText(raw.last_actor, 20), reply_state: replyState,
+    ai_draft: draftText, ai_draft_origin: safeText(raw.ai_draft_origin, 20).toUpperCase(), ai_draft_purpose: draftPurpose,
+    ai_draft_required_checks: safeText(raw.ai_draft_required_checks, 2000), ai_draft_pii_scan: safeText(raw.ai_draft_pii_scan, 20).toUpperCase(),
+    pii_scan: "PASS", content_hash: contentHash, change_state: safeText(raw.change_state, 30).toUpperCase(),
+  };
+}
+
+export function normalizeSyncRequest(input: unknown) {
+  const raw = plainObject(input, "INVALID_SYNC_REQUEST");
+  assertOnlyKeys(raw, ALLOWED_SYNC_KEYS, "SYNC_PARAM_NOT_ALLOWED");
+  if (raw.action !== "syncRun") throw new Error("UNKNOWN_WRITE_ACTION");
+  const report = plainObject(raw.report, "INVALID_REPORT");
+  assertOnlyKeys(report, ALLOWED_REPORT_KEYS, "REPORT_PARAM_NOT_ALLOWED");
+  if (Number(report.schema_version) !== 1) throw new Error("INVALID_REPORT_SCHEMA");
+  const summary = plainObject(report.summary ?? {}, "INVALID_REPORT_SUMMARY");
+  if (Number(summary.marketplace_write_actions ?? 0) !== 0) throw new Error("MARKETPLACE_WRITE_ACTIONS_NOT_ALLOWED");
+  const records = Array.isArray(report.records) ? report.records : [];
+  if (records.length > 2000) throw new Error("SYNC_BATCH_TOO_LARGE");
+  const normalizedRecords = records.map(normalizedRecord);
+  if (new Set(normalizedRecords.map((record) => record.source_key)).size !== normalizedRecords.length) throw new Error("DUPLICATE_SOURCE_KEY");
+  return {
+    action: "syncRun" as const,
+    run_id: safeText(raw.run_id, 300),
+    model: safeText(raw.model, 100),
+    prompt_version: safeText(raw.prompt_version, 100),
+    report: {
+      schema_version: 1,
+      mode: safeText(report.mode, 50),
+      range: report.range,
+      collected_at: safeText(report.collected_at, 50),
+      duration_ms: Math.max(0, Number(report.duration_ms) || 0),
+      summary,
+      channels: report.channels,
+      records: normalizedRecords,
+    },
+  };
+}

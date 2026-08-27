@@ -19,8 +19,9 @@
     "check:mcp-worker": "npm run test:mcp-worker && npm run build:mcp-worker && npm run verify:mcp-worker-bundle",
     "dev:mcp-worker": "wrangler dev --config wrangler.mcp-development.jsonc --local",
     "test:apps-script": "node apps-script/Code.contract.test.cjs",
-    "test:skill": "node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/answer-library-core.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/notion-answer-adapter.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.test.mjs",
-    "check": "npm run typecheck && npm run test:skill && npm run test:apps-script && npm run test:mcp && npm run check:mcp-worker && npm run lint && npm run build"
+    "test:web-api": "node --experimental-strip-types --test app/api/cs/policy.test.ts",
+    "test:skill": "node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/browser-session-core.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/answer-library-core.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/notion-answer-adapter.test.mjs && node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.test.mjs",
+    "check": "npm run typecheck && npm run test:skill && npm run test:apps-script && npm run test:web-api && npm run test:mcp && npm run check:mcp-worker && npm run lint && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
