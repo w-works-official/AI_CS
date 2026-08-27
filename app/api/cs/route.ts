@@ -77,7 +77,7 @@ export async function GET(request: NextRequest) {
     if (!response.ok || !payload || payload.ok === false) {
       return privateJson({ ok: false, error: payload?.error ?? `UPSTREAM_HTTP_${response.status}` }, response.status >= 400 ? response.status : 502);
     }
-    if (payload.environment !== target.environment || payload.auto_send !== false) {
+    if ((payload.environment && payload.environment !== target.environment) || payload.auto_send !== false) {
       return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: target.environment, auto_send: false }, 502);
     }
     responseCache.set(cacheKey, {
