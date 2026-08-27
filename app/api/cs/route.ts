@@ -59,21 +59,19 @@ export async function GET(request: NextRequest) {
   const cached = responseCache.get(cacheKey);
   if (!fresh && cached && cached.expiresAt > Date.now()) return privateJson(cached.payload, 200, action === 'case' ? 60 : 30);
 
-  const upstreamBody: Record<string, string> = {};
+  const upstream = new URL(target.endpoint);
   request.nextUrl.searchParams.forEach((value, key) => {
-    if (ALLOWED_PARAMS.has(key)) upstreamBody[key] = value;
+    if (ALLOWED_PARAMS.has(key)) upstream.searchParams.set(key, value);
   });
-  upstreamBody.action = action;
-  upstreamBody.api_key = target.apiKey;
-  upstreamBody.environment = target.environment;
+  upstream.searchParams.set('action', action);
+  upstream.searchParams.set('api_key', target.apiKey);
+  upstream.searchParams.set('environment', target.environment);
 
   try {
-    const response = await fetch(target.endpoint, {
-      method: 'POST',
+    const response = await fetch(upstream, {
       cache: 'no-store',
       redirect: 'follow',
-      headers: { Accept: 'application/json', 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(upstreamBody),
+      headers: { Accept: 'application/json' },
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload || payload.ok === false) {
