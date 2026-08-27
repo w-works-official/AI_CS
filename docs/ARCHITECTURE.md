@@ -14,14 +14,16 @@
 
 - 쇼핑몰 원문: 각 마켓 판매자센터
 - 운영 데이터: Google Sheets
-- 수집·정규화 규칙: `skills/marketplace-cs-monitor`
+- 수집·정규화 규칙: `plugins/ai-cs/skills/marketplace-cs-monitor`
+- 개인 플러그인 패키지: `plugins/ai-cs`
+- OAuth 보호 원격 MCP: `mcp-server` 및 `/mcp`
 - 조회·동기화 계약: `apps-script/Code.gs`
 - 검수 UI: `app/`
 
 ## 공개 저장소에 넣지 않는 값
 
-- `MARKETPLACE_CS_SYNC_KEY`
-- 운영 Apps Script 웹 앱 URL
+- 환경별 Apps Script 키
+- 개발·운영 Apps Script 웹 앱 URL
 - Google 계정 쿠키, 로그인 토큰, 브라우저 프로필
 - 마스킹 전 고객 메시지와 주문번호
 - 운영 Sheet의 원본 데이터 덤프
@@ -38,4 +40,4 @@ AI 초안의 `APPROVED`, `REJECTED`, `USED`는 내부 검수 상태이며 쇼핑
 
 ## 배포
 
-공개 검수 UI는 `https://w-works-official.github.io/AI_CS/`에서 정적 GitHub Pages로 제공합니다. GitHub Pages는 서버 라우트나 비밀 키를 실행할 수 없으므로, 브라우저는 별도 읽기 전용 프록시를 호출합니다. 프록시만 Apps Script 키를 보유하며 공개 프론트에는 키와 운영 Sheet ID가 포함되지 않습니다.
+플러그인과 MCP는 `.openai/hosting.json`의 기존 Sites 프로젝트를 재사용합니다. 개발 배포와 운영 배포는 같은 저장소를 사용하더라도 서로 다른 서버 비밀값과 OAuth 클라이언트를 가져야 합니다. GitHub Pages 정적 UI는 MCP/OAuth 서버가 아니며, 비밀값이나 운영 데이터 접근 권한을 포함해서는 안 됩니다.

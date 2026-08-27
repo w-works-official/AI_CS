@@ -9,6 +9,18 @@ const cacheScope = globalThis as typeof globalThis & { __pinkRocketCsCache?: Map
 const responseCache = cacheScope.__pinkRocketCsCache ?? new Map<string, CacheEntry>();
 cacheScope.__pinkRocketCsCache = responseCache;
 const publicWebOrigin = process.env.CS_PUBLIC_WEB_ORIGIN ?? 'https://w-works-official.github.io';
+type WebEnvironment = 'development' | 'production';
+
+function webTarget() {
+  const environment = process.env.AI_CS_WEB_ENVIRONMENT as WebEnvironment | undefined;
+  if (environment !== 'development' && environment !== 'production') throw new Error('CS_WEB_ENVIRONMENT_NOT_CONFIGURED');
+  if (environment === 'production' && process.env.AI_CS_PRODUCTION_ENABLED !== 'true') throw new Error('CS_PRODUCTION_DISABLED');
+  const prefix = environment === 'development' ? 'AI_CS_DEV' : 'AI_CS_PROD';
+  const endpoint = process.env[`${prefix}_APPS_SCRIPT_URL`];
+  const apiKey = process.env[`${prefix}_APPS_SCRIPT_KEY`];
+  if (!endpoint || !apiKey) throw new Error('CS_DATA_CONNECTION_NOT_CONFIGURED');
+  return { environment, endpoint, apiKey };
+}
 
 function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
   return NextResponse.json(body, {
@@ -23,9 +35,12 @@ function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
 }
 
 export async function GET(request: NextRequest) {
-  const endpoint = process.env.MARKETPLACE_CS_SYNC_URL;
-  const apiKey = process.env.MARKETPLACE_CS_SYNC_KEY;
-  if (!endpoint || !apiKey) return privateJson({ ok: false, error: 'CS_DATA_CONNECTION_NOT_CONFIGURED' }, 503);
+  let target: ReturnType<typeof webTarget>;
+  try {
+    target = webTarget();
+  } catch (error) {
+    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_DATA_CONNECTION_NOT_CONFIGURED', environment: 'unconfigured', auto_send: false }, 503);
+  }
 
   const action = request.nextUrl.searchParams.get('action') ?? 'overview';
   if (!ALLOWED_ACTIONS.has(action)) return privateJson({ ok: false, error: 'UNKNOWN_ACTION' }, 400);
@@ -40,18 +55,28 @@ export async function GET(request: NextRequest) {
   const cached = responseCache.get(cacheKey);
   if (!fresh && cached && cached.expiresAt > Date.now()) return privateJson(cached.payload, 200, action === 'case' ? 60 : 30);
 
-  const upstream = new URL(endpoint);
+  const upstreamBody: Record<string, string> = {};
   request.nextUrl.searchParams.forEach((value, key) => {
-    if (ALLOWED_PARAMS.has(key)) upstream.searchParams.set(key, value);
+    if (ALLOWED_PARAMS.has(key)) upstreamBody[key] = value;
   });
-  upstream.searchParams.set('action', action);
-  upstream.searchParams.set('api_key', apiKey);
+  upstreamBody.action = action;
+  upstreamBody.api_key = target.apiKey;
+  upstreamBody.environment = target.environment;
 
   try {
-    const response = await fetch(upstream, { cache: 'no-store', redirect: 'follow', headers: { Accept: 'application/json' } });
-    const payload = await response.json().catch(() => null);
+    const response = await fetch(target.endpoint, {
+      method: 'POST',
+      cache: 'no-store',
+      redirect: 'follow',
+      headers: { Accept: 'application/json', 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(upstreamBody),
+    });
+    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload || payload.ok === false) {
       return privateJson({ ok: false, error: payload?.error ?? `UPSTREAM_HTTP_${response.status}` }, response.status >= 400 ? response.status : 502);
+    }
+    if (payload.environment !== target.environment || payload.auto_send !== false) {
+      return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: target.environment, auto_send: false }, 502);
     }
     responseCache.set(cacheKey, {
       payload,

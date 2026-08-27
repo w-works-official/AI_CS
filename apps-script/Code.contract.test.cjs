@@ -25,6 +25,8 @@ const context = {
 };
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(`${__dirname}/Code.gs`, "utf8"), context);
+const source = fs.readFileSync(`${__dirname}/Code.gs`, "utf8");
+assert.match(source, /\['health', 'overview', 'cases', 'case', 'answerLibrary'\]/);
 
 const record = {
   market: "smartstore",
@@ -46,6 +48,7 @@ const record = {
   reply_state: "NEEDS_REPLY",
   ai_draft: "안녕하세요. 옵션 확인 후 안내드리겠습니다.",
   ai_draft_origin: "AI",
+  ai_draft_pii_scan: "PASS",
   pii_scan: "PASS",
 };
 
@@ -76,5 +79,33 @@ assert.equal(messages[0].message_id, undefined);
 
 assert.equal(context.mapReplyState_("NO_REPLY"), "NO_REPLY_REQUIRED");
 assert.equal(context.channelInfo_("zigzag", "item_question").channel, "상품 문의");
+
+context.getObjects_ = () => [{
+  example_id: "ANS_test",
+  enabled: true,
+  quality_state: "USE",
+  pii_scan: "PASS",
+  intent: "배송",
+  market: "SMARTSTORE",
+  channel: "톡톡 상담",
+  risk_level: "REVIEW_REQUIRED",
+  customer_question: "배송은 언제 출고되나요?",
+  product_name: "샘플 피어싱",
+  human_answer: "주문 상태를 확인한 뒤 출고 일정을 안내드리겠습니다.",
+  required_checks: "실제 주문 및 출고 상태 확인",
+  keywords: "배송, 출고",
+  last_verified_at: "2026-08-25T01:01:00Z",
+}];
+const ranked = context.searchVerifiedAnswers_({
+  query: "배송 출고 언제",
+  market: "SMARTSTORE",
+  channel: "톡톡 상담",
+  intent: "배송",
+  limit: 3,
+});
+assert.equal(ranked.reference_source, "VERIFIED_HUMAN_ANSWER_ONLY");
+assert.equal(ranked.examples.length, 1);
+assert.equal(ranked.examples[0].example_id, "ANS_test");
+assert.equal(ranked.examples[0].human_answer.includes("주문 상태"), true);
 
 console.log("Pink Rocket CS Apps Script sync contract: PASS");

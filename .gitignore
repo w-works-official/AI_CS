@@ -7,7 +7,12 @@ pages-dist/
 .env
 .env.local
 .env.*.local
+plugins/ai-cs/.app.json
+plugins/ai-cs/dist/
+plugins/ai-cs/*.zip
+plugins/ai-cs/skills/marketplace-cs-monitor/config/sheet-target.json
 *.log
+*.tsbuildinfo
 *.zip
 .DS_Store
 Thumbs.db

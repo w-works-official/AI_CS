@@ -1,6 +1,6 @@
 # Pink Rocket CS Apps Script API
 
-Google Sheet `Pink Rocket CS 운영 데이터 v1`에 연결하는 읽기, 마스킹된 수집 결과 업서트, AI 초안 검토 API입니다.
+환경별 Google Sheet에 연결하는 읽기, 마스킹된 수집 결과 업서트, 검증된 사람답변 검색, AI 초안 검토 API입니다. 개발 배포는 테스트 Sheet만 사용하고 운영 배포만 승인 후 `Pink Rocket CS 운영 데이터 v1`을 사용합니다.
 
 ## 안전 경계
 
@@ -16,15 +16,15 @@ Google Sheet `Pink Rocket CS 운영 데이터 v1`에 연결하는 읽기, 마스
 2. `Code.gs`와 `appsscript.json` 내용을 각각 붙여넣습니다.
 3. 연결형 프로젝트이면 별도 스프레드시트 ID가 필요 없습니다.
 4. 독립형 프로젝트이면 스크립트 속성 `CS_SPREADSHEET_ID`에 대상 Sheet ID를 설정합니다.
-5. 스크립트 속성 `CS_API_KEY`를 설정해야 모든 POST 요청이 허용됩니다.
-6. 웹 앱 배포 URL은 로컬 환경변수 `MARKETPLACE_CS_SYNC_URL`, 같은 키는 `MARKETPLACE_CS_SYNC_KEY`에 설정합니다.
+5. 개발 배포는 `CS_ENVIRONMENT=development`, 운영 배포는 `CS_ENVIRONMENT=production`을 설정합니다.
+6. 모든 요청에 필요한 별도 `CS_API_KEY`를 설정합니다. 키가 없으면 GET과 POST 모두 거부됩니다.
+7. 운영 배포에만 `CS_PRODUCTION_ENABLED=true`를 설정합니다.
+8. `03_AI_DRAFTS`에 사람 수정본을 AI 원문과 분리하는 `human_revision` 열을 추가합니다.
+9. 배포 URL과 키는 MCP 서버의 환경별 비밀값으로 등록합니다. 로컬 Windows 사용자 환경이나 프롬프트에서 읽지 않습니다.
 
-## GET
+## 읽기 요청
 
-- `?action=health`
-- `?action=overview`
-- `?action=cases&reply_state=NEEDS_REPLY&limit=50&cursor=0`
-- `?action=case&case_key=...`
+서버 클라이언트는 키가 URL이나 접근 로그에 남지 않도록 `Content-Type: text/plain` POST JSON으로 읽기 요청을 보냅니다. 지원 작업은 `health`, `overview`, `cases`, `case`, `answerLibrary`입니다. `answerLibrary`는 `enabled=TRUE`, `quality_state=USE`, `pii_scan=PASS`인 사람답변만 최대 3개 반환합니다. 레거시 진단용 GET도 인증과 환경 검사를 동일하게 적용합니다.
 
 ## POST
 
@@ -35,6 +35,7 @@ Google Sheet `Pink Rocket CS 운영 데이터 v1`에 연결하는 읽기, 마스
 ```json
 {
   "action": "syncRun",
+  "environment": "development",
   "run_id": "SYNC_...",
   "report": {
     "schema_version": 1,
@@ -53,9 +54,11 @@ AI 초안 검토:
 ```json
 {
   "action": "reviewDraft",
+  "environment": "development",
   "draft_id": "...",
   "draft_state": "APPROVED",
   "review_note": "검토 완료",
+  "human_revision": "사람이 검토하고 수정한 별도 문장",
   "api_key": "required"
 }
 ```

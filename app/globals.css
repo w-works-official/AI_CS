@@ -153,6 +153,20 @@ button {
   gap: 14px;
 }
 
+.environment-badge {
+  border: 1px solid #d8dce6;
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.environment-badge.development { background: #edf5ff; color: #2769a8; }
+.environment-badge.production { background: #fff0f0; color: #b33b3b; }
+.environment-badge.unconfigured { background: #f1f2f4; color: #676d78; }
+
 .sync-copy {
   position: relative;
   flex-direction: column;

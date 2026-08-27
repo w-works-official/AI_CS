@@ -1,0 +1,27 @@
+{
+  "name": "ai-cs",
+  "version": "0.1.0+codex.20260827013608",
+  "description": "Read-only marketplace CS collection, masked Google Sheets synchronization, and human-reviewed AI drafts.",
+  "author": {
+    "name": "w-works-official"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Pink Rocket AI CS",
+    "shortDescription": "Collect masked CS and review AI reply drafts.",
+    "longDescription": "Uses the signed-in Chrome profile through the official Chrome capability for read-only collection, then calls a private authenticated MCP server to query or synchronize masked CS data. It never types or sends marketplace replies.",
+    "developerName": "w-works-official",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Browser",
+      "MCP",
+      "Skills"
+    ],
+    "defaultPrompt": [
+      "\uc624\ub298 \ubcc0\uacbd\ub41c CS\ub97c \uc77d\uae30 \uc804\uc6a9\uc73c\ub85c \uc218\uc9d1\ud558\uace0 \ub9c8\uc2a4\ud0b9 \uacb0\uacfc\ub9cc \ub3d9\uae30\ud654\ud574 \uc8fc\uc138\uc694.",
+      "\ud604\uc7ac \ud658\uacbd\uacfc CS \ud604\ud669\uc744 \uc870\ud68c\ud574 \uc8fc\uc138\uc694.",
+      "AI \ub2f5\ubcc0 \ucd08\uc548\uc744 \uac80\ud1a0\uc6a9\uc73c\ub85c \ub9cc\ub4e4\ub418 \uc1fc\ud551\ubab0\uc5d0\ub294 \uc804\uc1a1\ud558\uc9c0 \ub9c8\uc138\uc694."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -4,7 +4,7 @@ Claude Code는 `SKILL.md`, 참고 파일, 실행 스크립트로 구성된 Agent
 
 ## 필요한 변경
 
-1. `skills/marketplace-cs-monitor` 전체를 `~/.claude/skills/marketplace-cs-monitor/`에 복사합니다.
+1. `plugins/ai-cs/skills/marketplace-cs-monitor` 전체를 `~/.claude/skills/marketplace-cs-monitor/`에 복사합니다.
 2. `chrome:control-chrome` 지시를 Claude in Chrome의 `claude --chrome` 또는 `/chrome` 흐름으로 바꿉니다.
 3. Codex 절대 경로 예시를 `${CLAUDE_SKILL_DIR}` 기준으로 바꿉니다.
 4. 노션을 사용할 경우 Claude Code에 Notion MCP를 연결합니다.
@@ -25,4 +25,3 @@ Claude Code는 `SKILL.md`, 참고 파일, 실행 스크립트로 구성된 Agent
 - https://code.claude.com/docs/en/skills
 - https://code.claude.com/docs/en/chrome
 - https://code.claude.com/docs/en/mcp
-

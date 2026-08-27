@@ -6,7 +6,8 @@
 
 - `app/` — 상담원용 AI 답변 검수 프론트와 서버 프록시
 - `apps-script/` — Google Sheets 기반 조회·동기화·AI 초안 검토 API
-- `skills/marketplace-cs-monitor/` — Codex용 마켓플레이스 수집 스킬, 정규화·마스킹·답변 참고 로직과 테스트
+- `plugins/ai-cs/` — 개인용 ChatGPT/Codex 플러그인 패키지와 `marketplace-cs-monitor` 스킬
+- `mcp-server/` — OAuth로 보호되는 원격 HTTP MCP와 제한된 Apps Script 도구
 - `docs/marketplace-cs-monitor-manual.md` — 실행 모드와 추천 프롬프트
 - `docs/ARCHITECTURE.md` — 데이터 흐름, 안전 경계, 배포 구조
 - `docs/CLAUDE-CODE.md` — Claude Code 포팅 범위와 설치 체크리스트
@@ -46,18 +47,18 @@ pnpm dev
 pnpm build
 pnpm lint
 node apps-script/Code.contract.test.cjs
-node skills/marketplace-cs-monitor/scripts/report-core.test.mjs
-node skills/marketplace-cs-monitor/scripts/answer-library-core.test.mjs
-node skills/marketplace-cs-monitor/scripts/notion-answer-adapter.test.mjs
-node skills/marketplace-cs-monitor/scripts/sync-client.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/answer-library-core.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/notion-answer-adapter.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.test.mjs
 ```
 
 ## Codex 스킬 설치
 
-`skills/marketplace-cs-monitor` 폴더 전체를 Windows 사용자 전역 스킬 폴더에 복사합니다.
+플러그인 전체 설치가 아닌 레거시 단일 스킬 설치가 필요할 때만 아래 폴더를 복사합니다.
 
 ```powershell
-Copy-Item -Recurse -Force .\skills\marketplace-cs-monitor "$env:USERPROFILE\.codex\skills\marketplace-cs-monitor"
+Copy-Item -Recurse -Force .\plugins\ai-cs\skills\marketplace-cs-monitor "$env:USERPROFILE\.codex\skills\marketplace-cs-monitor"
 ```
 
 설치 후 Codex에서 `마켓플레이스 CS 모니터 스킬로 오늘 변화분을 수집해줘`처럼 요청할 수 있습니다.

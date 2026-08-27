@@ -4,7 +4,7 @@ Read this reference whenever creating, refreshing, or using AI answer recommenda
 
 ## Destination and ownership
 
-- Spreadsheet: `Pink Rocket CS 운영 데이터 v1`
+- Spreadsheet: the OAuth-fixed environment target. Development uses only its test Sheet; production uses `Pink Rocket CS 운영 데이터 v1` only after approved cutover.
 - Sheet: `06_ANSWER_LIBRARY`
 - The library contains masked, verified human question-answer examples only.
 - `01_CASES`, `02_MESSAGES`, and `03_AI_DRAFTS` remain the source-of-truth logs. Do not replace or rewrite them to refresh the library.
@@ -40,7 +40,7 @@ Create one candidate for each contiguous customer turn followed by a contiguous 
 6. Preserve manually edited `enabled`, `quality_state`, `risk_level`, and `note` cells when the example ID already exists.
 7. Verify the final row count, exact header, PII status, dropdown values, frozen header, filter, and wrapping.
 
-The normal Apps Script sync contract owns `01_CASES` through `04_SYNC_RUNS`. `06_ANSWER_LIBRARY` is the one explicit exception: maintain it with the Google Sheets connector after exact-header validation because the current Apps Script web app has no answer-library operation. Never use this exception to write collection tabs directly.
+The normal Apps Script sync contract owns `01_CASES` through `04_SYNC_RUNS`. The MCP tool `search_verified_answers` provides bounded, read-only access to eligible `06_ANSWER_LIBRARY` examples. Maintaining that library remains the one explicit exception: use the Google Sheets connector only after exact-header validation and only in the fixed environment's Sheet. Never use this exception to write collection tabs directly.
 
 Allowed review values:
 
@@ -52,8 +52,8 @@ Allowed review values:
 
 For each normalized record with `reply_state=NEEDS_REPLY`:
 
-1. Read enabled library rows and active rules from `05_RULES`.
-2. Run `buildDraftContext(inquiry, libraryRows, { limit: 3 })`.
+1. Call `search_verified_answers` with masked inquiry text and read active rules from `05_RULES` when available.
+2. For local deterministic tests, the equivalent helper is `buildDraftContext(inquiry, libraryRows, { limit: 3 })`.
 3. Use only returned `quality_state=USE`, `enabled=TRUE`, `pii_scan=PASS` examples.
 4. Treat examples as tone and workflow evidence, not as proof of current price, stock, order, shipping, refund, or compensation state.
 5. Generate a concise Korean draft. If required facts are missing, ask for confirmation or state the manual check instead of inventing facts.

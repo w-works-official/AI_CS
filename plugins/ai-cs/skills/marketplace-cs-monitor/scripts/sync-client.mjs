@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -8,19 +7,6 @@ export const DEFAULT_SYNC_CONFIG = fileURLToPath(
 );
 
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
-
-function readWindowsUserEnvironment(name) {
-  if (globalThis.process?.platform !== "win32") return "";
-  try {
-    return execFileSync(
-      "powershell.exe",
-      ["-NoProfile", "-Command", `[Environment]::GetEnvironmentVariable('${name}', 'User')`],
-      { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
-  } catch {
-    return "";
-  }
-}
 
 export function makeRunId(report) {
   const identity = [
@@ -65,8 +51,8 @@ export async function loadSyncConfig({
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const syncUrl = env.MARKETPLACE_CS_SYNC_URL || readWindowsUserEnvironment("MARKETPLACE_CS_SYNC_URL");
-  const syncKey = env.MARKETPLACE_CS_SYNC_KEY || readWindowsUserEnvironment("MARKETPLACE_CS_SYNC_KEY");
+  const syncUrl = env.MARKETPLACE_CS_SYNC_URL;
+  const syncKey = env.MARKETPLACE_CS_SYNC_KEY;
   return {
     ...file,
     web_app_url: syncUrl || file.web_app_url || "",
