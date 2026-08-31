@@ -1,0 +1,8 @@
+{
+  "apps": {
+    "pink-rocket-ai-cs": {
+      "id": "plugin_asdk_app_REPLACE_AFTER_PRIVATE_CHATGPT_CONNECTION",
+      "category": "Developer Tools"
+    }
+  }
+}

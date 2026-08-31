@@ -5,6 +5,7 @@ const CS_SHEETS = Object.freeze({
   DRAFTS: '03_AI_DRAFTS',
   RUNS: '04_SYNC_RUNS',
   RULES: '05_RULES',
+  ANSWERS: '06_ANSWER_LIBRARY',
   CONFIG: '99_CONFIG',
 });
 
@@ -16,15 +17,9 @@ function doGet(e) {
   try {
     const request = normalizeRequest_(e);
     authorize_(request);
+    assertRequestEnvironment_(request);
     const action = String(request.action || 'health');
-
-    if (action === 'health') return json_(health_());
-    if (action === 'overview') return json_(overview_());
-    if (action === 'dashboard') return json_(dashboard_(request));
-    if (action === 'cases') return json_(listCases_(request));
-    if (action === 'case') return json_(getCase_(request.case_key));
-
-    return json_({ ok: false, error: 'UNKNOWN_ACTION' });
+    return json_(dispatchRead_(action, request));
   } catch (error) {
     return errorJson_(error);
   }
@@ -34,8 +29,14 @@ function doPost(e) {
   try {
     const request = normalizeRequest_(e);
     authorize_(request);
-    assertWriteKeyConfigured_();
+    assertRequestEnvironment_(request);
     const action = String(request.action || '');
+
+    if (['health', 'overview', 'dashboard', 'cases', 'case', 'answerLibrary'].indexOf(action) !== -1) {
+      return json_(dispatchRead_(action, request));
+    }
+
+    assertWriteKeyConfigured_();
 
     if (action === 'syncRun') {
       return json_(withDocumentLock_(function () {
@@ -59,12 +60,21 @@ function doPost(e) {
   }
 }
 
+function dispatchRead_(action, request) {
+  if (action === 'health') return health_();
+  if (action === 'overview') return overview_();
+  if (action === 'dashboard') return dashboard_(request);
+  if (action === 'cases') return listCases_(request);
+  if (action === 'case') return getCase_(request.case_key);
+  if (action === 'answerLibrary') return searchVerifiedAnswers_(request);
+  throw new Error('UNKNOWN_ACTION');
+}
+
 function health_() {
-  const spreadsheet = getSpreadsheet_();
+  getSpreadsheet_();
   return {
     ok: true,
     service: 'pink-rocket-cs-review-api',
-    spreadsheet_id: spreadsheet.getId(),
     schema_version: 'cs-sheet-v1',
     write_policy: CS_WRITE_POLICY,
     write_key_configured: Boolean(PropertiesService.getScriptProperties().getProperty('CS_API_KEY')),
@@ -280,8 +290,15 @@ function prepareMessages_(record, now) {
 
 function prepareDraft_(record, existingDrafts, draftIds, now, request) {
   const text = String(record.ai_draft || '').trim();
-  if (!text || mapReplyState_(record.reply_state) !== 'NEEDS_REPLY') return { object: null, isNew: false };
+  if (!text) return { object: null, isNew: false };
+  const replyState = mapReplyState_(record.reply_state);
+  const requestedPurpose = String(record.ai_draft_purpose || '').toUpperCase();
+  const purpose = requestedPurpose || (replyState === 'NEEDS_REPLY' ? 'REPLY' : '');
+  const isReplyDraft = replyState === 'NEEDS_REPLY' && purpose === 'REPLY';
+  const isEvaluationDraft = replyState === 'ANSWERED' && purpose === 'EVAL';
+  if (!isReplyDraft && !isEvaluationDraft) throw new Error('AI_DRAFT_REPLY_STATE_MISMATCH');
   if (String(record.ai_draft_origin || '') !== 'AI') throw new Error('AI_DRAFT_ORIGIN_REQUIRED');
+  if (String(record.ai_draft_pii_scan || '') !== 'PASS') throw new Error('AI_DRAFT_PII_SCAN_REQUIRED');
   assertMaskedText_(text, 'ai_draft');
   const contentHash = sha256_([record.source_key, text].join('|'));
   const draftId = 'DRAFT:' + String(record.source_key) + ':' + contentHash.slice(0, 20);
@@ -294,7 +311,7 @@ function prepareDraft_(record, existingDrafts, draftIds, now, request) {
     isNew: !draftIds[draftId],
     object: {
       draft_id: draftId,
-      record_type: 'LIVE',
+      record_type: isEvaluationDraft ? 'EVAL' : 'LIVE',
       case_key: String(record.source_key),
       version: (versions.length ? Math.max.apply(null, versions) : 0) + 1,
       generated_at: now,
@@ -302,8 +319,8 @@ function prepareDraft_(record, existingDrafts, draftIds, now, request) {
       prompt_version: String(request.prompt_version || 'marketplace-cs-monitor-v1'),
       draft_text: text,
       required_checks: String(record.ai_draft_required_checks || '사람 검토 필수 · 자동 전송 금지'),
-      draft_state: 'READY',
-      pii_scan: String(record.ai_draft_pii_scan || record.pii_scan || 'REVIEW') === 'PASS' ? 'PASS' : 'WARNING',
+      draft_state: isEvaluationDraft ? 'EVAL' : 'READY',
+      pii_scan: 'PASS',
       reviewed_at: '',
       review_note: '',
       used_at: '',
@@ -350,6 +367,10 @@ function buildRunRows_(report, runId, results, now) {
 function assertMaskedRecord_(record) {
   if (!record || !record.source_key) throw new Error('SOURCE_KEY_REQUIRED');
   if (!record.content_hash) throw new Error('CONTENT_HASH_REQUIRED');
+  if (String(record.pii_scan || '') !== 'PASS') throw new Error('PII_SCAN_PASS_REQUIRED');
+  if (record.customer_masked && String(record.customer_masked).indexOf('*') === -1) {
+    throw new Error('CUSTOMER_NOT_MASKED');
+  }
   assertMaskedText_(record.customer_masked, 'customer_masked');
   assertMaskedText_(record.subject, 'subject');
   assertMaskedText_(record.preview, 'preview');
@@ -580,10 +601,87 @@ function getCase_(caseKey) {
   };
 }
 
+function searchVerifiedAnswers_(request) {
+  const query = String(request.query || '').trim();
+  if (query.length < 2 || query.length > 500) throw new Error('ANSWER_QUERY_INVALID');
+  assertMaskedText_(query, 'answer_query');
+  const limit = Math.min(Math.max(Number(request.limit || 3), 1), 3);
+  const queryTokens = answerTokens_(query);
+  const requestedMarket = String(request.market || '').toUpperCase();
+  const requestedChannel = String(request.channel || '');
+  const requestedIntent = String(request.intent || '');
+
+  const examples = getObjects_(CS_SHEETS.ANSWERS)
+    .filter(function (row) {
+      const enabled = row.enabled === true || /^(true|use|yes|1)$/i.test(String(row.enabled || ''));
+      return enabled && String(row.quality_state || '') === 'USE' && String(row.pii_scan || '') === 'PASS';
+    })
+    .map(function (row) {
+      const rowMarket = String(row.market || '').toUpperCase();
+      const rowChannel = String(row.channel || '');
+      const rowIntent = String(row.intent || '');
+      const haystackTokens = answerTokens_([
+        rowIntent,
+        row.category,
+        row.customer_question,
+        row.product_name,
+        row.keywords,
+      ].join(' '));
+      const overlap = queryTokens.filter(function (token) { return haystackTokens.indexOf(token) !== -1; }).length;
+      let score = overlap;
+      if (requestedIntent && rowIntent === requestedIntent) score += 12;
+      if (requestedMarket && rowMarket === requestedMarket) score += 2;
+      if (requestedChannel && rowChannel === requestedChannel) score += 2;
+      return { row: row, score: score };
+    })
+    .filter(function (item) { return item.score > 0; })
+    .sort(function (a, b) {
+      if (a.score !== b.score) return b.score - a.score;
+      return dateValue_(b.row.last_verified_at) - dateValue_(a.row.last_verified_at);
+    })
+    .slice(0, limit)
+    .map(function (item) { return publicAnswerExample_(item.row, item.score); });
+
+  return {
+    ok: true,
+    reference_source: 'VERIFIED_HUMAN_ANSWER_ONLY',
+    examples: examples,
+  };
+}
+
+function answerTokens_(value) {
+  const matches = String(value || '').toLowerCase().match(/[가-힣a-z0-9.]{2,}/g) || [];
+  return matches.filter(function (token, index) { return matches.indexOf(token) === index; });
+}
+
+function publicAnswerExample_(row, score) {
+  const question = String(row.customer_question || '');
+  const answer = String(row.human_answer || '');
+  const productName = String(row.product_name || '');
+  assertMaskedText_(question, 'answer_customer_question');
+  assertMaskedText_(answer, 'answer_human_answer');
+  assertMaskedText_(productName, 'answer_product_name');
+  if (/\b\d{10,}\b/.test([question, answer, productName].join(' '))) throw new Error('UNMASKED_LONG_NUMBER:answer_library');
+  return {
+    example_id: String(row.example_id || ''),
+    intent: String(row.intent || ''),
+    market: String(row.market || ''),
+    channel: String(row.channel || ''),
+    risk_level: String(row.risk_level || '') === 'STANDARD' ? 'STANDARD' : 'REVIEW_REQUIRED',
+    customer_question: question,
+    product_name: productName,
+    human_answer: answer,
+    required_checks: String(row.required_checks || ''),
+    score: Number(score || 0),
+    last_verified_at: serializeCell_(row.last_verified_at),
+  };
+}
+
 function reviewDraft_(request) {
   const draftId = String(request.draft_id || '');
   const nextState = String(request.draft_state || '');
   const note = String(request.review_note || '').slice(0, 1000);
+  const humanRevision = String(request.human_revision || '').trim();
   if (!draftId) throw new Error('DRAFT_ID_REQUIRED');
   if (CS_ALLOWED_DRAFT_STATES.indexOf(nextState) === -1) {
     throw new Error('INVALID_DRAFT_STATE');
@@ -595,6 +693,11 @@ function reviewDraft_(request) {
   const stateCol = draftData.headerMap.draft_state;
   const reviewedAtCol = draftData.headerMap.reviewed_at;
   const noteCol = draftData.headerMap.review_note;
+  const humanRevisionCol = draftData.headerMap.human_revision;
+  if (humanRevision) {
+    if (humanRevisionCol == null) throw new Error('HUMAN_REVISION_COLUMN_REQUIRED');
+    assertMaskedText_(humanRevision, 'human_revision');
+  }
   const target = draftData.rows.find(function (row) {
     return String(row.values[draftIdCol]) === draftId;
   });
@@ -604,6 +707,7 @@ function reviewDraft_(request) {
   draftSheet.getRange(target.rowNumber, stateCol + 1).setValue(nextState);
   draftSheet.getRange(target.rowNumber, reviewedAtCol + 1).setValue(now);
   draftSheet.getRange(target.rowNumber, noteCol + 1).setValue(note);
+  if (humanRevision) draftSheet.getRange(target.rowNumber, humanRevisionCol + 1).setValue(humanRevision);
 
   const caseKey = String(target.values[draftData.headerMap.case_key] || '');
   const caseSheet = getSpreadsheet_().getSheetByName(CS_SHEETS.CASES);
@@ -623,6 +727,7 @@ function reviewDraft_(request) {
     draft_state: nextState,
     reviewed_at: now.toISOString(),
     reply_state_changed: false,
+    human_revision_saved: Boolean(humanRevision),
     marketplace_write_actions: 0,
     auto_send: false,
   };
@@ -689,8 +794,21 @@ function normalizeRequest_(e) {
 
 function authorize_(request) {
   const requiredKey = PropertiesService.getScriptProperties().getProperty('CS_API_KEY');
-  if (!requiredKey) return;
+  if (!requiredKey) throw new Error('CS_API_KEY_NOT_CONFIGURED');
   if (String(request.api_key || '') !== requiredKey) throw new Error('UNAUTHORIZED');
+}
+
+function currentEnvironment_() {
+  const environment = String(PropertiesService.getScriptProperties().getProperty('CS_ENVIRONMENT') || '');
+  if (['development', 'production'].indexOf(environment) === -1) throw new Error('CS_ENVIRONMENT_NOT_CONFIGURED');
+  if (environment === 'production' && PropertiesService.getScriptProperties().getProperty('CS_PRODUCTION_ENABLED') !== 'true') {
+    throw new Error('CS_PRODUCTION_DISABLED');
+  }
+  return environment;
+}
+
+function assertRequestEnvironment_(request) {
+  if (String(request.environment || '') !== currentEnvironment_()) throw new Error('ENVIRONMENT_MISMATCH');
 }
 
 function assertWriteKeyConfigured_() {
@@ -728,18 +846,26 @@ function dateValue_(value) {
 }
 
 function json_(payload) {
+  const safePayload = Object.assign({}, payload, {
+    environment: currentEnvironment_(),
+    marketplace_write_actions: 0,
+    auto_send: false,
+  });
   return ContentService
-    .createTextOutput(JSON.stringify(payload))
+    .createTextOutput(JSON.stringify(safePayload))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
 function errorJson_(error) {
-  return json_({
+  const environment = String(PropertiesService.getScriptProperties().getProperty('CS_ENVIRONMENT') || 'unconfigured');
+  return ContentService.createTextOutput(JSON.stringify({
     ok: false,
     error: String(error && error.message ? error.message : error),
+    environment: environment,
     write_policy: CS_WRITE_POLICY,
+    marketplace_write_actions: 0,
     auto_send: false,
-  });
+  })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function testHealth() {

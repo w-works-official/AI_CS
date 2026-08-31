@@ -1,0 +1,4 @@
+# Local Worker development only. Copy to ignored .dev.vars and use synthetic or test-only values.
+AI_CS_DEV_ALLOWED_SUBJECTS="development-user-subject"
+AI_CS_DEV_APPS_SCRIPT_URL="https://script.google.com/macros/s/REPLACE_DEVELOPMENT_ONLY/exec"
+AI_CS_DEV_APPS_SCRIPT_KEY="REPLACE_DEVELOPMENT_SECRET"

@@ -6,10 +6,19 @@
 
 - `app/` — 상담원용 AI 답변 검수 프론트와 서버 프록시
 - `apps-script/` — Google Sheets 기반 조회·동기화·AI 초안 검토 API
-- `skills/marketplace-cs-monitor/` — Codex용 마켓플레이스 수집 스킬, 정규화·마스킹·답변 참고 로직과 테스트
+- `plugins/ai-cs/` — 개인용 ChatGPT/Codex 플러그인 패키지와 `marketplace-cs-monitor` 스킬
+- `mcp-server/` — OAuth로 보호되는 원격 HTTP MCP와 제한된 Apps Script 도구
 - `docs/marketplace-cs-monitor-manual.md` — 실행 모드와 추천 프롬프트
 - `docs/ARCHITECTURE.md` — 데이터 흐름, 안전 경계, 배포 구조
 - `docs/CLAUDE-CODE.md` — Claude Code 포팅 범위와 설치 체크리스트
+- `github-pages/` — 공개 GitHub Pages 프론트 진입점
+- `.github/workflows/pages.yml` — `main` 변경 시 GitHub Pages 자동 배포
+
+## 공개 페이지
+
+- GitHub Pages: <https://w-works-official.github.io/AI_CS/>
+- 공개 정적 프론트에는 API 키나 시트 ID를 포함하지 않습니다.
+- 마스킹된 CS 데이터는 읽기 전용 프록시를 통해 조회합니다.
 
 ## 안전 경계
 
@@ -38,18 +47,18 @@ pnpm dev
 pnpm build
 pnpm lint
 node apps-script/Code.contract.test.cjs
-node skills/marketplace-cs-monitor/scripts/report-core.test.mjs
-node skills/marketplace-cs-monitor/scripts/answer-library-core.test.mjs
-node skills/marketplace-cs-monitor/scripts/notion-answer-adapter.test.mjs
-node skills/marketplace-cs-monitor/scripts/sync-client.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/answer-library-core.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/notion-answer-adapter.test.mjs
+node plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.test.mjs
 ```
 
 ## Codex 스킬 설치
 
-`skills/marketplace-cs-monitor` 폴더 전체를 Windows 사용자 전역 스킬 폴더에 복사합니다.
+플러그인 전체 설치가 아닌 레거시 단일 스킬 설치가 필요할 때만 아래 폴더를 복사합니다.
 
 ```powershell
-Copy-Item -Recurse -Force .\skills\marketplace-cs-monitor "$env:USERPROFILE\.codex\skills\marketplace-cs-monitor"
+Copy-Item -Recurse -Force .\plugins\ai-cs\skills\marketplace-cs-monitor "$env:USERPROFILE\.codex\skills\marketplace-cs-monitor"
 ```
 
 설치 후 Codex에서 `마켓플레이스 CS 모니터 스킬로 오늘 변화분을 수집해줘`처럼 요청할 수 있습니다.
@@ -57,4 +66,3 @@ Copy-Item -Recurse -Force .\skills\marketplace-cs-monitor "$env:USERPROFILE\.cod
 ## 환경 설정
 
 Google Apps Script 설정과 시트 계약은 [apps-script/README.md](apps-script/README.md)를 참고하세요. 전체 구조는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)에 정리되어 있습니다.
-
