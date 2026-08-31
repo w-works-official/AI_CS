@@ -83,11 +83,16 @@ export async function GET(request: NextRequest) {
     ) {
       return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: target.environment, auto_send: false }, 502);
     }
+    const safePayload = {
+      ...payload,
+      environment: payload.environment ?? target.environment,
+      auto_send: false,
+    };
     responseCache.set(cacheKey, {
-      payload,
+      payload: safePayload,
       expiresAt: Date.now() + (action === 'case' ? 120_000 : 60_000),
     });
-    return privateJson(payload, 200, action === 'case' ? 60 : 30);
+    return privateJson(safePayload, 200, action === 'case' ? 60 : 30);
   } catch {
     return privateJson({ ok: false, error: 'CS_DATA_CONNECTION_FAILED' }, 502);
   }
