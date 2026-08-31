@@ -3,7 +3,7 @@ import { normalizeReviewRequest, normalizeSyncRequest } from './policy';
 
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ACTIONS = new Set(['health', 'overview', 'cases', 'case']);
+const ALLOWED_ACTIONS = new Set(['health', 'overview', 'dashboard', 'cases', 'case']);
 const ALLOWED_PARAMS = new Set(['action', 'case_key', 'record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit', 'cursor']);
 type CacheEntry = { expiresAt: number; payload: unknown };
 const cacheScope = globalThis as typeof globalThis & { __pinkRocketCsCache?: Map<string, CacheEntry> };
@@ -83,11 +83,16 @@ export async function GET(request: NextRequest) {
     ) {
       return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: target.environment, auto_send: false }, 502);
     }
+    const safePayload = {
+      ...payload,
+      environment: payload.environment ?? target.environment,
+      auto_send: false,
+    };
     responseCache.set(cacheKey, {
-      payload,
+      payload: safePayload,
       expiresAt: Date.now() + (action === 'case' ? 120_000 : 60_000),
     });
-    return privateJson(payload, 200, action === 'case' ? 60 : 30);
+    return privateJson(safePayload, 200, action === 'case' ? 60 : 30);
   } catch {
     return privateJson({ ok: false, error: 'CS_DATA_CONNECTION_FAILED' }, 502);
   }

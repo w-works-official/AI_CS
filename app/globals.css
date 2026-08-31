@@ -368,6 +368,18 @@ button {
   flex: 1;
 }
 
+.load-more-row {
+  display: flex;
+  justify-content: center;
+  padding: 14px;
+  border-bottom: 1px solid #eceef2;
+  background: #fafafe;
+}
+
+.load-more-row .secondary-button {
+  min-width: 150px;
+}
+
 .case-item {
   width: 100%;
   border: 0;
