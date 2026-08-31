@@ -23,6 +23,7 @@ The launcher-managed session requires no persistent profile name or CDP environm
 $env:CS_START_DATE = (Get-Date).ToString('yyyy-MM-dd')
 $env:CS_END_DATE = $env:CS_START_DATE
 $env:CS_CHANNELS = 'comments'
+$env:CS_RUN_MODE = 'collect_and_reconcile'
 $env:CS_SYNC_MODE = 'prepare'
 $env:CS_KEEP_MASKED_OUTPUT = '1'
 npm run scrape
@@ -31,6 +32,8 @@ npm run scrape
 For an explicitly selected remote-debuggable Google Chrome on the same PC, `SMARTSTORE_CDP_URL` may be set for that process. Only `http://127.0.0.1:<port>`, `http://localhost:<port>`, or the IPv6 loopback equivalent is accepted.
 
 `prepare` is the default and performs no Apps Script or Sheet write. The masked report is written below the macro project's `output/` directory and its path is returned as `masked_output`.
+
+`collect_and_reconcile` is the normal collection mode. It still collects only the requested date range for ordinary detail work, but it also carries hashed source keys from a count-matched current unanswered view when the marketplace exposes one. It never changes marketplace state.
 
 ## Supported channel controls
 

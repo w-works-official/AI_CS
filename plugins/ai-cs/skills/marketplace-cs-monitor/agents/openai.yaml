@@ -1,7 +1,7 @@
 interface:
   display_name: "마켓 CS 통합 모니터"
   short_description: "기존 Playwright 매크로로 CS 수집·AI 검수 준비"
-  default_prompt: "Use $marketplace-cs-monitor to run today's Smartstore inquiry vertical slice with the existing Playwright macro and prepare a masked AI-review report."
+  default_prompt: "Use $marketplace-cs-monitor to collect today's selected marketplace CS, reconcile the complete unanswered queues, prepare AI drafts, and sync the masked review report."
 
 policy:
   allow_implicit_invocation: true

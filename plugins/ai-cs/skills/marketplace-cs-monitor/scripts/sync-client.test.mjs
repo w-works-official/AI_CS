@@ -5,7 +5,15 @@ const report = {
   schema_version: 1,
   collected_at: "2026-08-25T04:00:00.000Z",
   summary: { marketplace_write_actions: 0 },
-  channels: {},
+  channels: {
+    smartstore_comments: {
+      market: "smartstore",
+      channel: "comments",
+      open_queue_complete: true,
+      open_queue_visible_total: 1,
+      open_queue_source_keys: ["smartstore:comments:abc"],
+    },
+  },
   records: [{ source_key: "smartstore:comments:abc", content_hash: "hash-1", customer_masked: "고*", subject: "한글 문의", preview: "바 길이 변경 문의" }],
 };
 
@@ -17,6 +25,13 @@ assert.equal(validateSyncReport(report), report);
 assert.throws(
   () => validateSyncReport({ ...report, records: [...report.records, ...report.records] }),
   /DUPLICATE_SOURCE_KEY/,
+);
+assert.throws(
+  () => validateSyncReport({
+    ...report,
+    channels: { smartstore_comments: { ...report.channels.smartstore_comments, open_queue_visible_total: 2 } },
+  }),
+  /OPEN_QUEUE_TOTAL_MISMATCH/,
 );
 
 let captured;

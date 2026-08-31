@@ -7,9 +7,9 @@ description: Run the existing local Playwright marketplace CS macro, mask and de
 
 Use the existing Playwright macro as the normal collection engine. Do not build another Chrome collector and do not drive Chrome interactively for an ordinary run.
 
-## Current rollout gate
+## Default operating mode
 
-Smartstore is temporarily paused until the account holder can complete Naver reauthentication in the dedicated CS Chrome. The active vertical slice is ABLY `문의 관리` plus Zigzag/KakaoStyle `주문 문의` and `상품 문의`. Keep runs limited to today's changes until collection and masking are verified. Generate operational `REPLY` drafts only for real `NEEDS_REPLY` records. When the user explicitly requests training or skill verification, answered records may receive separate `EVAL` shadow drafts under the evaluation rules below. Do not treat a verified zero as a selector failure.
+Use `collect_and_reconcile` unless the user asks for a prepare-only diagnostic. It collects new and changed cases, carries a complete current unanswered-queue snapshot when the marketplace proves the count, and lets the development sync target reconcile stale open cases. Generate operational `REPLY` drafts only for real `NEEDS_REPLY` records. When the user explicitly requests training or skill verification, answered records may receive separate `EVAL` shadow drafts under the evaluation rules below. Do not treat a verified zero as a selector failure.
 
 Canonical local macro:
 
@@ -40,13 +40,13 @@ Read [references/local-playwright-macro.md](references/local-playwright-macro.md
 ## Vertical-slice workflow
 
 1. Confirm the current collection operator has started the local CS Chrome and signed in. Resolve the active session file or the explicit loopback `SMARTSTORE_CDP_URL`; do not inspect cookies, tokens, saved passwords, or browser storage.
-2. Run the existing macro in `prepare` mode with the explicitly requested channels, today's range, and `CS_KEEP_MASKED_OUTPUT=1`. The current gate uses `CS_CHANNELS=ably_inquiry,zigzag_order_inquiry,zigzag_item_question`. This prepares a masked JSON report and performs no Sheet write.
-3. Check that only the requested channels have `attempted=true`. Verify visible totals, verified zero states, source keys, content hashes, PII scan, counts, and `marketplace_write_actions=0`.
+2. Run the existing macro with the explicitly requested channels, today's range, `CS_RUN_MODE=collect_and_reconcile`, and `CS_KEEP_MASKED_OUTPUT=1`. Use `CS_SYNC_MODE=prepare` for inspection or `sync` only when the user asked to persist the run.
+3. Check that only the requested channels have `attempted=true`. Verify visible totals, verified zero states, source keys, content hashes, PII scan, counts, and `marketplace_write_actions=0`. A channel may reconcile old cases only when `open_queue_complete=true`, `open_queue_visible_total=open_queue_observed_count`, and the snapshot declares its window. An incomplete or failed list must never close a stored case.
 4. For each `reply_state=NEEDS_REPLY`, retrieve at most three enabled `USE` examples from the development `06_ANSWER_LIBRARY` through `searchVerifiedAnswers` in `scripts/sync-client.mjs`. For an explicitly requested answered-case evaluation, hold the actual seller answer out while generating and set `ai_draft_purpose=EVAL`.
 5. Generate a cautious AI draft using only those examples and current inquiry facts. Do not claim live price, stock, order, shipment, refund, compensation, or policy state without an explicit human check.
 6. Attach drafts with `applyAiDrafts(report, drafts)` from `scripts/report-core.mjs`. Every draft must set `ai_draft_origin=AI`, `ai_draft_purpose=REPLY|EVAL`, required checks, and `ai_draft_pii_scan=PASS`; the helper recalculates `content_hash`. `EVAL` is valid only for `ANSWERED`, never changes `reply_state`, and never contributes to reply-needed or ready-to-send counts.
 7. Load the existing local sync config, require `environment=development`, and call `readCsData("health")`. Stop before sync unless health returns `ok=true`, `environment=development`, `auto_send=false`, and `marketplace_write_actions=0`.
-8. Call `syncReport(finalReport, config)` once. Do not retry browser collection when sync fails. Reusing the same deterministic run ID must be idempotent.
+8. Call `syncReport(finalReport, config)` once. Do not retry browser collection when sync fails. Reusing the same deterministic run ID must be idempotent. For complete unanswered snapshots, one consecutive absence changes an old open case to `REVIEW`; two consecutive complete-snapshot absences change it to `CLOSED`. A later reappearance reopens it as `NEEDS_REPLY`. Preserve the original case and messages for training and audit.
 9. Verify the development review frontend shows the masked post and distinctly labels an operational draft as `AI 추천답변` or an answered-case shadow draft as `AI 검증 초안`. `EVAL` is comparison-only: disable approval/rejection and compare it with the actual human answer. The frontend never sends a marketplace reply.
 10. Return a short Korean report with duration, collected count, new/changed/unchanged/reply-needed counts, draft count, PII result, sync result, and prohibited write count.
 
@@ -72,8 +72,8 @@ Never recompute hashes ad hoc and never append directly to Sheet tabs.
 
 - Existing standalone Playwright macro: Smartstore 문의 관리, 고객문의 관리, 고객센터 문의 관리, 톡톡 상담; Zigzag/KakaoStyle 주문 문의 and 상품 문의; ABLY 문의 관리.
 - ABLY detail collection preserves customer/seller message direction. Zigzag uses the numeric detail route ID and reads existing seller replies without using reply inputs.
-- Smartstore remains disabled in the current run until Naver reauthentication is completed by the account holder.
+- All seven implemented channels are available when the current collection operator is signed in. A login or account-verification screen still stops only the affected run and must never be automated.
 
 ## Completion gate
 
-Collection and masking have passed for a real answered ABLY record. Answered records may be used in a bounded `EVAL` shadow-draft run (normally 1–10 records) without changing operational state or promoting the AI output into the verified answer library. The next operational gate remains one real `NEEDS_REPLY` record from an enabled ABLY or Zigzag channel passing grounded AI drafting, development sync, frontend display, and separate human review. Smartstore can resume only after the account holder authenticates. Marketplace reply transmission must remain zero.
+Answered records may be used in a bounded `EVAL` shadow-draft run (normally 1–10 records) without changing operational state or promoting the AI output into the verified answer library. Reconciliation is accepted only when incomplete snapshots produce zero status transitions and two consecutive complete-snapshot absences close a synthetic test case. Marketplace reply transmission must remain zero.

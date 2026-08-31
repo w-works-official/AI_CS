@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { applyAiDrafts, buildReport } from "./report-core.mjs";
+import { applyAiDrafts, buildReport, normalizeMarketplaceUrl } from "./report-core.mjs";
 
 const base = {
   mode: "changes_today",
@@ -16,6 +16,11 @@ const base = {
     zigzag_order_inquiry: {
       market: "zigzag", channel: "order_inquiry", attempted: true, visible_total: 1,
       records: [{ inquiry_id: "23423568", status: "미답변", subject: "배송 문의", customer: "uneh****", occurred_at: "2026-08-25 10:01" }],
+      open_queue_complete: true,
+      open_queue_scope: "one_week_unanswered",
+      open_queue_window_start: "2026-08-19",
+      open_queue_visible_total: 1,
+      open_queue_records: [{ inquiry_id: "23423568" }],
     },
     zigzag_item_question: { market: "zigzag", channel: "item_question", attempted: true, visible_total: 0, records: [] },
     ably_inquiry: {
@@ -34,6 +39,108 @@ assert.equal(first.channels.smartstore_talktalk.read_state_transition_count, 2);
 assert.match(first.records[0].preview, /010-\*\*\*\*-\*\*\*\*/);
 assert.equal(first.records.find((row) => row.market === "ably").reply_state, "NO_REPLY");
 assert.equal(first.records.find((row) => row.market === "zigzag").reply_state, "NEEDS_REPLY");
+assert.equal(first.summary.reconciled_channel_count, 1);
+assert.equal(first.channels.zigzag_order_inquiry.open_queue_complete, true);
+assert.equal(first.channels.zigzag_order_inquiry.open_queue_source_keys.length, 1);
+assert.match(first.channels.zigzag_order_inquiry.open_queue_source_keys[0], /^zigzag:order_inquiry:/);
+assert.equal(JSON.stringify(first).includes("23423568"), false);
+
+assert.equal(
+  normalizeMarketplaceUrl("https://talk.naver.com/ct/example?filter.read=unread"),
+  "https://talk.naver.com/ct/example?filter.read=unread",
+);
+assert.throws(() => normalizeMarketplaceUrl("http://talk.naver.com/ct/example"), /MARKETPLACE_URL_UNSAFE/);
+assert.throws(() => normalizeMarketplaceUrl("https://example.com/ct/example"), /MARKETPLACE_URL_HOST_NOT_ALLOWED/);
+assert.throws(() => normalizeMarketplaceUrl("https://talk.naver.com/ct/example?access_token=secret"), /MARKETPLACE_URL_SECRET_PARAM/);
+assert.throws(() => normalizeMarketplaceUrl("https://talk.naver.com/ct/example?phone=010-1234-5678"), /MARKETPLACE_URL_PII_PARAM/);
+assert.throws(() => normalizeMarketplaceUrl("https://talk.naver.com/#/chat?session_token=secret"), /MARKETPLACE_URL_SECRET_FRAGMENT/);
+assert.throws(() => normalizeMarketplaceUrl("https://talk.naver.com/#%E0%A4%A"), /MARKETPLACE_URL_INVALID_FRAGMENT/);
+
+const linkedTalktalkInput = structuredClone(base);
+linkedTalktalkInput.channels.smartstore_talktalk.records = [{
+  thread_id: "thread-123",
+  message_date: "2026-08-25",
+  customer_name: "고객",
+  product: "샘플 피어싱",
+  source_url: "https://talk.naver.com/ct/thread-123?filter.read=unread",
+  source_url_kind: "EXACT",
+  source_reference_masked: "TT-0b6d54a12345",
+  messages: [{ direction: "customer", text: "사진을 확인해 주세요", image_count: 1 }],
+  last_actor: "customer",
+}];
+const linkedTalktalk = buildReport(linkedTalktalkInput, []);
+const linkedRecord = linkedTalktalk.records.find((row) => row.channel === "talktalk");
+assert.equal(linkedRecord.source_url_kind, "EXACT");
+assert.match(linkedRecord.source_url, /^https:\/\/talk\.naver\.com\/ct\/thread-123/);
+assert.equal(linkedRecord.source_reference, "TT-0b6d54a12345");
+assert.equal(linkedRecord.product_name, "샘플 피어싱");
+assert.equal(linkedRecord.messages[0].image_count, 1);
+const linkOnlyChange = structuredClone(linkedTalktalkInput);
+linkOnlyChange.channels.smartstore_talktalk.records[0].source_url = "https://talk.naver.com/ct/thread-123?filter.read=all";
+const linkOnlyReport = buildReport(linkOnlyChange, [{ source_key: linkedRecord.source_key, content_hash: linkedRecord.content_hash }]);
+assert.equal(linkOnlyReport.records.find((row) => row.channel === "talktalk").change_state, "UNCHANGED");
+const missingExactLink = structuredClone(linkedTalktalkInput);
+missingExactLink.channels.smartstore_talktalk.records[0].source_url = "";
+assert.throws(() => buildReport(missingExactLink, []), /SOURCE_URL_EXACT_REQUIRED/);
+
+const linkedChannelInput = structuredClone(base);
+linkedChannelInput.channels.smartstore_comments.records = [{
+  product_id: "1001",
+  created_at: "2026-08-25 10:10",
+  customer_id_masked: "ab***z",
+  body: "상품 문의입니다.",
+  status: "미답변",
+  source_url: "https://sell.smartstore.naver.com/#/comment/",
+  source_url_kind: "LIST",
+  source_reference_masked: "SS-C-a1b2c3d4e5f6",
+  product_url: "https://smartstore.naver.com/pinkrocket/products/1001",
+}];
+linkedChannelInput.channels.smartstore_customer_qna.visible_total = 1;
+linkedChannelInput.channels.smartstore_customer_qna.records = [{
+  product_order_no: "123456789012",
+  received_at: "2026-08-25 10:11",
+  subject: "교환 문의",
+  status: "답변완료",
+  source_url: "https://sell.smartstore.naver.com/#/naverpay/qnas",
+  source_url_kind: "LIST",
+  source_reference_masked: "SS-Q-a1b2c3d4e5f6",
+}];
+linkedChannelInput.channels.zigzag_item_question.visible_total = 1;
+linkedChannelInput.channels.zigzag_item_question.records = [{
+  source_id: "34567890",
+  occurred_at: "2026-08-25 10:12",
+  subject: "상품 문의",
+  status: "미답변",
+  source_url: "https://partners.kakaostyle.com/shop/pink-rocket/item_question/detail/34567890",
+  source_url_kind: "EXACT",
+  source_reference_masked: "ZZ-I-a1b2c3d4e5f6",
+}];
+linkedChannelInput.channels.ably_inquiry.records = [{
+  room_id: "95162904",
+  occurred_at: "2026-08-25 10:13",
+  customer_name: "혜진",
+  status: "진행중",
+  source_url: "https://my.a-bly.com/inquiry",
+  source_url_kind: "LIST",
+  source_reference_masked: "AB-a1b2c3d4e5f6",
+  messages: [{ direction: "customer", text: "문의합니다." }],
+}];
+const linkedChannels = buildReport(linkedChannelInput, []);
+const linkedComment = linkedChannels.records.find((row) => row.channel === "comments");
+const linkedQna = linkedChannels.records.find((row) => row.channel === "customer_qna");
+const linkedZigzagItem = linkedChannels.records.find((row) => row.channel === "item_question");
+const linkedAbly = linkedChannels.records.find((row) => row.market === "ably");
+assert.equal(linkedComment.source_url_kind, "LIST");
+assert.match(linkedComment.product_url, /^https:\/\/smartstore\.naver\.com\/pinkrocket\/products\/1001/);
+assert.equal(linkedQna.source_reference, "SS-Q-a1b2c3d4e5f6");
+assert.equal(linkedZigzagItem.source_url_kind, "EXACT");
+assert.match(linkedZigzagItem.source_url, /\/item_question\/detail\/34567890$/);
+assert.equal(linkedAbly.source_url_kind, "LIST");
+assert.equal(linkedAbly.source_reference, "AB-a1b2c3d4e5f6");
+
+const incompleteQueue = structuredClone(base);
+incompleteQueue.channels.zigzag_order_inquiry.open_queue_visible_total = 2;
+assert.throws(() => buildReport(incompleteQueue, []), /OPEN_QUEUE_TOTAL_MISMATCH/);
 
 const previous = first.records.map(({ source_key, content_hash }) => ({ source_key, content_hash }));
 const second = buildReport(base, previous);
@@ -75,6 +182,21 @@ assert.equal(attached.ai_draft_purpose, "REPLY");
 assert.equal(attached.ai_draft_pii_scan, "PASS");
 assert.notEqual(attached.content_hash, target.content_hash);
 assert.throws(() => applyAiDrafts(first, [{ source_key: target.source_key, ai_draft: "초안", ai_draft_origin: "AI", ai_draft_pii_scan: "REVIEW" }]), /AI_DRAFT_PII_SCAN_REQUIRED/);
+
+const ablyCompleted = structuredClone(base);
+ablyCompleted.channels.ably_inquiry.records = [{
+  room_id: "95162905",
+  status: "완료",
+  customer_name: "혜진",
+  occurred_at: "2026-08-25 11:00",
+  messages: [{ direction: "customer", text: "전체 취소 철회가 가능한가요? 상품 주문번호 648997240" }],
+  last_actor: "customer",
+}];
+const completedReport = buildReport(ablyCompleted, []);
+const completedAbly = completedReport.records.find((row) => row.market === "ably");
+assert.equal(completedAbly.reply_state, "NO_REPLY");
+assert.match(completedAbly.messages[0].text, /상품 주문번호 \[마스킹\]/);
+assert.equal(JSON.stringify(completedAbly).includes("648997240"), false);
 
 const answered = first.records.find((row) => row.reply_state === "ANSWERED");
 const evaluated = applyAiDrafts(first, [{

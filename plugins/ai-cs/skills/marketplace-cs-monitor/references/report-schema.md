@@ -33,6 +33,9 @@ Required fields:
 - `occurred_at`, `status`, `category`
 - `customer_masked`
 - `subject`, `preview`, `product_name`
+- `source_url`, `source_url_kind`: an allowlisted HTTPS marketplace URL and `EXACT`, `LIST`, or `UNAVAILABLE`
+- `source_reference`: a masked or hashed lookup label only; never a raw token, cookie, or credential
+- `product_url`, `product_thumbnail_url`: optional allowlisted HTTPS marketplace URLs
 - `order_no_masked`, `product_order_no_masked`
 - `messages[]`, `seller_replies[]`
 - `last_actor`: `customer`, `seller`, `automatic`, or `unknown`
@@ -45,6 +48,7 @@ Required fields:
 - `pii_scan`: `PASS` or `REVIEW`
 
 `source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time and run duration.
+Link fields are excluded from `content_hash`, so a harmless route or filter change does not turn an otherwise unchanged inquiry into `CHANGED`. Reject non-HTTPS URLs, non-marketplace hosts, embedded credentials, authentication-like query keys or fragments, and query values containing an unmasked phone or email before writing the masked report.
 
 ## Channel report
 
@@ -63,8 +67,17 @@ Each channel returns:
 
 The top-level report also includes total duration, prepared count, duplicate count, missing-key/hash counts, `talktalk_read_state_transitions`, and `marketplace_write_actions: 0`. The write-action field covers prohibited operational actions; an authorized TalkTalk read marker is an explicitly reported observational side effect, not a reply or operational status action.
 
+For deterministic stale-case reconciliation, each channel may also include only masked/hashed snapshot evidence:
+
+- `open_queue_complete`: true only after the whole authoritative unanswered view was read and its count matched;
+- `open_queue_scope` and `open_queue_window_start`: the marketplace window covered by the snapshot;
+- `open_queue_visible_total` and `open_queue_observed_count`: these must match for a complete snapshot;
+- `open_queue_source_keys[]`: hashed source keys only, never raw marketplace IDs.
+
+An incomplete or mismatched snapshot cannot change a stored case. On the sync target, one consecutive absence becomes `REVIEW`, two becomes `CLOSED`, and a later reappearance becomes `NEEDS_REPLY`. `CLOSED` is a local review state only; it never closes anything in a marketplace and the original masked case/messages remain stored.
+
 ## Comparison boundary
 
-Compare only records returned inside the same locked scope. A previous record absent from the current scope is `NOT_SEEN`; do not archive, delete, or label it deleted.
+Compare only records returned inside the same locked scope. A previous record absent from an ordinary collection is `NOT_SEEN`; do not archive, delete, or label it deleted. The only exception is the separate complete, count-matched unanswered-queue reconciliation contract described above.
 
 Google Sheets or Notion persistence must store normalized masked records only. Keep human replies and `ai_draft` in separate columns so reviewers can always distinguish them. An `EVAL` draft remains comparison-only: it must not change `reply_state`, reply-needed counts, or the verified human-answer library.

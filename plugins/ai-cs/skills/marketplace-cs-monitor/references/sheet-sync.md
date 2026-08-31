@@ -17,6 +17,8 @@ Preserve UTF-8 end to end. Never parse and reserialize the report with Windows P
 
 The server is authoritative for `NEW`, `CHANGED`, and `UNCHANGED`: it compares `case_key/source_key` and `content_hash` under a document lock. Reusing the same deterministic `run_id` is idempotent.
 
+When a report includes a complete unanswered-queue snapshot, the server also owns the local reconciliation fields `last_status_verified_at`, `status_missing_count`, `status_source`, and `completion_reason`. It appends those columns once if an older development Sheet lacks them. A case is never changed from absence alone unless the snapshot is complete, count-matched, channel-matched, and the case date is inside the declared window. One absence yields `REVIEW`; two consecutive absences yield local `CLOSED`; reappearance yields `NEEDS_REPLY`.
+
 The server may write only:
 
 - normalized cases to `01_CASES`;

@@ -12,6 +12,65 @@ const CHANNEL_KEYS = [
 
 const compact = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
+const MARKETPLACE_HOST_SUFFIXES = ["naver.com", "kakaostyle.com", "a-bly.com"];
+const SENSITIVE_URL_KEY = /(?:^|[_-])(token|secret|session|cookie|auth|authorization|password|passwd|credential|signature|jwt|api[_-]?key|access[_-]?key)(?:$|[_-])/i;
+
+function normalizeMarketplaceUrl(value) {
+  const text = compact(value);
+  if (!text) return "";
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw new Error("MARKETPLACE_URL_INVALID");
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+    throw new Error("MARKETPLACE_URL_UNSAFE");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!MARKETPLACE_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
+    throw new Error("MARKETPLACE_URL_HOST_NOT_ALLOWED");
+  }
+  for (const [key, item] of parsed.searchParams) {
+    if (SENSITIVE_URL_KEY.test(key)) throw new Error("MARKETPLACE_URL_SECRET_PARAM");
+    if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(item) || /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(item)) {
+      throw new Error("MARKETPLACE_URL_PII_PARAM");
+    }
+  }
+  let decodedHash = "";
+  try {
+    decodedHash = decodeURIComponent(parsed.hash || "");
+  } catch {
+    throw new Error("MARKETPLACE_URL_INVALID_FRAGMENT");
+  }
+  const fragmentQuery = decodedHash.includes("?")
+    ? decodedHash.slice(decodedHash.indexOf("?") + 1)
+    : decodedHash.replace(/^#/, "");
+  for (const [key, item] of new URLSearchParams(fragmentQuery)) {
+    if (SENSITIVE_URL_KEY.test(key)) throw new Error("MARKETPLACE_URL_SECRET_FRAGMENT");
+    if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(item) || /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(item)) {
+      throw new Error("MARKETPLACE_URL_PII_FRAGMENT");
+    }
+  }
+  return parsed.toString();
+}
+
+function normalizeSourceUrlKind(value, sourceUrl) {
+  const requested = compact(value).toUpperCase();
+  const kind = requested || (sourceUrl ? "LIST" : "UNAVAILABLE");
+  if (!["EXACT", "LIST", "UNAVAILABLE"].includes(kind)) throw new Error("SOURCE_URL_KIND_INVALID");
+  if (kind === "EXACT" && !sourceUrl) throw new Error("SOURCE_URL_EXACT_REQUIRED");
+  if (kind === "UNAVAILABLE" && sourceUrl) throw new Error("SOURCE_URL_UNAVAILABLE_MISMATCH");
+  return kind;
+}
+
+function contentHashForRecord(record) {
+  const material = { ...record };
+  for (const field of ["content_hash", "change_state", "source_url", "source_url_kind", "source_reference", "product_url", "product_thumbnail_url"]) {
+    delete material[field];
+  }
+  return sha256(stableJson(material));
+}
 
 function stableValue(value) {
   if (Array.isArray(value)) return value.map(stableValue);
@@ -49,6 +108,7 @@ function maskSensitiveText(value) {
   return compact(value)
     .replace(/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/g, "010-****-****")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "**@***")
+    .replace(/((?:상품\s*)?주문번호\s*[:：]?\s*)\d{6,}/gi, "$1[마스킹]")
     .replace(/\b\d{12,}\b/g, (number) => maskLongNumber(number))
     .replace(/(주소\s*[:：]?)[^,;]+/gi, "$1 [주소 마스킹]");
 }
@@ -66,6 +126,12 @@ function rawSourceId(market, channel, record) {
     return compact([record.product_id, record.created_at, record.customer_id, record.customer_id_masked, record.body].join("|"));
   }
   return compact([record.occurred_at, record.customer_id, record.subject, record.preview].join("|"));
+}
+
+function sourceKeyForRaw(market, channel, record) {
+  const sourceId = rawSourceId(market, channel, record);
+  if (!sourceId) throw new Error(`Missing stable source id for ${market}/${channel}`);
+  return `${market}:${channel}:${sha256(sourceId).slice(0, 24)}`;
 }
 
 function isAcknowledgement(text) {
@@ -86,6 +152,7 @@ function inferReplyState(status, lastActor, lastMessage) {
 
 function normalizeMessage(message) {
   return {
+    source_message_id: compact(message?.source_message_id),
     direction: ["customer", "seller", "automatic", "system"].includes(message?.direction) ? message.direction : "unknown",
     at: compact(message?.at ?? message?.time),
     text: maskSensitiveText(message?.text),
@@ -111,7 +178,9 @@ function normalizeRecord(market, channel, raw) {
   const lastMessage = messages.at(-1) ?? null;
   const lastActor = raw.last_actor ?? lastMessage?.direction ?? (sellerReplies.length ? "seller" : "unknown");
   const customer = raw.customer_name ?? raw.customer ?? raw.customer_id ?? raw.customer_id_masked ?? "";
-  const replyState = inferReplyState(raw.status, lastActor, lastMessage?.text ?? raw.last_message ?? "");
+  const replyState = market === "ably" && /완료|종료/.test(compact(raw.status))
+    ? (lastActor === "seller" ? "ANSWERED" : "NO_REPLY")
+    : inferReplyState(raw.status, lastActor, lastMessage?.text ?? raw.last_message ?? "");
   const aiDraft = maskSensitiveText(raw.ai_draft);
   const requestedDraftPurpose = compact(raw.ai_draft_purpose).toUpperCase();
   const aiDraftPurpose = aiDraft
@@ -125,10 +194,13 @@ function normalizeRecord(market, channel, raw) {
   if (aiDraft && raw.ai_draft_origin !== "AI") {
     throw new Error("AI_DRAFT_ORIGIN_REQUIRED");
   }
+  const sourceUrl = normalizeMarketplaceUrl(raw.source_url);
+  const productUrl = normalizeMarketplaceUrl(raw.product_url);
+  const productThumbnailUrl = normalizeMarketplaceUrl(raw.product_thumbnail_url);
   const masked = {
     market,
     channel,
-    source_key: `${market}:${channel}:${sha256(sourceId).slice(0, 24)}`,
+    source_key: sourceKeyForRaw(market, channel, raw),
     occurred_at: compact(raw.occurred_at ?? raw.created_at ?? raw.received_at ?? raw.updated_at ?? raw.message_date),
     status: compact(raw.status),
     category: compact(raw.category ?? raw.tag ?? raw.type),
@@ -137,6 +209,11 @@ function normalizeRecord(market, channel, raw) {
     preview: maskSensitiveText(raw.preview ?? raw.body),
     product_id: compact(raw.product_id),
     product_name: maskSensitiveText(raw.product_name ?? raw.product),
+    source_url: sourceUrl,
+    source_url_kind: normalizeSourceUrlKind(raw.source_url_kind, sourceUrl),
+    source_reference: maskSensitiveText(raw.source_reference_masked),
+    product_url: productUrl,
+    product_thumbnail_url: productThumbnailUrl,
     order_no_masked: maskLongNumber(raw.order_no ?? raw.order_id),
     product_order_no_masked: maskLongNumber(raw.product_order_no),
     messages,
@@ -150,7 +227,7 @@ function normalizeRecord(market, channel, raw) {
     ai_draft_pii_scan: draftAllowed && aiDraft && raw.ai_draft_pii_scan === "PASS" ? "PASS" : "REVIEW",
     pii_scan: "PASS",
   };
-  masked.content_hash = sha256(stableJson({ ...masked, content_hash: undefined, change_state: undefined }));
+  masked.content_hash = contentHashForRecord(masked);
   return masked;
 }
 
@@ -166,15 +243,29 @@ export function buildReport(rawCollection, previousRecords = []) {
 
   for (const key of CHANNEL_KEYS) {
     const source = channels[key] ?? {};
+    const market = source.market ?? key.split("_")[0];
+    const channel = source.channel ?? key;
     const channelRows = [];
     for (const raw of source.records ?? []) {
-      const normalized = normalizeRecord(source.market ?? key.split("_")[0], source.channel ?? key, raw);
+      const normalized = normalizeRecord(market, channel, raw);
       const old = previous.get(normalized.source_key);
       normalized.change_state = !old ? "NEW" : old.content_hash === normalized.content_hash ? "UNCHANGED" : "CHANGED";
       channelRows.push(normalized);
       records.push(normalized);
     }
+    const openQueueKeys = (source.open_queue_records ?? []).map((raw) => sourceKeyForRaw(market, channel, raw));
+    const uniqueOpenQueueKeys = [...new Set(openQueueKeys)];
+    if (openQueueKeys.length !== uniqueOpenQueueKeys.length) {
+      throw new Error(`OPEN_QUEUE_DUPLICATE_SOURCE_KEY:${key}`);
+    }
+    const openQueueVisibleTotal = Number(source.open_queue_visible_total ?? uniqueOpenQueueKeys.length) || 0;
+    const openQueueComplete = Boolean(source.open_queue_complete);
+    if (openQueueComplete && openQueueVisibleTotal !== uniqueOpenQueueKeys.length) {
+      throw new Error(`OPEN_QUEUE_TOTAL_MISMATCH:${key}:${openQueueVisibleTotal}:${uniqueOpenQueueKeys.length}`);
+    }
     channelReports[key] = {
+      market,
+      channel,
       attempted: Boolean(source.attempted),
       visible_total: Number(source.visible_total ?? 0) || 0,
       collected_count: channelRows.length,
@@ -187,6 +278,13 @@ export function buildReport(rawCollection, previousRecords = []) {
       error: compact(source.error),
       filter: compact(source.filter),
       sort: compact(source.sort),
+      open_queue_complete: openQueueComplete,
+      open_queue_scope: compact(source.open_queue_scope),
+      open_queue_window_start: compact(source.open_queue_window_start),
+      open_queue_visible_total: openQueueVisibleTotal,
+      open_queue_observed_count: uniqueOpenQueueKeys.length,
+      open_queue_source_keys: uniqueOpenQueueKeys,
+      open_queue_error: compact(source.open_queue_error),
     };
   }
 
@@ -210,6 +308,7 @@ export function buildReport(rawCollection, previousRecords = []) {
       missing_key_count: missingKeyCount,
       missing_hash_count: missingHashCount,
       talktalk_read_state_transitions: channelReports.smartstore_talktalk?.read_state_transition_count ?? 0,
+      reconciled_channel_count: Object.values(channelReports).filter((channel) => channel.open_queue_complete).length,
       marketplace_write_actions: 0,
     },
     channels: channelReports,
@@ -255,7 +354,7 @@ export function applyAiDrafts(report, drafts = []) {
     record.ai_draft_purpose = purpose;
     record.ai_draft_required_checks = maskSensitiveText(draft.ai_draft_required_checks);
     record.ai_draft_pii_scan = "PASS";
-    record.content_hash = sha256(stableJson({ ...record, content_hash: undefined, change_state: undefined }));
+    record.content_hash = contentHashForRecord(record);
     draftByKey.delete(record.source_key);
   }
   if (draftByKey.size) throw new Error(`AI_DRAFT_CASE_NOT_FOUND:${[...draftByKey.keys()][0]}`);
@@ -264,4 +363,4 @@ export function applyAiDrafts(report, drafts = []) {
   return next;
 }
 
-export { CHANNEL_KEYS, maskSensitiveText, normalizeRecord };
+export { CHANNEL_KEYS, maskSensitiveText, normalizeMarketplaceUrl, normalizeRecord, sourceKeyForRaw };

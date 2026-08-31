@@ -28,6 +28,18 @@ export function validateSyncReport(report) {
   if (keys.some((key) => !key)) throw new Error("SOURCE_KEY_REQUIRED");
   if (new Set(keys).size !== keys.length) throw new Error("DUPLICATE_SOURCE_KEY");
   if (report.records.some((row) => !row?.content_hash)) throw new Error("CONTENT_HASH_REQUIRED");
+  for (const [channelKey, channel] of Object.entries(report.channels ?? {})) {
+    if (!channel?.open_queue_complete) continue;
+    const openKeys = channel.open_queue_source_keys;
+    if (!Array.isArray(openKeys)) throw new Error(`OPEN_QUEUE_SOURCE_KEYS_REQUIRED:${channelKey}`);
+    if (new Set(openKeys).size !== openKeys.length) throw new Error(`OPEN_QUEUE_DUPLICATE_SOURCE_KEY:${channelKey}`);
+    if (openKeys.some((key) => !String(key).startsWith(`${channel.market}:`))) {
+      throw new Error(`OPEN_QUEUE_SOURCE_KEY_SCOPE_MISMATCH:${channelKey}`);
+    }
+    if (Number(channel.open_queue_visible_total ?? -1) !== openKeys.length) {
+      throw new Error(`OPEN_QUEUE_TOTAL_MISMATCH:${channelKey}`);
+    }
+  }
   return report;
 }
 

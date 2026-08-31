@@ -12,6 +12,19 @@ const CS_SHEETS = Object.freeze({
 const CS_WRITE_POLICY = 'MASKED_SYNC_AND_DRAFT_REVIEW_ONLY';
 const CS_ALLOWED_DRAFT_STATES = Object.freeze(['APPROVED', 'REJECTED', 'USED']);
 const CS_MAX_SYNC_RECORDS = 2000;
+const CS_RECONCILIATION_COLUMNS = Object.freeze([
+  'last_status_verified_at',
+  'status_missing_count',
+  'status_source',
+  'completion_reason',
+]);
+const CS_LINK_COLUMNS = Object.freeze([
+  'source_url_kind',
+  'source_reference',
+  'product_url',
+  'product_thumbnail_url',
+  'image_count',
+]);
 
 function doGet(e) {
   try {
@@ -32,7 +45,7 @@ function doPost(e) {
     assertRequestEnvironment_(request);
     const action = String(request.action || '');
 
-    if (['health', 'overview', 'cases', 'case', 'answerLibrary'].indexOf(action) !== -1) {
+    if (['health', 'overview', 'dashboard', 'cases', 'case', 'answerLibrary'].indexOf(action) !== -1) {
       return json_(dispatchRead_(action, request));
     }
 
@@ -63,6 +76,7 @@ function doPost(e) {
 function dispatchRead_(action, request) {
   if (action === 'health') return health_();
   if (action === 'overview') return overview_();
+  if (action === 'dashboard') return dashboard_(request);
   if (action === 'cases') return listCases_(request);
   if (action === 'case') return getCase_(request.case_key);
   if (action === 'answerLibrary') return searchVerifiedAnswers_(request);
@@ -97,6 +111,7 @@ function syncRun_(request) {
   const messagesSheet = requiredSheet_(spreadsheet, CS_SHEETS.MESSAGES);
   const draftsSheet = requiredSheet_(spreadsheet, CS_SHEETS.DRAFTS);
   const runsSheet = requiredSheet_(spreadsheet, CS_SHEETS.RUNS);
+  ensureColumns_(casesSheet, CS_RECONCILIATION_COLUMNS.concat(CS_LINK_COLUMNS));
   const casesTable = readTable_(casesSheet);
   const messagesTable = readTable_(messagesSheet);
   const draftsTable = readTable_(draftsSheet);
@@ -175,6 +190,10 @@ function syncRun_(request) {
     });
   });
 
+  const reconciliation = prepareOpenQueueReconciliation_(report, casesTable, keys, now);
+  reconciliation.updates.forEach(function (item) { caseUpdates.push(item); });
+  reconciliation.results.forEach(function (item) { results.push(item); });
+
   caseUpdates.forEach(function (item) {
     writeObjectRow_(casesSheet, casesTable, item.rowNumber, item.object);
   });
@@ -184,6 +203,7 @@ function syncRun_(request) {
 
   const runRows = buildRunRows_(report, runId, results, now);
   appendObjects_(runsSheet, runsTable, runRows);
+  invalidateReadCache_();
 
   return {
     ok: true,
@@ -197,6 +217,10 @@ function syncRun_(request) {
     unchanged_count: results.filter(function (row) { return row.change_state === 'UNCHANGED'; }).length,
     inserted_messages: messageAppends.length,
     inserted_drafts: draftAppends.length,
+    reconciliation_checked_cases: reconciliation.checked,
+    reconciliation_review_cases: reconciliation.review,
+    reconciliation_closed_cases: reconciliation.closed,
+    reconciliation_reopened_cases: reconciliation.reopened,
     marketplace_write_actions: 0,
     auto_send: false,
   };
@@ -210,6 +234,16 @@ function caseObjectFromRecord_(record, existing, changeState, draft, now) {
   const lastMessage = messages.length ? messages[messages.length - 1] : null;
   const channelInfo = channelInfo_(record.market, record.channel);
   const old = existing || {};
+  const recordSourceUrl = safeMarketplaceUrl_(record.source_url, 'source_url');
+  const oldSourceUrl = safeMarketplaceUrl_(old.source_url, 'source_url');
+  const sourceUrl = recordSourceUrl || oldSourceUrl || channelInfo.sourceUrl;
+  const sourceUrlKind = normalizeSourceUrlKind_(record.source_url_kind || old.source_url_kind, Boolean(recordSourceUrl || oldSourceUrl));
+  const sourceReference = String(record.source_reference || old.source_reference || '');
+  const productUrl = safeMarketplaceUrl_(record.product_url, 'product_url') || safeMarketplaceUrl_(old.product_url, 'product_url');
+  const productThumbnailUrl = safeMarketplaceUrl_(record.product_thumbnail_url, 'product_thumbnail_url') || safeMarketplaceUrl_(old.product_thumbnail_url, 'product_thumbnail_url');
+  const imageCount = Array.isArray(record.messages)
+    ? record.messages.reduce(function (total, message) { return total + Math.max(Number(message.image_count || 0), 0); }, 0)
+    : Math.max(Number(old.image_count || 0), 0);
   const humanReplyExists = replyState === 'ANSWERED' || sellerReplies.length > 0 || String(record.last_actor) === 'seller' || old.human_reply_exists === true;
   const changedAt = changeState === 'UNCHANGED' && old.last_changed_at ? old.last_changed_at : now;
   const activeDraft = draft || (old.active_ai_draft_id ? {
@@ -217,6 +251,11 @@ function caseObjectFromRecord_(record, existing, changeState, draft, now) {
     draft_text: old.active_ai_draft_preview,
     draft_state: old.ai_draft_state,
   } : null);
+  const completionReason = replyState === 'ANSWERED'
+    ? 'SELLER_REPLY_CONFIRMED'
+    : replyState === 'NO_REPLY_REQUIRED'
+      ? 'NO_REPLY_REQUIRED_CONFIRMED'
+      : '';
 
   return {
     case_key: String(record.source_key),
@@ -224,7 +263,12 @@ function caseObjectFromRecord_(record, existing, changeState, draft, now) {
     market: channelInfo.market,
     channel: channelInfo.channel,
     ui_type: channelInfo.uiType,
-    source_url: channelInfo.sourceUrl,
+    source_url: sourceUrl,
+    source_url_kind: sourceUrlKind,
+    source_reference: sourceReference,
+    product_url: productUrl,
+    product_thumbnail_url: productThumbnailUrl,
+    image_count: imageCount,
     occurred_at: toDateOrBlank_(record.occurred_at) || old.occurred_at || '',
     last_message_at: toDateOrBlank_(lastMessage && lastMessage.at || record.occurred_at) || old.last_message_at || '',
     customer_masked: String(record.customer_masked || ''),
@@ -249,34 +293,142 @@ function caseObjectFromRecord_(record, existing, changeState, draft, now) {
     first_seen_at: old.first_seen_at || now,
     last_seen_at: now,
     last_changed_at: changedAt,
+    last_status_verified_at: now,
+    status_missing_count: 0,
+    status_source: 'COLLECTED_DETAIL_OR_STATUS',
+    completion_reason: completionReason,
     pii_scan: String(record.pii_scan || 'REVIEW') === 'PASS' ? 'PASS' : 'WARNING',
     sync_error: '',
   };
 }
 
+function prepareOpenQueueReconciliation_(report, casesTable, collectedKeys, now) {
+  const updates = [];
+  const results = [];
+  let checked = 0;
+  let review = 0;
+  let closed = 0;
+  let reopened = 0;
+
+  Object.keys(report.channels || {}).forEach(function (channelKey) {
+    const snapshot = report.channels[channelKey] || {};
+    if (snapshot.open_queue_complete !== true) return;
+    const openKeys = Array.isArray(snapshot.open_queue_source_keys) ? snapshot.open_queue_source_keys : null;
+    if (!openKeys) throw new Error('OPEN_QUEUE_SOURCE_KEYS_REQUIRED:' + channelKey);
+    if (Number(snapshot.open_queue_visible_total) !== openKeys.length) {
+      throw new Error('OPEN_QUEUE_TOTAL_MISMATCH:' + channelKey);
+    }
+    const unique = {};
+    openKeys.forEach(function (key) {
+      const value = String(key || '');
+      if (!value) throw new Error('OPEN_QUEUE_SOURCE_KEY_REQUIRED:' + channelKey);
+      if (unique[value]) throw new Error('OPEN_QUEUE_DUPLICATE_SOURCE_KEY:' + channelKey);
+      unique[value] = true;
+    });
+
+    const info = channelInfoFromKey_(channelKey);
+    const windowStart = dateValue_(snapshot.open_queue_window_start);
+    casesTable.rows.forEach(function (row) {
+      const existing = objectFromRow_(casesTable, row);
+      const key = String(existing.case_key || '');
+      if (!key || collectedKeys[key]) return;
+      if (String(existing.record_type || '') !== 'LIVE') return;
+      if (String(existing.market || '') !== info.market || String(existing.channel || '') !== info.channel) return;
+      if (windowStart && dateValue_(existing.occurred_at) < windowStart) return;
+
+      const isOpen = Boolean(unique[key]);
+      const oldState = mapReplyState_(existing.reply_state);
+      const oldMissing = Math.max(Number(existing.status_missing_count || 0), 0);
+      const priorMissingReview = oldState === 'REVIEW' && String(existing.status_source || '') === 'OPEN_QUEUE_MISSING';
+      if (!isOpen && oldState !== 'NEEDS_REPLY' && !priorMissingReview) return;
+
+      checked += 1;
+      const next = Object.assign({}, existing, {
+        last_status_verified_at: now,
+        sync_error: '',
+      });
+
+      if (isOpen) {
+        next.reply_required = true;
+        next.reply_state = 'NEEDS_REPLY';
+        next.source_status = '현재 미답변 목록에서 확인';
+        next.status_missing_count = 0;
+        next.status_source = 'OPEN_QUEUE';
+        next.completion_reason = '';
+        next.change_state = oldState === 'NEEDS_REPLY' && oldMissing === 0 ? 'UNCHANGED' : 'CHANGED';
+        if (next.change_state === 'CHANGED') {
+          next.content_hash = sha256_(['RECONCILE', existing.content_hash || '', 'OPEN', now.toISOString()].join('|'));
+          next.last_changed_at = now;
+          reopened += 1;
+        }
+      } else {
+        const missingCount = oldMissing + 1;
+        const shouldClose = missingCount >= 2;
+        next.reply_required = !shouldClose;
+        next.reply_state = shouldClose ? 'CLOSED' : 'REVIEW';
+        next.source_status = shouldClose ? '처리 종료 · 미답변 목록 2회 연속 미노출' : '재확인 필요 · 미답변 목록 1회 미노출';
+        next.status_missing_count = missingCount;
+        next.status_source = 'OPEN_QUEUE_MISSING';
+        next.completion_reason = shouldClose ? 'OPEN_QUEUE_MISSING_TWICE' : '';
+        next.change_state = 'CHANGED';
+        next.content_hash = sha256_(['RECONCILE', existing.content_hash || '', missingCount, next.reply_state].join('|'));
+        next.last_changed_at = now;
+        // A case that disappeared from the complete open queue is no longer safe
+        // to present as AI-ready, even while we wait for the second observation.
+        // Keep the historical draft row for audit, but detach it from the case.
+        next.active_ai_draft_id = '';
+        next.active_ai_draft_preview = '';
+        next.ai_draft_state = 'NONE';
+        if (shouldClose) {
+          closed += 1;
+        } else {
+          review += 1;
+        }
+      }
+
+      updates.push({ rowNumber: row.rowNumber, object: next });
+      results.push({
+        source_key: key,
+        market: info.rawMarket,
+        channel: info.rawChannel,
+        change_state: next.change_state,
+        reply_state: next.reply_state,
+      });
+    });
+  });
+
+  return { updates: updates, results: results, checked: checked, review: review, closed: closed, reopened: reopened };
+}
+
 function prepareMessages_(record, now) {
   const result = [];
   const input = [];
-  const signatures = {};
-  const pushUnique = function (message) {
-    const signature = [String(message.actor || ''), String(message.at || ''), String(message.text || ''), Number(message.image_count || 0)].join('|');
-    if (signatures[signature]) return;
-    signatures[signature] = true;
-    input.push(message);
-  };
-  (Array.isArray(record.messages) ? record.messages : []).forEach(function (message) {
-    pushUnique({ at: message.at, actor: message.direction, text: message.text, image_count: message.image_count });
+  (Array.isArray(record.messages) ? record.messages : []).forEach(function (message, index) {
+    input.push({
+      at: message.at,
+      actor: message.direction,
+      text: message.text,
+      image_count: message.image_count,
+      source_message_id: String(message.source_message_id || ('sequence-' + (index + 1))),
+    });
   });
-  (Array.isArray(record.seller_replies) ? record.seller_replies : []).forEach(function (reply) {
-    pushUnique({ at: reply.at, actor: 'seller', text: reply.text, image_count: 0 });
+  (Array.isArray(record.seller_replies) ? record.seller_replies : []).forEach(function (reply, index) {
+    input.push({
+      at: reply.at,
+      actor: 'seller',
+      text: reply.text,
+      image_count: 0,
+      source_message_id: String(reply.source_message_id || ('seller-reply-' + (index + 1))),
+    });
   });
 
   input.forEach(function (message, index) {
     const actor = mapActor_(message.actor);
     const text = String(message.text || '');
-    const contentHash = sha256_([record.source_key, index + 1, actor, message.at || '', text, Number(message.image_count || 0)].join('|'));
+    const sourceMessageId = String(message.source_message_id || ('sequence-' + (index + 1)));
+    const contentHash = sha256_([record.source_key, sourceMessageId, index + 1, actor, message.at || '', text, Number(message.image_count || 0)].join('|'));
     result.push({
-      message_key: 'MSG:' + String(record.source_key) + ':' + contentHash.slice(0, 20),
+      message_key: 'MSG2:' + String(record.source_key) + ':' + contentHash.slice(0, 20),
       record_type: 'LIVE',
       case_key: String(record.source_key),
       sequence: index + 1,
@@ -388,12 +540,49 @@ function assertMaskedRecord_(record) {
     const value = String(record[field] || '');
     if (/^\d{10,}$/.test(value)) throw new Error('UNMASKED_LONG_NUMBER:' + field);
   });
+  assertMaskedText_(record.source_reference, 'source_reference');
+  safeMarketplaceUrl_(record.source_url, 'source_url');
+  safeMarketplaceUrl_(record.product_url, 'product_url');
+  safeMarketplaceUrl_(record.product_thumbnail_url, 'product_thumbnail_url');
+  normalizeSourceUrlKind_(record.source_url_kind, Boolean(record.source_url));
 }
 
 function assertMaskedText_(value, field) {
   const text = String(value || '');
   if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(text)) throw new Error('UNMASKED_PHONE:' + field);
   if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(text)) throw new Error('UNMASKED_EMAIL:' + field);
+}
+
+function normalizeSourceUrlKind_(value, hasSourceUrl) {
+  const kind = String(value || '').toUpperCase();
+  if (!kind) return hasSourceUrl ? 'LIST' : 'UNAVAILABLE';
+  if (['EXACT', 'LIST', 'UNAVAILABLE'].indexOf(kind) === -1) throw new Error('INVALID_SOURCE_URL_KIND');
+  if (kind === 'EXACT' && !hasSourceUrl) throw new Error('SOURCE_URL_KIND_MISMATCH');
+  if (kind === 'UNAVAILABLE' && hasSourceUrl) throw new Error('SOURCE_URL_KIND_MISMATCH');
+  return kind;
+}
+
+function safeMarketplaceUrl_(value, field) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (!/^https:\/\//i.test(text)) throw new Error('UNSAFE_MARKETPLACE_URL:' + field);
+  const authorityMatch = text.match(/^https:\/\/([^\/?#]+)(?:[\/?#]|$)/i);
+  if (!authorityMatch || authorityMatch[1].indexOf('@') !== -1) throw new Error('UNSAFE_MARKETPLACE_URL:' + field);
+  const host = String(authorityMatch[1].split(':')[0] || '').toLowerCase();
+  const allowed = ['naver.com', 'kakaostyle.com', 'a-bly.com'].some(function (suffix) {
+    return host === suffix || host.slice(-(suffix.length + 1)) === '.' + suffix;
+  });
+  if (!allowed) throw new Error('UNSAFE_MARKETPLACE_URL:' + field);
+
+  let decoded = text;
+  try { decoded = decodeURIComponent(text); } catch (error) { /* Keep the original value for conservative checks. */ }
+  const queryOrFragment = (decoded.match(/[?#]([\s\S]*)$/) || [])[1] || '';
+  if (/(?:^|[?&#])(?:token|access_token|refresh_token|api_key|apikey|key|secret|password|passwd|session|cookie|authorization)=/i.test(queryOrFragment)) {
+    throw new Error('SENSITIVE_MARKETPLACE_URL_PARAMETER:' + field);
+  }
+  if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(queryOrFragment)) throw new Error('UNMASKED_PHONE:' + field);
+  if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(queryOrFragment)) throw new Error('UNMASKED_EMAIL:' + field);
+  return text;
 }
 
 function channelInfo_(market, channel) {
@@ -408,7 +597,7 @@ function channelInfoFromKey_(key) {
     smartstore_talktalk: { rawMarket: 'smartstore', rawChannel: 'talktalk', market: 'SMARTSTORE', channel: '톡톡 상담', uiType: 'CHAT', sourceUrl: 'https://sell.smartstore.naver.com/#/talktalk/chat' },
     zigzag_order_inquiry: { rawMarket: 'zigzag', rawChannel: 'order_inquiry', market: 'ZIGZAG', channel: '주문 문의', uiType: 'POST', sourceUrl: 'https://partners.kakaostyle.com/shop/pink-rocket/order_inquiry' },
     zigzag_item_question: { rawMarket: 'zigzag', rawChannel: 'item_question', market: 'ZIGZAG', channel: '상품 문의', uiType: 'POST', sourceUrl: 'https://partners.kakaostyle.com/shop/pink-rocket/item_question' },
-    ably_inquiry: { rawMarket: 'ably', rawChannel: 'inquiry', market: 'ABLY', channel: '문의 관리', uiType: 'CHAT', sourceUrl: 'https://seller.a-bly.com/' },
+    ably_inquiry: { rawMarket: 'ably', rawChannel: 'inquiry', market: 'ABLY', channel: '문의 관리', uiType: 'CHAT', sourceUrl: 'https://my.a-bly.com/inquiry' },
   };
   const info = map[key];
   if (!info) throw new Error('UNKNOWN_CHANNEL:' + key);
@@ -418,7 +607,7 @@ function channelInfoFromKey_(key) {
 function mapReplyState_(value) {
   const state = String(value || 'REVIEW');
   if (state === 'NO_REPLY') return 'NO_REPLY_REQUIRED';
-  if (['NEEDS_REPLY', 'ANSWERED', 'NO_REPLY_REQUIRED', 'REVIEW'].indexOf(state) !== -1) return state;
+  if (['NEEDS_REPLY', 'ANSWERED', 'NO_REPLY_REQUIRED', 'REVIEW', 'CLOSED'].indexOf(state) !== -1) return state;
   return 'REVIEW';
 }
 
@@ -451,6 +640,16 @@ function requiredSheet_(spreadsheet, name) {
   const sheet = spreadsheet.getSheetByName(name);
   if (!sheet) throw new Error('SHEET_NOT_FOUND:' + name);
   return sheet;
+}
+
+function ensureColumns_(sheet, requiredHeaders) {
+  const lastColumn = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(function (value) {
+    return String(value || '').trim();
+  });
+  const missing = requiredHeaders.filter(function (header) { return headers.indexOf(header) === -1; });
+  if (!missing.length) return;
+  sheet.getRange(1, headers.length + 1, 1, missing.length).setValues([missing]);
 }
 
 function objectRowsBy_(table, field) {
@@ -499,7 +698,11 @@ function appendObjects_(sheet, table, objects) {
 
 function overview_() {
   const cases = getObjects_(CS_SHEETS.CASES);
-  const live = cases.filter(function (row) { return row.record_type === 'LIVE'; });
+  return overviewFromCases_(cases);
+}
+
+function overviewFromCases_(cases) {
+  const live = cases.map(publicCase_).filter(function (row) { return row.record_type === 'LIVE'; });
   const count = function (field, value) {
     return live.filter(function (row) { return String(row[field] || '') === value; }).length;
   };
@@ -517,6 +720,7 @@ function overview_() {
     answered: count('reply_state', 'ANSWERED'),
     review: count('reply_state', 'REVIEW'),
     no_reply_required: count('reply_state', 'NO_REPLY_REQUIRED'),
+    closed: count('reply_state', 'CLOSED'),
     ai_ready: count('ai_draft_state', 'READY'),
     by_market: byMarket,
     auto_send: false,
@@ -524,10 +728,14 @@ function overview_() {
 }
 
 function listCases_(request) {
+  return listCasesFromRows_(getObjects_(CS_SHEETS.CASES), request);
+}
+
+function listCasesFromRows_(caseRows, request) {
   const limit = Math.min(Math.max(Number(request.limit || 50), 1), 200);
   const cursor = Math.max(Number(request.cursor || 0), 0);
   const filters = ['record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state'];
-  let rows = getObjects_(CS_SHEETS.CASES);
+  let rows = caseRows.map(publicCase_);
 
   filters.forEach(function (field) {
     if (!request[field]) return;
@@ -539,9 +747,12 @@ function listCases_(request) {
   if (!request.record_type) {
     rows = rows.filter(function (row) { return row.record_type === 'LIVE'; });
   }
+  if (!request.reply_state) {
+    rows = rows.filter(function (row) { return String(row.reply_state || '') !== 'CLOSED'; });
+  }
 
   rows.sort(function (a, b) {
-    const priority = { NEEDS_REPLY: 0, REVIEW: 1, ANSWERED: 2, NO_REPLY_REQUIRED: 3 };
+    const priority = { NEEDS_REPLY: 0, REVIEW: 1, ANSWERED: 2, NO_REPLY_REQUIRED: 3, CLOSED: 4 };
     const pa = priority[a.reply_state] == null ? 9 : priority[a.reply_state];
     const pb = priority[b.reply_state] == null ? 9 : priority[b.reply_state];
     if (pa !== pb) return pa - pb;
@@ -558,6 +769,22 @@ function listCases_(request) {
   };
 }
 
+function dashboard_(request) {
+  const safeRequest = Object.assign({}, request, {
+    limit: Math.min(Math.max(Number(request.limit || 50), 1), 100),
+    cursor: 0,
+  });
+  const cacheKey = dashboardCacheKey_(safeRequest);
+  const cached = readJsonCache_(cacheKey);
+  if (cached) return cached;
+
+  const cases = getObjects_(CS_SHEETS.CASES);
+  const listing = listCasesFromRows_(cases, safeRequest);
+  const payload = Object.assign({ ok: true, overview: overviewFromCases_(cases) }, listing);
+  writeJsonCache_(cacheKey, payload, 45);
+  return payload;
+}
+
 function getCase_(caseKey) {
   if (!caseKey) throw new Error('CASE_KEY_REQUIRED');
   const caseRow = getObjects_(CS_SHEETS.CASES).find(function (row) {
@@ -565,8 +792,13 @@ function getCase_(caseKey) {
   });
   if (!caseRow) throw new Error('CASE_NOT_FOUND');
 
-  const messages = getObjects_(CS_SHEETS.MESSAGES)
-    .filter(function (row) { return String(row.case_key) === String(caseKey); })
+  const allMessages = getObjects_(CS_SHEETS.MESSAGES)
+    .filter(function (row) { return String(row.case_key) === String(caseKey); });
+  const versionTwoMessages = allMessages.filter(function (row) {
+    return String(row.message_key || '').indexOf('MSG2:') === 0;
+  });
+  const messages = (versionTwoMessages.length ? versionTwoMessages : allMessages)
+    .filter(function (row) { return !isUiControlText_(row.message_text_masked); })
     .sort(function (a, b) { return Number(a.sequence || 0) - Number(b.sequence || 0); });
 
   const drafts = getObjects_(CS_SHEETS.DRAFTS)
@@ -700,6 +932,7 @@ function reviewDraft_(request) {
   if (caseRow && String(caseRow.values[caseData.headerMap.active_ai_draft_id] || '') === draftId) {
     caseSheet.getRange(caseRow.rowNumber, caseData.headerMap.ai_draft_state + 1).setValue(nextState);
   }
+  invalidateReadCache_();
 
   return {
     ok: true,
@@ -716,8 +949,26 @@ function reviewDraft_(request) {
 
 function publicCase_(row) {
   const copy = Object.assign({}, row);
+  if (isUiControlText_(copy.preview)) {
+    copy.preview = '과거 수집 데이터 · 원문 재확인 필요';
+  }
+  // A one-pass open-queue miss is intentionally REVIEW, but its historical
+  // draft must not remain actionable in the dashboard while status is unsure.
+  if (String(copy.reply_state || '') === 'REVIEW' && String(copy.status_source || '') === 'OPEN_QUEUE_MISSING') {
+    copy.active_ai_draft_id = '';
+    copy.active_ai_draft_preview = '';
+    copy.ai_draft_state = 'NONE';
+  }
   delete copy.sync_error;
   return copy;
+}
+
+function isUiControlText_(value) {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  return [
+    '문의 계속하기', '문의 종료하기', '상담 계속하기', '상담 종료하기',
+    '답변하기', '답변 수정', '답변 등록', '메시지 보내기', '전송',
+  ].indexOf(normalized) !== -1;
 }
 
 function getObjects_(sheetName) {
@@ -731,6 +982,36 @@ function getObjects_(sheetName) {
     });
     return result;
   });
+}
+
+function dashboardCacheKey_(request) {
+  const fields = ['record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit'];
+  const version = String(PropertiesService.getScriptProperties().getProperty('CS_READ_CACHE_VERSION') || '0');
+  return 'dashboard:' + version + ':' + fields.map(function (field) {
+    return field + '=' + String(request[field] || '');
+  }).join('&');
+}
+
+function readJsonCache_(key) {
+  try {
+    const value = CacheService.getScriptCache().get(key);
+    return value ? JSON.parse(value) : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function writeJsonCache_(key, payload, seconds) {
+  try {
+    const value = JSON.stringify(payload);
+    if (value.length <= 90000) CacheService.getScriptCache().put(key, value, seconds);
+  } catch (error) {
+    // Cache failure must never block the read-only CS dashboard.
+  }
+}
+
+function invalidateReadCache_() {
+  PropertiesService.getScriptProperties().setProperty('CS_READ_CACHE_VERSION', String(Date.now()));
 }
 
 function readTable_(sheet) {
