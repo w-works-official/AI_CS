@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeReviewRequest, normalizeSyncRequest } from "./policy.ts";
+import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeReviewRequest, normalizeSyncRequest } from "./policy.ts";
+
+test("case batch accepts one to three distinct safe case keys", () => {
+  assert.deepEqual(normalizeCaseBatchKeys("smartstore:talktalk:abc,ably:inquiry:def"), ["smartstore:talktalk:abc", "ably:inquiry:def"]);
+  assert.throws(() => normalizeCaseBatchKeys(""), /CASE_KEYS_REQUIRED/);
+  assert.throws(() => normalizeCaseBatchKeys("a,b,c,d"), /CASE_BATCH_TOO_LARGE/);
+  assert.throws(() => normalizeCaseBatchKeys("a,a"), /DUPLICATE_CASE_KEY/);
+  assert.throws(() => normalizeCaseBatchKeys("safe,unsafe key"), /CASE_KEY_INVALID/);
+});
 
 test("development review request allows only bounded review fields", () => {
   assert.deepEqual(normalizeReviewRequest({
@@ -43,6 +51,10 @@ const safeRecord = {
   pii_scan: "PASS",
   content_hash: "abc123",
   change_state: "NEW",
+  source_url: "https://my.a-bly.com/inquiry",
+  source_url_kind: "LIST",
+  source_reference: "AB-masked-ref",
+  product_url: "https://my.a-bly.com/product/123",
 };
 
 test("sync request accepts only a masked read-only report", () => {
@@ -54,6 +66,7 @@ test("sync request accepts only a masked read-only report", () => {
   assert.equal(result.action, "syncRun");
   assert.equal(result.report.records.length, 1);
   assert.equal(result.report.records[0].pii_scan, "PASS");
+  assert.equal(result.report.records[0].source_url_kind, "LIST");
 });
 
 test("sync request rejects secret overrides, PII, and draft-state mismatches", () => {
@@ -62,4 +75,12 @@ test("sync request rejects secret overrides, PII, and draft-state mismatches", (
   assert.throws(() => normalizeSyncRequest({ ...base, report: { ...base.report, summary: { marketplace_write_actions: 1 } } }), /MARKETPLACE_WRITE_ACTIONS_NOT_ALLOWED/);
   assert.throws(() => normalizeSyncRequest({ ...base, report: { ...base.report, records: [{ ...safeRecord, preview: "010-1234-5678" }] } }), /UNMASKED_PHONE/);
   assert.throws(() => normalizeSyncRequest({ ...base, report: { ...base.report, records: [{ ...safeRecord, reply_state: "ANSWERED" }] } }), /AI_DRAFT_REPLY_STATE_MISMATCH/);
+  assert.throws(() => normalizeSyncRequest({ ...base, report: { ...base.report, records: [{ ...safeRecord, source_url: "https://example.com/case" }] } }), /MARKETPLACE_URL_HOST_NOT_ALLOWED/);
+  assert.throws(() => normalizeSyncRequest({ ...base, report: { ...base.report, records: [{ ...safeRecord, source_url: "https://my.a-bly.com/inquiry?sessionId=secret" }] } }), /MARKETPLACE_URL_SECRET_PARAM/);
+  assert.throws(() => normalizeSyncRequest({ ...base, report: { ...base.report, records: [{ ...safeRecord, source_url: "https://my.a-bly.com/inquiry#detail?accessToken=secret" }] } }), /MARKETPLACE_URL_SECRET_PARAM/);
+});
+
+test("read params reject duplicate singleton values", () => {
+  assert.throws(() => assertSingletonReadParams(new URLSearchParams("action=case&case_key=A&case_key=B")), /READ_PARAM_DUPLICATE:case_key/);
+  assert.doesNotThrow(() => assertSingletonReadParams(new URLSearchParams("action=case&case_key=A")));
 });

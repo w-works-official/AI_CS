@@ -7,13 +7,18 @@ export const DEFAULT_SYNC_CONFIG = fileURLToPath(
 );
 
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
-const READ_ACTIONS = new Set(["health", "overview", "cases", "case", "answerLibrary"]);
-const READ_PARAMS = new Set(["case_key", "record_type", "market", "channel", "ui_type", "reply_state", "ai_draft_state", "limit", "cursor", "query", "intent"]);
+const READ_ACTIONS = new Set(["health", "overview", "cases", "case", "caseBatch", "caseIndex", "answerLibrary"]);
+const READ_PARAMS = new Set(["case_key", "case_keys", "record_type", "market", "channel", "ui_type", "reply_state", "ai_draft_state", "limit", "cursor", "query", "intent"]);
 
 export function makeRunId(report) {
   const identity = [
     report?.collected_at ?? "",
-    ...(report?.records ?? []).map((row) => `${row.source_key}:${row.content_hash}`),
+    ...(report?.records ?? []).map((row) => `${row.source_key}:${row.content_hash}:${sha256([
+      row.ai_draft ?? "",
+      row.ai_draft_purpose ?? "",
+      row.ai_draft_required_checks ?? "",
+      row.ai_draft_pii_scan ?? "",
+    ].join("|")).slice(0, 16)}`),
   ].join("|");
   return `SYNC_${sha256(identity).slice(0, 24)}`;
 }
@@ -146,4 +151,21 @@ export async function readCsData(action, params, config, { fetchImpl = globalThi
 
 export function searchVerifiedAnswers(params, config, options) {
   return readCsData("answerLibrary", { ...params, limit: Math.min(3, Number(params?.limit ?? 3) || 3) }, config, options);
+}
+
+export async function readCaseIndex(config, options) {
+  const result = await readCsData("caseIndex", {}, config, options);
+  const items = Array.isArray(result.items) ? result.items : [];
+  if (result.truncated === true || Number(result.total_available ?? items.length) > items.length) throw new Error("CASE_INDEX_TRUNCATED");
+  if (items.length > 5000) throw new Error("CASE_INDEX_TOO_LARGE");
+  const keys = items.map((item) => String(item?.source_key || ""));
+  if (keys.some((key) => !key)) throw new Error("CASE_INDEX_KEY_REQUIRED");
+  if (new Set(keys).size !== keys.length) throw new Error("CASE_INDEX_DUPLICATE_KEY");
+  return items.map((item) => ({
+    source_key: String(item.source_key),
+    content_hash: String(item.content_hash || ""),
+    ai_draft_state: String(item.ai_draft_state || "NONE"),
+    reply_state: String(item.reply_state || ""),
+    last_seen_at: String(item.last_seen_at || ""),
+  }));
 }

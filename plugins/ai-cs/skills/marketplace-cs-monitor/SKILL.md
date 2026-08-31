@@ -13,11 +13,11 @@ Use `collect_and_reconcile` unless the user asks for a prepare-only diagnostic. 
 
 Canonical local macro:
 
-- working directory: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs`
-- script: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs/smartstore_cs_macro.mjs`
-- command: `npm run scrape`
+- working directory: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs/work/AI_CS`
+- script: `tools/marketplace-cs/smartstore_cs_macro.mjs`
+- command: `npm run collect:cs`
 
-Read [references/local-playwright-macro.md](references/local-playwright-macro.md) before running it. Read [references/report-schema.md](references/report-schema.md) before changing the masked report and [references/answer-library.md](references/answer-library.md) before generating drafts. Read [references/sheet-sync.md](references/sheet-sync.md) before any health or sync request.
+Read [references/local-playwright-macro.md](references/local-playwright-macro.md) before running it. Read [references/report-schema.md](references/report-schema.md) before changing the masked report and [references/answer-library.md](references/answer-library.md) before generating drafts. Read [references/sheet-sync.md](references/sheet-sync.md) before any health or sync request. Read [references/automation.md](references/automation.md) before proposing or enabling recurring collection.
 
 ## Browser and profile boundary
 
@@ -40,11 +40,11 @@ Read [references/local-playwright-macro.md](references/local-playwright-macro.md
 ## Vertical-slice workflow
 
 1. Confirm the current collection operator has started the local CS Chrome and signed in. Resolve the active session file or the explicit loopback `SMARTSTORE_CDP_URL`; do not inspect cookies, tokens, saved passwords, or browser storage.
-2. Run the existing macro with the explicitly requested channels, today's range, `CS_RUN_MODE=collect_and_reconcile`, and `CS_KEEP_MASKED_OUTPUT=1`. Use `CS_SYNC_MODE=prepare` for inspection or `sync` only when the user asked to persist the run.
+2. Run the existing macro with the explicitly requested channels, today's range, `CS_RUN_MODE=collect_and_reconcile`, `CS_SYNC_MODE=prepare`, and `CS_KEEP_MASKED_OUTPUT=1`. The macro may read the development case index for deterministic NEW/CHANGED/UNCHANGED classification, but it must not sync yet. A collection-only run with no drafts may use direct `sync` only when the user explicitly requests it.
 3. Check that only the requested channels have `attempted=true`. Verify visible totals, verified zero states, source keys, content hashes, PII scan, counts, and `marketplace_write_actions=0`. A channel may reconcile old cases only when `open_queue_complete=true`, `open_queue_visible_total=open_queue_observed_count`, and the snapshot declares its window. An incomplete or failed list must never close a stored case.
-4. For each `reply_state=NEEDS_REPLY`, retrieve at most three enabled `USE` examples from the development `06_ANSWER_LIBRARY` through `searchVerifiedAnswers` in `scripts/sync-client.mjs`. For an explicitly requested answered-case evaluation, hold the actual seller answer out while generating and set `ai_draft_purpose=EVAL`.
-5. Generate a cautious AI draft using only those examples and current inquiry facts. Do not claim live price, stock, order, shipment, refund, compensation, or policy state without an explicit human check.
-6. Attach drafts with `applyAiDrafts(report, drafts)` from `scripts/report-core.mjs`. Every draft must set `ai_draft_origin=AI`, `ai_draft_purpose=REPLY|EVAL`, required checks, and `ai_draft_pii_scan=PASS`; the helper recalculates `content_hash`. `EVAL` is valid only for `ANSWERED`, never changes `reply_state`, and never contributes to reply-needed or ready-to-send counts.
+4. Use `selectDraftCandidates`, `buildAnswerSearchRequest`, and `buildAiDraftJob` from `scripts/ai-draft-core.mjs`. For each candidate, retrieve at most three enabled `USE` examples through `searchVerifiedAnswers` in `scripts/sync-client.mjs`. For an explicitly requested answered-case evaluation, the job must hold the actual seller answer out and set `ai_draft_purpose=EVAL`.
+5. Generate a cautious AI draft using only the masked job, returned examples, and active rules. Do not claim live price, stock, order, shipment, refund, compensation, or policy state without an explicit human check. Validate each result with `validateGeneratedDraft`; isolate a failed candidate instead of aborting all other drafts.
+6. Attach validated drafts with `applyAiDrafts(report, drafts)` from `scripts/report-core.mjs`. Every draft must set `ai_draft_origin=AI`, `ai_draft_purpose=REPLY|EVAL`, required checks, and `ai_draft_pii_scan=PASS`. AI fields are deliberately excluded from the inquiry `content_hash`, so adding or revising a draft cannot turn an unchanged customer inquiry into `CHANGED`. `EVAL` is valid only for `ANSWERED`, never changes `reply_state`, and never contributes to reply-needed or ready-to-send counts.
 7. Load the existing local sync config, require `environment=development`, and call `readCsData("health")`. Stop before sync unless health returns `ok=true`, `environment=development`, `auto_send=false`, and `marketplace_write_actions=0`.
 8. Call `syncReport(finalReport, config)` once. Do not retry browser collection when sync fails. Reusing the same deterministic run ID must be idempotent. For complete unanswered snapshots, one consecutive absence changes an old open case to `REVIEW`; two consecutive complete-snapshot absences change it to `CLOSED`. A later reappearance reopens it as `NEEDS_REPLY`. Preserve the original case and messages for training and audit.
 9. Verify the development review frontend shows the masked post and distinctly labels an operational draft as `AI 추천답변` or an answered-case shadow draft as `AI 검증 초안`. `EVAL` is comparison-only: disable approval/rejection and compare it with the actual human answer. The frontend never sends a marketplace reply.
@@ -58,6 +58,7 @@ Use the installed skill directory from the available-skills entry:
 var marketCsCore = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/report-core.mjs");
 var marketCsSync = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/sync-client.mjs");
 var answerLibraryCore = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/answer-library-core.mjs");
+var aiDraftCore = await import("C:/Users/hihi0/.codex/skills/marketplace-cs-monitor/scripts/ai-draft-core.mjs");
 ```
 
 The macro already calls `buildReport()`. After generating drafts, call:

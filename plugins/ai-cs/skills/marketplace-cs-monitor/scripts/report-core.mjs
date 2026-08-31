@@ -13,7 +13,11 @@ const CHANNEL_KEYS = [
 const compact = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
 const MARKETPLACE_HOST_SUFFIXES = ["naver.com", "kakaostyle.com", "a-bly.com"];
-const SENSITIVE_URL_KEY = /(?:^|[_-])(token|secret|session|cookie|auth|authorization|password|passwd|credential|signature|jwt|api[_-]?key|access[_-]?key)(?:$|[_-])/i;
+const SENSITIVE_URL_KEY_PARTS = ["token", "secret", "session", "cookie", "auth", "authorization", "password", "passwd", "credential", "signature", "jwt", "apikey", "accesskey", "refreshtoken"];
+const isSensitiveUrlKey = (key) => {
+  const normalized = String(key ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return normalized === "key" || SENSITIVE_URL_KEY_PARTS.some((part) => normalized.includes(part));
+};
 
 function normalizeMarketplaceUrl(value) {
   const text = compact(value);
@@ -32,7 +36,7 @@ function normalizeMarketplaceUrl(value) {
     throw new Error("MARKETPLACE_URL_HOST_NOT_ALLOWED");
   }
   for (const [key, item] of parsed.searchParams) {
-    if (SENSITIVE_URL_KEY.test(key)) throw new Error("MARKETPLACE_URL_SECRET_PARAM");
+    if (isSensitiveUrlKey(key)) throw new Error("MARKETPLACE_URL_SECRET_PARAM");
     if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(item) || /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(item)) {
       throw new Error("MARKETPLACE_URL_PII_PARAM");
     }
@@ -47,7 +51,7 @@ function normalizeMarketplaceUrl(value) {
     ? decodedHash.slice(decodedHash.indexOf("?") + 1)
     : decodedHash.replace(/^#/, "");
   for (const [key, item] of new URLSearchParams(fragmentQuery)) {
-    if (SENSITIVE_URL_KEY.test(key)) throw new Error("MARKETPLACE_URL_SECRET_FRAGMENT");
+    if (isSensitiveUrlKey(key)) throw new Error("MARKETPLACE_URL_SECRET_FRAGMENT");
     if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(item) || /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(item)) {
       throw new Error("MARKETPLACE_URL_PII_FRAGMENT");
     }
@@ -66,7 +70,20 @@ function normalizeSourceUrlKind(value, sourceUrl) {
 
 function contentHashForRecord(record) {
   const material = { ...record };
-  for (const field of ["content_hash", "change_state", "source_url", "source_url_kind", "source_reference", "product_url", "product_thumbnail_url"]) {
+  for (const field of [
+    "content_hash",
+    "change_state",
+    "source_url",
+    "source_url_kind",
+    "source_reference",
+    "product_url",
+    "product_thumbnail_url",
+    "ai_draft",
+    "ai_draft_origin",
+    "ai_draft_purpose",
+    "ai_draft_required_checks",
+    "ai_draft_pii_scan",
+  ]) {
     delete material[field];
   }
   return sha256(stableJson(material));
@@ -111,6 +128,18 @@ function maskSensitiveText(value) {
     .replace(/((?:상품\s*)?주문번호\s*[:：]?\s*)\d{6,}/gi, "$1[마스킹]")
     .replace(/\b\d{12,}\b/g, (number) => maskLongNumber(number))
     .replace(/(주소\s*[:：]?)[^,;]+/gi, "$1 [주소 마스킹]");
+}
+
+export function inspectUnmaskedPii(value) {
+  const text = compact(value);
+  const issues = [];
+  if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(text)) issues.push("PHONE");
+  if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(text)) issues.push("EMAIL");
+  if (/\b\d{12,}\b/.test(text)) issues.push("LONG_NUMBER");
+  if (/(?:계좌|은행)\s*[:：]?\s*[0-9-]{6,}/.test(text)) issues.push("ACCOUNT");
+  if (/(?:상품\s*)?(?:주문번호|송장번호|운송장)\s*[:：]?\s*\d{6,}/i.test(text)) issues.push("ORDER_OR_TRACKING");
+  if (/(?:주소|배송지)\s*[:：]\s*[^,;]{5,}/i.test(text)) issues.push("ADDRESS");
+  return [...new Set(issues)];
 }
 
 function rawSourceId(market, channel, record) {
@@ -347,7 +376,10 @@ export function applyAiDrafts(report, drafts = []) {
     if (!allowed) throw new Error(`AI_DRAFT_REPLY_STATE_MISMATCH:${record.source_key}`);
     if (draft.ai_draft_origin !== "AI") throw new Error("AI_DRAFT_ORIGIN_REQUIRED");
     if (draft.ai_draft_pii_scan !== "PASS") throw new Error("AI_DRAFT_PII_SCAN_REQUIRED");
-    const text = maskSensitiveText(draft.ai_draft);
+    const rawText = compact(draft.ai_draft);
+    const piiIssues = inspectUnmaskedPii(rawText);
+    if (piiIssues.length) throw new Error(`AI_DRAFT_UNMASKED_PII:${piiIssues.join(",")}`);
+    const text = maskSensitiveText(rawText);
     if (!text) throw new Error("AI_DRAFT_TEXT_REQUIRED");
     record.ai_draft = text;
     record.ai_draft_origin = "AI";

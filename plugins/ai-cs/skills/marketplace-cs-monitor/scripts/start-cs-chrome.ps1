@@ -1,7 +1,10 @@
 param(
   [ValidateRange(1024, 65535)]
   [int]$Port = 9222,
-  [switch]$CheckOnly
+  [switch]$CheckOnly,
+  [switch]$RegisterExisting,
+  [string]$ReviewUrl = 'https://pinkrocket-cs-review-mockup.kimhyein0214.chatgpt.site/',
+  [string]$MarketplaceUrl = 'https://sell.smartstore.naver.com/'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,9 +45,61 @@ function Save-ActiveSession {
   [System.IO.File]::WriteAllText($sessionFile, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Assert-SafeLaunchUrl {
+  param([string]$Value, [string[]]$AllowedHosts)
+  try { $uri = [Uri]$Value } catch { throw 'CS_CHROME_START_URL_INVALID' }
+  if ($uri.Scheme -ne 'https' -or -not ($AllowedHosts -contains $uri.Host.ToLowerInvariant())) {
+    throw 'CS_CHROME_START_URL_NOT_ALLOWED'
+  }
+  if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo)) { throw 'CS_CHROME_START_URL_CREDENTIALS_NOT_ALLOWED' }
+  return $uri.AbsoluteUri
+}
+
+function Get-RegisteredEndpointId {
+  if (-not (Test-Path -LiteralPath $sessionFile)) { return '' }
+  try {
+    $registered = Get-Content -Raw -Encoding UTF8 -LiteralPath $sessionFile | ConvertFrom-Json
+    if ("$($registered.cdp_url)" -ne $cdpBase) { return '' }
+    return "$($registered.browser_endpoint_id)"
+  } catch {
+    throw 'ACTIVE_CS_CHROME_SESSION_INVALID'
+  }
+}
+
+function Open-CdpTabIfMissing {
+  param([string]$Url)
+  try {
+    $tabs = @(Invoke-RestMethod -Uri "$cdpBase/json/list" -TimeoutSec 3)
+    if ($tabs | Where-Object { "$($_.url)" -eq $Url }) { return }
+    $encoded = [Uri]::EscapeDataString($Url)
+    Invoke-RestMethod -Method Put -Uri "$cdpBase/json/new?$encoded" -TimeoutSec 3 | Out-Null
+  } catch {
+    throw 'CS_CHROME_REVIEW_TAB_OPEN_FAILED'
+  }
+}
+
+$safeReviewUrl = Assert-SafeLaunchUrl -Value $ReviewUrl -AllowedHosts @('pinkrocket-cs-review-mockup.kimhyein0214.chatgpt.site')
+$safeMarketplaceUrl = Assert-SafeLaunchUrl -Value $MarketplaceUrl -AllowedHosts @(
+  'sell.smartstore.naver.com',
+  'partners.kakaostyle.com',
+  'my.a-bly.com'
+)
+
 $existing = Get-CdpIdentity -BaseUrl $cdpBase
 if ($existing) {
+  $registeredEndpointId = Get-RegisteredEndpointId
+  if (-not $registeredEndpointId -and -not $RegisterExisting) {
+    if ($CheckOnly) {
+      [pscustomobject]@{ ready = $false; reused = $false; port = $Port; reason = 'UNREGISTERED_CHROME_ON_CDP_PORT' } | ConvertTo-Json -Compress
+      exit 0
+    }
+    throw 'UNREGISTERED_CHROME_ON_CDP_PORT_USE_REGISTEREXISTING'
+  }
+  if ($registeredEndpointId -and $registeredEndpointId -ne $existing.endpoint_id) {
+    throw 'ACTIVE_CS_CHROME_SESSION_CHANGED'
+  }
   Save-ActiveSession -BrowserPid 0 -BrowserEndpointId $existing.endpoint_id
+  if (-not $CheckOnly) { Open-CdpTabIfMissing -Url $safeReviewUrl }
   [pscustomobject]@{ ready = $true; reused = $true; port = $Port; action = 'Use the open CS Chrome window.' } | ConvertTo-Json -Compress
   exit 0
 }
@@ -70,7 +125,8 @@ $arguments = @(
   "--remote-debugging-port=$Port",
   "--user-data-dir=`"$browserDataDir`"",
   '--no-first-run',
-  'https://sell.smartstore.naver.com/'
+  $safeMarketplaceUrl,
+  $safeReviewUrl
 )
 $process = Start-Process -FilePath $chromePath -ArgumentList $arguments -PassThru
 

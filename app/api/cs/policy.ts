@@ -5,19 +5,62 @@ const ALLOWED_REPORT_KEYS = new Set(["schema_version", "mode", "range", "collect
 const ALLOWED_RECORD_KEYS = new Set([
   "market", "channel", "source_key", "occurred_at", "status", "category", "customer_masked",
   "subject", "preview", "product_id", "product_name", "order_no_masked", "product_order_no_masked",
+  "source_url", "source_url_kind", "source_reference", "product_url", "product_thumbnail_url",
   "messages", "seller_replies", "last_actor", "reply_state", "ai_draft", "ai_draft_origin",
   "ai_draft_purpose", "ai_draft_required_checks", "ai_draft_pii_scan", "pii_scan", "content_hash", "change_state",
 ]);
-const ALLOWED_MESSAGE_KEYS = new Set(["direction", "actor", "at", "text", "image_count"]);
+const ALLOWED_MESSAGE_KEYS = new Set(["source_message_id", "direction", "actor", "at", "text", "image_count"]);
 
 function safeText(value: unknown, maxLength: number): string {
   return String(value ?? "").trim().slice(0, maxLength);
+}
+
+const ALLOWED_MARKETPLACE_SUFFIXES = ["naver.com", "kakaostyle.com", "a-bly.com"];
+const SENSITIVE_URL_PARTS = ["token", "secret", "session", "cookie", "auth", "authorization", "password", "passwd", "credential", "signature", "jwt", "apikey", "accesskey", "refreshtoken"];
+function isSensitiveUrlKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return normalized === "key" || SENSITIVE_URL_PARTS.some((part) => normalized.includes(part));
+}
+
+function safeMarketplaceUrl(value: unknown): string {
+  const textValue = safeText(value, 3000);
+  if (!textValue) return "";
+  let url: URL;
+  try { url = new URL(textValue); } catch { throw new Error("MARKETPLACE_URL_INVALID"); }
+  if (url.protocol !== "https:" || url.username || url.password) throw new Error("MARKETPLACE_URL_UNSAFE");
+  const host = url.hostname.toLowerCase();
+  if (!ALLOWED_MARKETPLACE_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) throw new Error("MARKETPLACE_URL_HOST_NOT_ALLOWED");
+  const inspectParams = (params: URLSearchParams) => {
+    for (const [key, item] of params) {
+      if (isSensitiveUrlKey(key)) throw new Error("MARKETPLACE_URL_SECRET_PARAM");
+      assertMaskedReviewText(item);
+    }
+  };
+  inspectParams(url.searchParams);
+  const hashQuery = decodeURIComponent(url.hash || "");
+  if (hashQuery.includes("?")) inspectParams(new URLSearchParams(hashQuery.slice(hashQuery.indexOf("?") + 1)));
+  return url.toString();
 }
 
 export function assertMaskedReviewText(value: string): void {
   if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(value)) throw new Error("UNMASKED_PHONE");
   if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)) throw new Error("UNMASKED_EMAIL");
   if (/\b\d{12,}\b/.test(value)) throw new Error("UNMASKED_LONG_NUMBER");
+}
+
+export function normalizeCaseBatchKeys(value: string): string[] {
+  const keys = String(value ?? "").split(",").map((key) => key.trim()).filter(Boolean);
+  if (!keys.length) throw new Error("CASE_KEYS_REQUIRED");
+  if (keys.length > 3) throw new Error("CASE_BATCH_TOO_LARGE");
+  if (new Set(keys).size !== keys.length) throw new Error("DUPLICATE_CASE_KEY");
+  if (keys.some((key) => key.length > 300 || !/^[A-Za-z0-9:_-]+$/.test(key))) throw new Error("CASE_KEY_INVALID");
+  return keys;
+}
+
+export function assertSingletonReadParams(params: URLSearchParams): void {
+  for (const key of new Set(params.keys())) {
+    if (params.getAll(key).length !== 1) throw new Error(`READ_PARAM_DUPLICATE:${key}`);
+  }
 }
 
 export function normalizeReviewRequest(input: unknown) {
@@ -61,6 +104,7 @@ function normalizedMessage(value: unknown): Record<string, unknown> {
   const text = safeText(raw.text, 8000);
   assertMaskedReviewText(text);
   return {
+    ...(raw.source_message_id !== undefined ? { source_message_id: safeText(raw.source_message_id, 300) } : {}),
     ...(raw.direction !== undefined ? { direction: safeText(raw.direction, 20) } : {}),
     ...(raw.actor !== undefined ? { actor: safeText(raw.actor, 20) } : {}),
     at: safeText(raw.at, 50),
@@ -99,11 +143,20 @@ function normalizedRecord(value: unknown): Record<string, unknown> {
 
   const messages = Array.isArray(raw.messages) ? raw.messages.map(normalizedMessage) : [];
   const sellerReplies = Array.isArray(raw.seller_replies) ? raw.seller_replies.map(normalizedMessage) : [];
+  const sourceUrl = safeMarketplaceUrl(raw.source_url);
+  const sourceUrlKind = safeText(raw.source_url_kind, 20).toUpperCase() || (sourceUrl ? "LIST" : "UNAVAILABLE");
+  if (!["EXACT", "LIST", "UNAVAILABLE"].includes(sourceUrlKind)) throw new Error("SOURCE_URL_KIND_INVALID");
+  if (sourceUrlKind === "EXACT" && !sourceUrl) throw new Error("SOURCE_URL_EXACT_REQUIRED");
+  if (sourceUrlKind === "UNAVAILABLE" && sourceUrl) throw new Error("SOURCE_URL_UNAVAILABLE_MISMATCH");
+  const sourceReference = safeText(raw.source_reference, 500);
+  assertMaskedReviewText(sourceReference);
   return {
     market: safeText(raw.market, 50), channel: safeText(raw.channel, 100), source_key: sourceKey,
     occurred_at: safeText(raw.occurred_at, 50), status: safeText(raw.status, 100), category: safeText(raw.category, 300),
     customer_masked: customerMasked, subject: safeText(raw.subject, 2000), preview: safeText(raw.preview, 2000),
     product_id: safeText(raw.product_id, 300), product_name: safeText(raw.product_name, 2000),
+    source_url: sourceUrl, source_url_kind: sourceUrlKind, source_reference: sourceReference,
+    product_url: safeMarketplaceUrl(raw.product_url), product_thumbnail_url: safeMarketplaceUrl(raw.product_thumbnail_url),
     order_no_masked: safeText(raw.order_no_masked, 300), product_order_no_masked: safeText(raw.product_order_no_masked, 300),
     messages, seller_replies: sellerReplies, last_actor: safeText(raw.last_actor, 20), reply_state: replyState,
     ai_draft: draftText, ai_draft_origin: safeText(raw.ai_draft_origin, 20).toUpperCase(), ai_draft_purpose: draftPurpose,

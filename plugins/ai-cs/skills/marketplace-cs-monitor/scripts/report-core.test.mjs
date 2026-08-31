@@ -138,6 +138,10 @@ assert.match(linkedZigzagItem.source_url, /\/item_question\/detail\/34567890$/);
 assert.equal(linkedAbly.source_url_kind, "LIST");
 assert.equal(linkedAbly.source_reference, "AB-a1b2c3d4e5f6");
 
+const unsafeCamelCaseUrl = structuredClone(linkedChannelInput);
+unsafeCamelCaseUrl.channels.zigzag_item_question.records[0].source_url = "https://partners.kakaostyle.com/shop/pink-rocket/item_question?sessionId=secret";
+assert.throws(() => buildReport(unsafeCamelCaseUrl, []), /MARKETPLACE_URL_SECRET_PARAM/);
+
 const incompleteQueue = structuredClone(base);
 incompleteQueue.channels.zigzag_order_inquiry.open_queue_visible_total = 2;
 assert.throws(() => buildReport(incompleteQueue, []), /OPEN_QUEUE_TOTAL_MISMATCH/);
@@ -180,8 +184,9 @@ const attached = draftedAfterCollection.records.find((row) => row.source_key ===
 assert.equal(attached.ai_draft_origin, "AI");
 assert.equal(attached.ai_draft_purpose, "REPLY");
 assert.equal(attached.ai_draft_pii_scan, "PASS");
-assert.notEqual(attached.content_hash, target.content_hash);
+assert.equal(attached.content_hash, target.content_hash);
 assert.throws(() => applyAiDrafts(first, [{ source_key: target.source_key, ai_draft: "초안", ai_draft_origin: "AI", ai_draft_pii_scan: "REVIEW" }]), /AI_DRAFT_PII_SCAN_REQUIRED/);
+assert.throws(() => applyAiDrafts(first, [{ source_key: target.source_key, ai_draft: "연락처는 010-1234-5678입니다.", ai_draft_origin: "AI", ai_draft_pii_scan: "PASS" }]), /AI_DRAFT_UNMASKED_PII/);
 
 const ablyCompleted = structuredClone(base);
 ablyCompleted.channels.ably_inquiry.records = [{

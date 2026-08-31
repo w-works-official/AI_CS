@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { buildSyncRequest, makeRunId, readCsData, searchVerifiedAnswers, syncReport, validateSyncReport } from "./sync-client.mjs";
+import { buildSyncRequest, makeRunId, readCaseIndex, readCsData, searchVerifiedAnswers, syncReport, validateSyncReport } from "./sync-client.mjs";
 
 const report = {
   schema_version: 1,
@@ -18,6 +18,7 @@ const report = {
 };
 
 assert.equal(makeRunId(report), makeRunId(structuredClone(report)));
+assert.notEqual(makeRunId(report), makeRunId({ ...structuredClone(report), records: [{ ...report.records[0], ai_draft: "새 추천 답변", ai_draft_purpose: "REPLY", ai_draft_pii_scan: "PASS" }] }));
 assert.equal(buildSyncRequest(report, { apiKey: "secret", environment: "development" }).action, "syncRun");
 assert.equal(buildSyncRequest(report, { apiKey: "secret", environment: "development" }).environment, "development");
 assert.throws(() => buildSyncRequest(report, { apiKey: "secret" }), /SYNC_ENVIRONMENT_NOT_CONFIGURED/);
@@ -65,5 +66,20 @@ assert.equal(readPayload.limit, 3);
 assert.equal(readPayload.environment, "development");
 await assert.rejects(() => readCsData("arbitrary", {}, readConfig, { fetchImpl: readFetch }), /CS_READ_ACTION_NOT_ALLOWED/);
 await assert.rejects(() => readCsData("cases", { url: "https://example.com" }, readConfig, { fetchImpl: readFetch }), /CS_READ_PARAM_NOT_ALLOWED/);
+
+const indexFetch = async (_url, init) => {
+  const request = JSON.parse(init.body);
+  assert.equal(request.action, "caseIndex");
+  return new Response(JSON.stringify({
+    ok: true,
+    environment: "development",
+    auto_send: false,
+    marketplace_write_actions: 0,
+    items: [{ source_key: "smartstore:comments:abc", content_hash: "hash-1", ai_draft_state: "NONE", reply_state: "NEEDS_REPLY" }],
+  }));
+};
+const index = await readCaseIndex(readConfig, { fetchImpl: indexFetch });
+assert.equal(index.length, 1);
+assert.equal(index[0].content_hash, "hash-1");
 
 console.log("marketplace-cs-monitor sync client: PASS");

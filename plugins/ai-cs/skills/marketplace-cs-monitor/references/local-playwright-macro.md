@@ -2,9 +2,9 @@
 
 ## Canonical files
 
-- Project: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs`
-- Entry point: `smartstore_cs_macro.mjs`
-- Package command: `npm run scrape`
+- Project: `C:/Users/hihi0/Documents/Codex/2026-08-12/cs/work/AI_CS`
+- Entry point: `tools/marketplace-cs/smartstore_cs_macro.mjs`
+- Package command: `npm run collect:cs`
 - Playwright connection: `chromium.connectOverCDP(active local CS Chrome session)`
 
 The macro connects to an already running remote-debuggable Chrome context. It does not launch a browser, log in, read credentials, or call `browser.close()`. Normal runs resolve `%LOCALAPPDATA%/PinkRocketCS/active-browser.json`; `SMARTSTORE_CDP_URL` remains an explicit loopback-only override.
@@ -12,6 +12,8 @@ The macro connects to an already running remote-debuggable Chrome context. It do
 ## Start or select the local CS Chrome
 
 Run `scripts/start-cs-chrome.cmd` once during operator setup. It reuses a Chrome endpoint already listening on port 9222 or opens a visible Google Chrome with a dedicated per-Windows-user data directory. The user signs in manually. It records only the loopback CDP URL, process ID, non-secret browser instance ID, label, and timestamp. A later process on the same port is rejected when its instance ID differs.
+
+An unregistered Chrome already listening on that port is not adopted automatically. After visually confirming that it is the intended CS Chrome, the operator may explicitly register it once with `scripts/start-cs-chrome.cmd -RegisterExisting`. The launcher never chooses an existing profile on the operator's behalf.
 
 Do not bind the session to a person's name or an ordinary Chrome window title. Scheduled collection reuses the registered session and never launches or switches browsers automatically. Whale and non-loopback endpoints are rejected. The macro uses a local lock so two collection runs on the same PC cannot overlap.
 
@@ -26,12 +28,12 @@ $env:CS_CHANNELS = 'comments'
 $env:CS_RUN_MODE = 'collect_and_reconcile'
 $env:CS_SYNC_MODE = 'prepare'
 $env:CS_KEEP_MASKED_OUTPUT = '1'
-npm run scrape
+npm run collect:cs
 ```
 
 For an explicitly selected remote-debuggable Google Chrome on the same PC, `SMARTSTORE_CDP_URL` may be set for that process. Only `http://127.0.0.1:<port>`, `http://localhost:<port>`, or the IPv6 loopback equivalent is accepted.
 
-`prepare` is the default and performs no Apps Script or Sheet write. The masked report is written below the macro project's `output/` directory and its path is returned as `masked_output`.
+`prepare` is the default and performs no Apps Script or Sheet write. It may use the read-only development case index to classify records. The masked report is written below the macro project's `output/` directory and its path is returned as `masked_output`.
 
 `collect_and_reconcile` is the normal collection mode. It still collects only the requested date range for ordinary detail work, but it also carries hashed source keys from a count-matched current unanswered view when the marketplace exposes one. It never changes marketplace state.
 

@@ -45,6 +45,8 @@ type Overview = { total_live: number; needs_reply: number; answered: number; rev
 type EnvironmentName = 'development' | 'production' | 'unconfigured';
 type DashboardSnapshot = { savedAt: number; cases: CsCase[]; total: number; overview: Overview; environment: EnvironmentName };
 type DetailSnapshot = { savedAt: number; item: CsCase };
+type DetailPayload = { case?: RawRow; messages?: RawRow[]; drafts?: RawRow[] };
+type DataFreshness = 'fresh' | 'refreshing' | 'stale';
 
 const EMPTY_OVERVIEW: Overview = { total_live: 0, needs_reply: 0, answered: 0, review: 0, no_reply_required: 0, ai_ready: 0, closed: 0 };
 const INITIAL_CASE_LIMIT = 50;
@@ -68,6 +70,19 @@ const filters: Array<{ key: 'all' | CaseStatus; label: string }> = [
 
 function text(value: unknown, fallback = '') { const result = String(value ?? '').trim(); return result || fallback; }
 function bool(value: unknown) { return value === true || value === 1 || ['TRUE', '1', 'Y', 'YES'].includes(text(value).toUpperCase()); }
+function safeExternalUrl(value: unknown) {
+  const raw = text(value); if (!raw) return '';
+  try {
+    const url = new URL(raw); const host = url.hostname.toLowerCase();
+    if (url.protocol !== 'https:' || url.username || url.password || !['naver.com', 'kakaostyle.com', 'a-bly.com'].some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return '';
+    const sensitive = (key: string) => { const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, ''); return normalized === 'key' || ['token', 'secret', 'session', 'cookie', 'auth', 'authorization', 'password', 'passwd', 'credential', 'signature', 'jwt', 'apikey', 'accesskey', 'refreshtoken'].some((part) => normalized.includes(part)); };
+    for (const key of url.searchParams.keys()) if (sensitive(key)) return '';
+    const fragment = decodeURIComponent(url.hash || '');
+    const fragmentParams = new URLSearchParams(fragment.includes('?') ? fragment.slice(fragment.indexOf('?') + 1) : fragment.replace(/^#/, ''));
+    for (const key of fragmentParams.keys()) if (sensitive(key)) return '';
+    return url.toString();
+  } catch { return ''; }
+}
 function formatDate(value: unknown) {
   const raw = text(value); if (!raw) return '시각 미수집';
   const date = new Date(raw); if (Number.isNaN(date.getTime())) return raw;
@@ -101,7 +116,7 @@ function riskLevel(value: unknown): '낮음' | '중간' | '높음' {
 }
 function baseCase(row: RawRow): CsCase {
   const status = caseStatus(row); const scan = text(row.pii_scan).toUpperCase(); const rawPreview = text(row.preview);
-  const sourceUrl = text(row.source_url); const rawSourceUrlKind = text(row.source_url_kind).toUpperCase();
+  const sourceUrl = safeExternalUrl(row.source_url); const rawSourceUrlKind = text(row.source_url_kind).toUpperCase();
   const sourceUrlKind: SourceUrlKind = rawSourceUrlKind === 'EXACT' || rawSourceUrlKind === 'LIST' || rawSourceUrlKind === 'UNAVAILABLE'
     ? rawSourceUrlKind : (sourceUrl ? 'LIST' : 'UNAVAILABLE');
   return {
@@ -110,8 +125,8 @@ function baseCase(row: RawRow): CsCase {
     category: text(row.category, '미분류'), product: text(row.product_name, text(row.subject, '상품정보 미수집')),
     preview: rawPreview || '과거 이관 데이터 · 문의 본문 미수집', updatedAt: formatDate(row.last_changed_at ?? row.last_seen_at ?? row.last_message_at),
     updatedRaw: text(row.last_seen_at ?? row.last_changed_at ?? row.last_message_at), status, sourceUrl, sourceUrlKind,
-    sourceReference: text(row.source_reference), productUrl: text(row.product_url), productId: text(row.product_id),
-    productThumbnailUrl: text(row.product_thumbnail_url), imageCount: Math.max(0, Number(row.image_count ?? 0) || 0), bodyCollected: Boolean(rawPreview),
+    sourceReference: text(row.source_reference), productUrl: safeExternalUrl(row.product_url), productId: text(row.product_id),
+    productThumbnailUrl: safeExternalUrl(row.product_thumbnail_url), imageCount: Math.max(0, Number(row.image_count ?? 0) || 0), bodyCollected: Boolean(rawPreview),
     alert: status === 'review' ? '수집 상태 또는 답변 여부 확인 필요' : (scan.includes('WARN') || scan.includes('FAIL') ? `개인정보 검사 ${text(row.pii_scan)}` : undefined),
     postTitle: text(row.subject, text(row.category, '문의 내용')), messages: [],
     actualReply: bool(row.human_reply_exists) ? { text: text(row.latest_human_reply_preview, '답변 존재 · 본문 미수집'), sentAt: formatDate(row.human_reply_at), verifiedAt: formatDate(row.last_seen_at) } : undefined,
@@ -136,6 +151,10 @@ function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[]): C
   const reviewedDraft = draftRows.find((row) => text(row.human_revision));
   if (reviewedDraft) item.humanRevision = { text: text(reviewedDraft.human_revision), state: text(reviewedDraft.draft_state, '검토됨'), reviewedAt: formatDate(reviewedDraft.reviewed_at) };
   return item;
+}
+function hydrateDetailPayload(payload: DetailPayload): CsCase | null {
+  if (!payload?.case) return null;
+  return hydrateCase(payload.case, payload.messages ?? [], payload.drafts ?? []);
 }
 function statusQuery(filter: 'all' | CaseStatus) {
   if (filter === 'all') return '';
@@ -176,6 +195,14 @@ function readSessionCache<T>(key: string, maxAge: number): T | null {
 function writeSessionCache(key: string, value: unknown) {
   try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* A full/disabled cache must not block the review desk. */ }
 }
+function clearSessionCachePrefix(prefix: string) {
+  try {
+    for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = sessionStorage.key(index);
+      if (key?.startsWith(prefix)) sessionStorage.removeItem(key);
+    }
+  } catch { /* Cache cleanup must not block the review desk. */ }
+}
 
 export default function Home() {
   const [activeFilter, setActiveFilter] = useState<'all' | CaseStatus>('all');
@@ -185,7 +212,8 @@ export default function Home() {
   const [search, setSearch] = useState(''); const [editor, setEditor] = useState(''); const [toast, setToast] = useState('');
   const [sourceGuide, setSourceGuide] = useState<SourceGuide | null>(null);
   const [reviewSaving, setReviewSaving] = useState(false);
-  const [loading, setLoading] = useState(true); const [loadingMore, setLoadingMore] = useState(false); const [detailLoading, setDetailLoading] = useState(false); const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true); const [loadingMore, setLoadingMore] = useState(false); const [detailLoading, setDetailLoading] = useState(false); const [error, setError] = useState(''); const [detailError, setDetailError] = useState('');
+  const [freshness, setFreshness] = useState<DataFreshness>('refreshing');
   const [totalCases, setTotalCases] = useState(0); const [detailEpoch, setDetailEpoch] = useState(0);
   const listRequestId = useRef(0); const detailRequestId = useRef(0); const detailCache = useRef(new Map<string, DetailSnapshot>());
 
@@ -207,19 +235,20 @@ export default function Home() {
     };
   }, []);
   const refresh = useCallback(async () => {
-    const requestId = ++listRequestId.current; setLoading(true); setLoadingMore(false); setError('');
+    const requestId = ++listRequestId.current; setLoading(true); setLoadingMore(false); setError(''); setFreshness('refreshing');
     try {
       const next = await fetchDashboard(activeFilter, undefined, true);
       if (requestId !== listRequestId.current) return;
       setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setEditor('');
+      setFreshness('fresh');
       setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
-      detailCache.current.clear(); setSelectedDetail(null); setDetailEpoch((value) => value + 1);
+      detailCache.current.clear(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX); setSelectedDetail(null); setDetailEpoch((value) => value + 1);
     } catch (cause) {
-      if (requestId === listRequestId.current) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
+      if (requestId === listRequestId.current) { setFreshness(cases.length ? 'stale' : 'refreshing'); setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED'); }
     } finally {
       if (requestId === listRequestId.current) { setLoading(false); setLoadingMore(false); }
     }
-  }, [activeFilter, fetchDashboard]);
+  }, [activeFilter, cases.length, fetchDashboard]);
 
   useEffect(() => {
     const controller = new AbortController(); const requestId = ++listRequestId.current;
@@ -227,23 +256,29 @@ export default function Home() {
     if (cached) {
       queueMicrotask(() => {
         if (requestId !== listRequestId.current) return;
+        setFreshness('refreshing');
         setCases(cached.cases); setTotalCases(cached.total); setOverview(cached.overview); setEnvironment(cached.environment); setLoading(false);
         setSelectedId((current) => cached.cases.some((item) => item.id === current) ? current : (cached.cases[0]?.id ?? ''));
       });
     }
-    fetchDashboard(activeFilter, controller.signal)
+    fetchDashboard(activeFilter, controller.signal, true)
       .then((next) => {
         if (requestId !== listRequestId.current) return;
         setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment);
+        detailCache.current.clear(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX);
+        setFreshness('fresh'); setError('');
         setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
         writeSessionCache(`${DASHBOARD_CACHE_PREFIX}${activeFilter}`, { savedAt: Date.now(), cases: next.items, total: next.total, overview: next.overview, environment: next.environment } satisfies DashboardSnapshot);
       }).catch((cause) => {
-        if (requestId === listRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
+        if (requestId === listRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) {
+          if (cached) setFreshness('stale'); else setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
+        }
       }).finally(() => { if (requestId === listRequestId.current) { setLoading(false); setLoadingMore(false); } });
     return () => controller.abort();
   }, [activeFilter, fetchDashboard]);
   useEffect(() => {
     const requestId = ++detailRequestId.current; if (!selectedId) return;
+    queueMicrotask(() => { if (requestId === detailRequestId.current) setDetailError(''); });
     const memoryCached = detailCache.current.get(selectedId);
     const cached = memoryCached && Date.now() - memoryCached.savedAt <= DETAIL_CACHE_TTL
       ? memoryCached
@@ -257,12 +292,35 @@ export default function Home() {
     }
     setDetailLoading(true);
     const controller = new AbortController();
-    getJson(`/api/cs?action=case&case_key=${encodeURIComponent(selectedId)}`, controller.signal)
-      .then((payload) => { if (requestId === detailRequestId.current) { const hydrated = hydrateCase(payload.case as RawRow, (payload.messages ?? []) as RawRow[], (payload.drafts ?? []) as RawRow[]); const snapshot = { savedAt: Date.now(), item: hydrated }; detailCache.current.set(selectedId, snapshot); writeSessionCache(`${DETAIL_CACHE_PREFIX}${selectedId}`, snapshot); setSelectedDetail(hydrated); setEditor(hydrated.humanRevision?.text ?? ''); } })
-      .catch((cause) => { if (requestId === detailRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setError(cause instanceof Error ? cause.message : 'DETAIL_LOAD_FAILED'); })
+    const selectedIndex = Math.max(0, cases.findIndex((item) => item.id === selectedId));
+    const batchKeys = [selectedId, ...cases.slice(selectedIndex + 1, selectedIndex + 3).map((item) => item.id)]
+      .filter((id, index, all) => id && all.indexOf(id) === index)
+      .slice(0, 3);
+    const freshDetail = detailEpoch > 0 ? '&fresh=1' : '';
+    const loadBatch = () => getJson(`/api/cs?action=caseBatch&case_keys=${encodeURIComponent(batchKeys.join(','))}${freshDetail}`, controller.signal)
+      .then((payload) => (payload.items ?? []) as DetailPayload[])
+      .catch(async (cause) => {
+        if (!(cause instanceof Error) || !/UNKNOWN_ACTION|CASE_KEYS/.test(cause.message)) throw cause;
+        const payload = await getJson(`/api/cs?action=case&case_key=${encodeURIComponent(selectedId)}`, controller.signal);
+        return [payload as DetailPayload];
+      });
+    loadBatch()
+      .then((payloadItems) => {
+        const hydratedItems = payloadItems.map(hydrateDetailPayload).filter((item): item is CsCase => item !== null);
+        for (const hydrated of hydratedItems) {
+          const snapshot = { savedAt: Date.now(), item: hydrated };
+          detailCache.current.set(hydrated.id, snapshot);
+          writeSessionCache(`${DETAIL_CACHE_PREFIX}${hydrated.id}`, snapshot);
+        }
+        if (requestId !== detailRequestId.current) return;
+        const hydrated = hydratedItems.find((item) => item.id === selectedId);
+        if (!hydrated) throw new Error('CASE_NOT_FOUND');
+        setSelectedDetail(hydrated); setEditor(hydrated.humanRevision?.text ?? ''); setDetailError('');
+      })
+      .catch((cause) => { if (requestId === detailRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setDetailError(cause instanceof Error ? cause.message : 'DETAIL_LOAD_FAILED'); })
       .finally(() => { if (requestId === detailRequestId.current) setDetailLoading(false); });
     return () => controller.abort();
-  }, [selectedId, detailEpoch]);
+  }, [cases, selectedId, detailEpoch]);
 
   const loadMore = useCallback(async () => {
     if (loadingMore || cases.length >= totalCases) return;
@@ -287,8 +345,10 @@ export default function Home() {
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 2200); };
   const copyText = async (value: string) => { try { await navigator.clipboard.writeText(value); notify('클립보드에 복사했습니다.'); } catch { notify('브라우저에서 복사를 허용해 주세요.'); } };
   const openExternal = (url: string, label: string) => {
+    const safeUrl = safeExternalUrl(url);
+    if (!safeUrl) { notify(`${label} 주소의 안전성을 확인할 수 없어 열지 않았습니다.`); return; }
     const link = document.createElement('a');
-    link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+    link.href = safeUrl; link.target = '_blank'; link.rel = 'noopener noreferrer';
     document.body.appendChild(link); link.click(); link.remove();
     notify(`${label}을 새 탭에서 열었습니다. 열리지 않으면 주소 복사를 사용해 주세요.`);
   };
@@ -300,9 +360,9 @@ export default function Home() {
   }, [sourceGuide]);
   const selectFilter = (filter: 'all' | CaseStatus) => {
     if (filter === activeFilter) return;
-    listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setCases([]); setTotalCases(0); setSelectedId(''); setSelectedDetail(null); setActiveFilter(filter);
+    listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setDetailError(''); setFreshness('refreshing'); setCases([]); setTotalCases(0); setSelectedId(''); setSelectedDetail(null); setActiveFilter(filter);
   };
-  const selectCase = (id: string) => { if (id === selectedId) return; detailRequestId.current += 1; setEditor(''); setDetailLoading(true); setSelectedId(id); };
+  const selectCase = (id: string) => { if (id === selectedId) return; detailRequestId.current += 1; setEditor(''); setDetailError(''); setDetailLoading(true); setSelectedId(id); };
   const countFor = (status: CaseStatus) => ({ unanswered: overview.needs_reply, 'ai-ready': overview.ai_ready, review: overview.review, 'no-reply': overview.no_reply_required, replied: overview.answered, closed: overview.closed })[status];
   const localReviewEnabled = typeof window !== 'undefined' && !text(window.__CS_API_BASE_URL__) && window.__CS_REVIEW_ENABLED__ !== false && environment === 'development';
   const saveReview = async (draftState: 'APPROVED' | 'REJECTED') => {
@@ -323,16 +383,16 @@ export default function Home() {
   return <main className="app-shell">
     <aside className="nav-rail"><div className="brand-mark">PR</div><nav aria-label="주 메뉴"><button className="rail-button active"><span>◫</span><small>검수함</small></button><button className="rail-button"><span>⌁</span><small>통계</small></button><button className="rail-button"><span>⚙</span><small>설정</small></button></nav><div className="rail-footer">LIVE</div></aside>
     <section className="workspace">
-      <header className="topbar"><div><div className="eyebrow">PINK ROCKET · CS REVIEW</div><h1>AI 답변 검수함</h1></div><div className="sync-area"><span className={`environment-badge ${environment}`}>{environment}</span><div className="sync-copy"><span className={`live-dot ${error ? 'error' : ''}`} /><strong>{error ? '연결 확인 필요' : `실데이터 ${overview.total_live.toLocaleString()}건`}</strong><small>{syncAt ? `최근 수집 기록 ${formatDate(syncAt)}` : '수집 기록 확인 중'}</small></div><button className="secondary-button" onClick={refresh} disabled={loading}>↻ {loading ? '불러오는 중' : '새로고침'}</button></div></header>
-      {error && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
+      <header className="topbar"><div><div className="eyebrow">PINK ROCKET · CS REVIEW</div><h1>AI 답변 검수함</h1></div><div className="sync-area"><span className={`environment-badge ${environment}`}>{environment}</span><div className="sync-copy"><span className={`live-dot ${error ? 'error' : ''}`} /><strong>{error && !cases.length ? '연결 확인 필요' : `실데이터 ${overview.total_live.toLocaleString()}건`}</strong><small>{freshness === 'stale' ? '연결이 지연되어 저장된 목록을 표시 중' : syncAt ? `최근 수집 기록 ${formatDate(syncAt)}` : '수집 기록 확인 중'}</small></div><button className="secondary-button" onClick={refresh} disabled={loading}>↻ {loading ? '확인 중' : '최신 확인'}</button></div></header>
+      {error && !cases.length && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
       <section className="status-strip" aria-label="문의 상태 요약">{filters.slice(1).map((filter) => { const meta = statusMeta[filter.key as CaseStatus]; return <button key={filter.key} className={`stat-card ${activeFilter === filter.key ? 'selected' : ''}`} onClick={() => selectFilter(filter.key as CaseStatus)}><span className="stat-dot" style={{ background: meta.dot }} /><span>{filter.label}</span><strong>{countFor(filter.key as CaseStatus).toLocaleString()}</strong></button>; })}</section>
       <div className="desk-grid">
         <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최신순 {cases.length.toLocaleString()} / {totalCases.toLocaleString()}건 {loading && cases.length ? '· 최신 정보 확인 중' : ''} · 민감정보 마스킹</p></div>
           <div className="case-list">{loading && !cases.length && <div className="empty-list loading-list"><span>⌁</span><strong>첫 연결을 확인하고 있습니다.</strong><p>한 번 불러온 뒤에는 같은 탭에서 즉시 표시하고, 최신 정보는 뒤에서 확인합니다.</p></div>}{filteredCases.map((item) => { const meta = statusMeta[item.status]; return <button key={item.id} className={`case-item ${selected?.id === item.id ? 'active' : ''}`} onClick={() => selectCase(item.id)}><div className="case-item-top"><span className={`status-pill ${meta.tone}`}>{meta.shortLabel}</span><time>{item.updatedAt}</time></div><div className="case-title-row"><strong>{item.customer}</strong></div><p className="case-product">{item.product}</p><p className="case-preview">{item.preview}</p><div className="case-meta"><span className={`surface-tag ${item.surface}`}>{item.surface === 'chat' ? '● 채팅형' : '▤ 게시글형'}</span><span>{item.channel}</span><span>{item.category}</span></div></button>; })}{!loading && !filteredCases.length && <div className="empty-list">조건에 맞는 문의가 없습니다.</div>}{cases.length < totalCases && <div className="load-more-row"><button className="secondary-button" onClick={loadMore} disabled={loadingMore}>{loadingMore ? '불러오는 중…' : `다음 ${Math.min(INITIAL_CASE_LIMIT, totalCases - cases.length)}건 보기`}</button></div>}</div>
         </section>
         <section className="conversation-column" aria-label="전체 대화">{!selected ? <div className="panel-empty"><span>⌁</span><strong>표시할 문의가 없습니다.</strong><p>상태 필터를 바꾸거나 데이터를 다시 불러와 주세요.</p></div> : <>
-          <header className="case-header"><div className="case-header-copy"><div className="case-heading-line"><span className={`status-pill ${statusMeta[selected.status].tone}`}>{statusMeta[selected.status].label}</span><span className={`surface-label ${selected.surface}`}>{selected.surface === 'chat' ? '● 채팅형 문의' : '▤ 게시글형 문의'}</span><span className="case-id">{selected.id}</span></div><div className="case-product-heading">{selected.productThumbnailUrl && <img src={selected.productThumbnailUrl} alt="" referrerPolicy="no-referrer"/>}<div><h2>{selected.product}</h2><p>{selected.productId ? `상품 ID ${selected.productId} · ` : ''}{selected.channel} · 고객 {selected.customer}</p></div></div><div className="case-link-meta"><span>첨부 {selected.imageCount}개</span>{selected.sourceUrlKind === 'LIST' && <span>개별 원문 링크 아님</span>}</div></div><div className="case-header-actions">{selected.sourceUrlKind === 'EXACT' && <><button className="icon-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && openExternal(selected.sourceUrl, '원문')}>원문 새 탭 ↗</button><button className="icon-button source-copy-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && copyText(selected.sourceUrl)}>주소 복사</button></>}{selected.sourceUrlKind === 'LIST' && <button className="icon-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && setSourceGuide({ url: selected.sourceUrl, reference: selected.sourceReference, product: selected.product })}>문의관리 안내</button>}{selected.sourceUrlKind === 'UNAVAILABLE' && <button className="icon-button" disabled>원문 미수집</button>}{selected.productUrl && <button className="icon-button product-link-button" onClick={() => openExternal(selected.productUrl, '상품 페이지')}>상품 보기 ↗</button>}</div></header>
-          {selected.alert && <div className="warning-banner"><span>!</span><div><strong>사람 검토가 필요한 문의입니다.</strong><p>{selected.alert} · 자동 전송 금지</p></div></div>}{detailLoading && <div className="detail-loading">상세 메시지를 불러오는 중…</div>}
+          <header className="case-header"><div className="case-header-copy"><div className="case-heading-line"><span className={`status-pill ${statusMeta[selected.status].tone}`}>{statusMeta[selected.status].label}</span><span className={`surface-label ${selected.surface}`}>{selected.surface === 'chat' ? '● 채팅형 문의' : '▤ 게시글형 문의'}</span><span className="case-id">{selected.id}</span></div><div className="case-product-heading">{selected.productThumbnailUrl && <img src={selected.productThumbnailUrl} alt="" referrerPolicy="no-referrer"/>}<div><h2>{selected.product}</h2><p>{selected.productId ? `상품 ID ${selected.productId} · ` : ''}{selected.channel} · 고객 {selected.customer}</p></div></div><div className="case-link-meta"><span>{selected.imageCount > 0 ? `첨부 이미지 ${selected.imageCount}개 · 원문에서 확인` : '첨부 여부 미수집'}</span>{selected.sourceUrlKind === 'LIST' && <span>개별 원문 링크 아님</span>}</div></div><div className="case-header-actions">{selected.sourceUrlKind === 'EXACT' && <><button className="icon-button" title="판매자센터 로그인을 이어받으려면 이 검수함을 CS Chrome에서 열어 주세요." disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && openExternal(selected.sourceUrl, '원문')}>원문 새 탭 ↗</button><button className="icon-button source-copy-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && copyText(selected.sourceUrl)}>주소 복사</button></>}{selected.sourceUrlKind === 'LIST' && <button className="icon-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && setSourceGuide({ url: selected.sourceUrl, reference: selected.sourceReference, product: selected.product })}>문의관리 안내</button>}{selected.sourceUrlKind === 'UNAVAILABLE' && <button className="icon-button" disabled>원문 미수집</button>}{selected.productUrl && <button className="icon-button product-link-button" onClick={() => openExternal(selected.productUrl, '상품 페이지')}>상품 보기 ↗</button>}</div></header>
+          {selected.alert && <div className="warning-banner"><span>!</span><div><strong>사람 검토가 필요한 문의입니다.</strong><p>{selected.alert} · 자동 전송 금지</p></div></div>}{detailLoading && <div className="detail-loading">선택한 문의와 다음 문의를 함께 불러오는 중…</div>}{detailError && <div className="detail-loading" role="alert">상세 메시지를 불러오지 못했습니다. 목록 정보는 유지됩니다. · {detailError}</div>}
           {selected.surface === 'chat' ? <div className="conversation-scroll chat-surface"><div className="chat-notice">수집된 대화 · 시간순 메시지</div><div className="date-divider"><span>최근 대화</span></div>{selected.messages.length ? selected.messages.map((message, index) => <div key={`${selected.id}-${index}`} className={`message-row ${message.actor}`}><div className="avatar">{message.actor === 'seller' ? 'P' : 'C'}</div><div className="message-wrap"><div className="message-label"><strong>{message.actor === 'seller' ? '판매자 실제 답변' : '고객'}</strong><time>{message.time}</time></div><div className="message-bubble">{message.image && <div className="image-placeholder">▧ 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div></div></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 열기에서 쇼핑몰의 문의 내용을 확인해 주세요.</p></div>}</div>
           : <div className="post-scroll"><article className="post-card"><div className="post-card-label"><span>문의 게시글</span><span>공개여부 미수집</span></div><h3>{selected.postTitle ?? selected.category}</h3><dl className="post-meta-grid"><div><dt>작성자</dt><dd>{selected.customer}</dd></div><div><dt>등록 시각</dt><dd>{customerMessages[0]?.time ?? selected.updatedAt}</dd></div><div><dt>문의 유형</dt><dd>{selected.category}</dd></div><div><dt>상품</dt><dd>{selected.product}</dd></div></dl><div className="post-body">{customerMessages.length ? customerMessages.map((message, index) => <div key={`${selected.id}-post-${index}`}>{message.image && <div className="post-attachment">▧ 고객 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 열기에서 쇼핑몰의 문의 내용을 확인해 주세요.</p></div>}</div></article><section className="board-answer"><div className="board-answer-title"><div><span className="answer-icon">P</span><div><strong>판매자 답변</strong><small>쇼핑몰에서 수집된 실제 답변</small></div></div>{sellerMessages[0] && <time>{sellerMessages[0].time}</time>}</div>{sellerMessages.length ? <div className="board-answer-body">{sellerMessages.map((message, index) => <p key={`${selected.id}-answer-${index}`}>{message.text}</p>)}</div> : <div className="board-answer-empty">아직 수집된 판매자 답변이 없습니다.</div>}</section></div>}
           <footer className="source-footer"><span>🔒 고객정보 마스킹됨</span><span>{selected.surface === 'chat' ? '채팅형' : '게시글형'} · 읽기 전용 수집 기록</span><span>원본 확인 {selected.updatedAt}</span></footer></>}
@@ -343,6 +403,6 @@ export default function Home() {
           <section className={`reply-section actual-section ${selected.actualReply ? 'verified' : ''}`}><div className="section-title"><div><span className="section-kicker actual">실제</span><h3>쇼핑몰 실제 답변</h3></div>{selected.actualReply ? <span className="verified-label">✓ 확인 완료</span> : <span className="unverified-label">미확인</span>}</div>{selected.actualReply ? <><div className="draft-card actual-draft">{selected.actualReply.text}</div><div className="verification-meta"><span>답변 시각 {selected.actualReply.sentAt}</span><span>최근 수집 확인 {selected.actualReply.verifiedAt}</span></div></> : <div className="verification-empty"><span className="scan-icon">⌁</span><div><strong>판매자 답변이 아직 확인되지 않았습니다.</strong><p>다음 수집에서 쇼핑몰 메시지와 답변 상태를 다시 확인합니다.</p></div></div>}</section>
         </div><div className="reply-bottom-bar"><div><span className="reply-state-dot" style={{ background: statusMeta[selected.status].dot }}/><strong>{statusMeta[selected.status].label}</strong></div><button onClick={() => notify('이 버튼은 아직 수집 매크로를 실행하지 않습니다.')}>답변 재확인 준비중</button></div></>}</aside>
       </div>
-    </section>{sourceGuide && <div className="source-guide-backdrop" role="presentation" onMouseDown={() => setSourceGuide(null)}><section className="source-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="source-guide-title" aria-describedby="source-guide-description" onMouseDown={(event) => event.stopPropagation()}><div className="source-guide-heading"><div><span className="source-guide-kicker">원문 확인</span><h2 id="source-guide-title">개별 문의 링크가 아닙니다.</h2></div><button className="dialog-close" type="button" aria-label="안내 닫기" onClick={() => setSourceGuide(null)}>×</button></div><p id="source-guide-description">이 버튼은 해당 문의를 바로 여는 주소가 아니라 쇼핑몰 문의관리 목록으로 이동합니다. 목록에서 아래 참조값 또는 상품명으로 문의를 확인해 주세요.</p><dl className="source-guide-reference"><dt>상품</dt><dd>{sourceGuide.product}</dd>{sourceGuide.reference && <><dt>참조값</dt><dd><code>{sourceGuide.reference}</code><button className="copy-reference" type="button" onClick={() => copyText(sourceGuide.reference)}>복사</button></dd></>}</dl><div className="source-guide-actions"><button className="secondary-button" type="button" onClick={() => setSourceGuide(null)}>닫기</button><button className="primary-button" type="button" onClick={() => { setSourceGuide(null); openExternal(sourceGuide.url, '문의관리'); }}>문의관리 새 탭 ↗</button></div></section></div>}{toast && <div className="toast" role="status">{toast}</div>}
+    </section>{sourceGuide && <div className="source-guide-backdrop" role="presentation" onMouseDown={() => setSourceGuide(null)}><section className="source-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="source-guide-title" aria-describedby="source-guide-description" onMouseDown={(event) => event.stopPropagation()}><div className="source-guide-heading"><div><span className="source-guide-kicker">원문 확인</span><h2 id="source-guide-title">개별 문의 링크가 아닙니다.</h2></div><button className="dialog-close" type="button" aria-label="안내 닫기" onClick={() => setSourceGuide(null)}>×</button></div><p id="source-guide-description">이 버튼은 해당 문의를 바로 여는 주소가 아니라 쇼핑몰 문의관리 목록으로 이동합니다. 목록에서 아래 참조값 또는 상품명으로 문의를 확인해 주세요. 판매자센터 로그인 상태를 이어받으려면 이 검수함을 먼저 CS Chrome에서 열어 주세요.</p><dl className="source-guide-reference"><dt>상품</dt><dd>{sourceGuide.product}</dd>{sourceGuide.reference && <><dt>참조값</dt><dd><code>{sourceGuide.reference}</code><button className="copy-reference" type="button" onClick={() => copyText(sourceGuide.reference)}>복사</button></dd></>}</dl><div className="source-guide-actions"><button className="secondary-button" type="button" onClick={() => setSourceGuide(null)}>닫기</button><button className="primary-button" type="button" onClick={() => { setSourceGuide(null); openExternal(sourceGuide.url, '문의관리'); }}>문의관리 새 탭 ↗</button></div></section></div>}{toast && <div className="toast" role="status">{toast}</div>}
   </main>;
 }

@@ -26,7 +26,7 @@ const context = {
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(`${__dirname}/Code.gs`, "utf8"), context);
 const source = fs.readFileSync(`${__dirname}/Code.gs`, "utf8");
-assert.match(source, /\['health', 'overview', 'dashboard', 'cases', 'case', 'answerLibrary'\]/);
+assert.match(source, /\['health', 'overview', 'dashboard', 'cases', 'case', 'caseBatch', 'caseIndex', 'answerLibrary'\]/);
 
 const record = {
   market: "smartstore",
@@ -108,6 +108,8 @@ assert.equal(legacyCaseObject.image_count, 3);
 assert.throws(() => context.assertMaskedRecord_({ ...record, source_url: "http://sell.smartstore.naver.com/#/comment/" }), /UNSAFE_MARKETPLACE_URL/);
 assert.throws(() => context.assertMaskedRecord_({ ...record, source_url: "https://example.com/case" }), /UNSAFE_MARKETPLACE_URL/);
 assert.throws(() => context.assertMaskedRecord_({ ...record, source_url: "https://sell.smartstore.naver.com/#/comment/?token=secret" }), /SENSITIVE_MARKETPLACE_URL_PARAMETER/);
+assert.throws(() => context.assertMaskedRecord_({ ...record, source_url: "https://sell.smartstore.naver.com/#/comment/?sessionId=secret" }), /SENSITIVE_MARKETPLACE_URL_PARAMETER/);
+assert.throws(() => context.assertMaskedRecord_({ ...record, source_url: "https://sell.smartstore.naver.com/#/comment/?accessToken=secret" }), /SENSITIVE_MARKETPLACE_URL_PARAMETER/);
 assert.throws(() => context.assertMaskedRecord_({ ...record, source_url_kind: "EXACT", source_url: "" }), /SOURCE_URL_KIND_MISMATCH/);
 
 const messages = context.prepareMessages_(record, new Date("2026-08-25T01:01:00Z"));
@@ -203,6 +205,16 @@ assert.equal(secondMissing.updates[0].object.reply_state, "CLOSED");
 assert.equal(secondMissing.updates[0].object.reply_required, false);
 assert.equal(secondMissing.updates[0].object.completion_reason, "OPEN_QUEUE_MISSING_TWICE");
 
+const reappeared = context.prepareOpenQueueReconciliation_(
+  { channels: { smartstore_comments: { ...missingReport.channels.smartstore_comments, open_queue_visible_total: 1, open_queue_source_keys: [openCase.case_key] } } },
+  tableFromObjects([secondMissing.updates[0].object]),
+  {},
+  new Date("2026-08-31T01:10:00Z"),
+);
+assert.equal(reappeared.reopened, 1);
+assert.equal(reappeared.updates[0].object.reply_state, "NEEDS_REPLY");
+assert.equal(reappeared.updates[0].object.status_missing_count, 0);
+
 const incompleteReport = structuredClone(missingReport);
 incompleteReport.channels.smartstore_comments.open_queue_complete = false;
 const incomplete = context.prepareOpenQueueReconciliation_(
@@ -212,6 +224,38 @@ const incomplete = context.prepareOpenQueueReconciliation_(
   new Date("2026-08-31T01:00:00Z"),
 );
 assert.equal(incomplete.checked, 0);
+
+const batchRows = {
+  "01_CASES": [
+    { case_key: "smartstore:comments:first", preview: "첫 문의", record_type: "LIVE", reply_state: "NEEDS_REPLY" },
+    { case_key: "ably:inquiry:second", preview: "둘째 문의", record_type: "LIVE", reply_state: "ANSWERED" },
+  ],
+  "02_MESSAGES": [
+    { case_key: "smartstore:comments:first", message_key: "MSG2:1", sequence: 1, actor_type: "CUSTOMER", message_text_masked: "첫 메시지" },
+    { case_key: "ably:inquiry:second", message_key: "MSG2:2", sequence: 1, actor_type: "SELLER", message_text_masked: "둘째 답변" },
+  ],
+  "03_AI_DRAFTS": [
+    { case_key: "smartstore:comments:first", draft_id: "DRAFT:first", version: 1, draft_text: "첫 초안" },
+  ],
+};
+const batchReads = {};
+context.PropertiesService = { getScriptProperties() { return { getProperty() { return "0"; } }; } };
+context.readJsonCache_ = () => null;
+context.writeJsonCache_ = () => {};
+context.getObjects_ = (sheetName) => {
+  batchReads[sheetName] = (batchReads[sheetName] || 0) + 1;
+  return batchRows[sheetName] || [];
+};
+const batch = context.getCaseBatch_("smartstore:comments:first,ably:inquiry:second");
+assert.equal(batch.items.length, 2);
+assert.equal(batch.items[0].messages[0].message_text_masked, "첫 메시지");
+assert.equal(batch.items[1].messages[0].message_text_masked, "둘째 답변");
+assert.equal(batch.items[0].drafts.length, 1);
+assert.equal(batchReads["01_CASES"], 1);
+assert.equal(batchReads["02_MESSAGES"], 1);
+assert.equal(batchReads["03_AI_DRAFTS"], 1);
+assert.throws(() => context.getCaseBatch_("a,b,c,d"), /CASE_BATCH_TOO_LARGE/);
+assert.throws(() => context.getCaseBatch_("same,same"), /DUPLICATE_CASE_KEY/);
 
 context.getObjects_ = () => [{
   example_id: "ANS_test",

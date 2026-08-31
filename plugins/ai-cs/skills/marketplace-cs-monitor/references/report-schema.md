@@ -47,7 +47,7 @@ Required fields:
 - `ai_draft_pii_scan`: `PASS` only after the generated text is scanned again
 - `pii_scan`: `PASS` or `REVIEW`
 
-`source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time and run duration.
+`source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time, run duration, link fields, and all AI-draft fields. Draft generation or review must never create a false inquiry-content change.
 Link fields are excluded from `content_hash`, so a harmless route or filter change does not turn an otherwise unchanged inquiry into `CHANGED`. Reject non-HTTPS URLs, non-marketplace hosts, embedded credentials, authentication-like query keys or fragments, and query values containing an unmasked phone or email before writing the masked report.
 
 ## Channel report
@@ -74,7 +74,7 @@ For deterministic stale-case reconciliation, each channel may also include only 
 - `open_queue_visible_total` and `open_queue_observed_count`: these must match for a complete snapshot;
 - `open_queue_source_keys[]`: hashed source keys only, never raw marketplace IDs.
 
-An incomplete or mismatched snapshot cannot change a stored case. On the sync target, one consecutive absence becomes `REVIEW`, two becomes `CLOSED`, and a later reappearance becomes `NEEDS_REPLY`. `CLOSED` is a local review state only; it never closes anything in a marketplace and the original masked case/messages remain stored.
+An incomplete, unpaginated, or mismatched snapshot cannot change a stored case. If a marketplace does not expose an independently verifiable unanswered total, set `open_queue_complete=false` and record a non-sensitive `open_queue_error`. On the sync target, one consecutive absence becomes `REVIEW`, two becomes `CLOSED`, and a later reappearance becomes `NEEDS_REPLY`. `CLOSED` is a local review state only; it never closes anything in a marketplace and the original masked case/messages remain stored.
 
 ## Comparison boundary
 

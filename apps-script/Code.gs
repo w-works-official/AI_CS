@@ -26,6 +26,10 @@ const CS_LINK_COLUMNS = Object.freeze([
   'image_count',
 ]);
 
+function isTruthy_(value) {
+  return value === true || value === 1 || /^(?:1|true|yes|y)$/i.test(String(value || ''));
+}
+
 function doGet(e) {
   try {
     const request = normalizeRequest_(e);
@@ -45,7 +49,7 @@ function doPost(e) {
     assertRequestEnvironment_(request);
     const action = String(request.action || '');
 
-    if (['health', 'overview', 'dashboard', 'cases', 'case', 'answerLibrary'].indexOf(action) !== -1) {
+    if (['health', 'overview', 'dashboard', 'cases', 'case', 'caseBatch', 'caseIndex', 'answerLibrary'].indexOf(action) !== -1) {
       return json_(dispatchRead_(action, request));
     }
 
@@ -78,7 +82,9 @@ function dispatchRead_(action, request) {
   if (action === 'overview') return overview_();
   if (action === 'dashboard') return dashboard_(request);
   if (action === 'cases') return listCases_(request);
-  if (action === 'case') return getCase_(request.case_key);
+  if (action === 'case') return getCase_(request.case_key, request.fresh);
+  if (action === 'caseBatch') return getCaseBatch_(request.case_keys, request.fresh);
+  if (action === 'caseIndex') return caseIndex_();
   if (action === 'answerLibrary') return searchVerifiedAnswers_(request);
   throw new Error('UNKNOWN_ACTION');
 }
@@ -577,7 +583,15 @@ function safeMarketplaceUrl_(value, field) {
   let decoded = text;
   try { decoded = decodeURIComponent(text); } catch (error) { /* Keep the original value for conservative checks. */ }
   const queryOrFragment = (decoded.match(/[?#]([\s\S]*)$/) || [])[1] || '';
-  if (/(?:^|[?&#])(?:token|access_token|refresh_token|api_key|apikey|key|secret|password|passwd|session|cookie|authorization)=/i.test(queryOrFragment)) {
+  const sensitiveParts = ['token', 'secret', 'session', 'cookie', 'auth', 'authorization', 'password', 'passwd', 'credential', 'signature', 'jwt', 'apikey', 'accesskey', 'refreshtoken'];
+  const sensitiveUrlKey = queryOrFragment.split(/[&#]/).some(function (pair) {
+    const rawKey = String(pair || '').split('=')[0] || '';
+    let key = rawKey;
+    try { key = decodeURIComponent(rawKey); } catch (error) { /* Reject through normalized raw text below when possible. */ }
+    const normalized = String(key || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    return normalized === 'key' || sensitiveParts.some(function (part) { return normalized.indexOf(part) !== -1; });
+  });
+  if (sensitiveUrlKey) {
     throw new Error('SENSITIVE_MARKETPLACE_URL_PARAMETER:' + field);
   }
   if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(queryOrFragment)) throw new Error('UNMASKED_PHONE:' + field);
@@ -618,7 +632,10 @@ function mapActor_(value) {
 }
 
 function makeRunId_(report) {
-  return 'SYNC_' + sha256_([report.collected_at || new Date().toISOString(), (report.records || []).map(function (row) { return row.source_key + ':' + row.content_hash; }).join('|')].join('|')).slice(0, 24);
+  return 'SYNC_' + sha256_([report.collected_at || new Date().toISOString(), (report.records || []).map(function (row) {
+    const draftHash = sha256_([row.ai_draft || '', row.ai_draft_purpose || '', row.ai_draft_required_checks || '', row.ai_draft_pii_scan || ''].join('|')).slice(0, 16);
+    return row.source_key + ':' + row.content_hash + ':' + draftHash;
+  }).join('|')].join('|')).slice(0, 24);
 }
 
 function sha256_(value) {
@@ -775,7 +792,7 @@ function dashboard_(request) {
     cursor: 0,
   });
   const cacheKey = dashboardCacheKey_(safeRequest);
-  const cached = readJsonCache_(cacheKey);
+  const cached = isTruthy_(request.fresh) ? null : readJsonCache_(cacheKey);
   if (cached) return cached;
 
   const cases = getObjects_(CS_SHEETS.CASES);
@@ -785,34 +802,87 @@ function dashboard_(request) {
   return payload;
 }
 
-function getCase_(caseKey) {
+function getCase_(caseKey, fresh) {
   if (!caseKey) throw new Error('CASE_KEY_REQUIRED');
-  const caseRow = getObjects_(CS_SHEETS.CASES).find(function (row) {
-    return String(row.case_key) === String(caseKey);
-  });
-  if (!caseRow) throw new Error('CASE_NOT_FOUND');
+  const batch = getCaseBatch_(String(caseKey), fresh);
+  if (!batch.items.length) throw new Error('CASE_NOT_FOUND');
+  return Object.assign({ ok: true }, batch.items[0]);
+}
 
-  const allMessages = getObjects_(CS_SHEETS.MESSAGES)
-    .filter(function (row) { return String(row.case_key) === String(caseKey); });
-  const versionTwoMessages = allMessages.filter(function (row) {
+function normalizeCaseKeys_(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  const keys = raw.map(function (item) { return String(item || '').trim(); }).filter(Boolean);
+  if (!keys.length) throw new Error('CASE_KEYS_REQUIRED');
+  if (keys.length > 3) throw new Error('CASE_BATCH_TOO_LARGE');
+  const unique = {};
+  keys.forEach(function (key) {
+    if (key.length > 300 || !/^[A-Za-z0-9:_-]+$/.test(key)) throw new Error('CASE_KEY_INVALID');
+    if (unique[key]) throw new Error('DUPLICATE_CASE_KEY');
+    unique[key] = true;
+  });
+  return keys;
+}
+
+function detailFromRows_(caseRow, allMessages, allDrafts) {
+  const caseKey = String(caseRow.case_key || '');
+  const caseMessages = allMessages.filter(function (row) { return String(row.case_key) === caseKey; });
+  const versionTwoMessages = caseMessages.filter(function (row) {
     return String(row.message_key || '').indexOf('MSG2:') === 0;
   });
-  const messages = (versionTwoMessages.length ? versionTwoMessages : allMessages)
+  const messages = (versionTwoMessages.length ? versionTwoMessages : caseMessages)
     .filter(function (row) { return !isUiControlText_(row.message_text_masked); })
     .sort(function (a, b) { return Number(a.sequence || 0) - Number(b.sequence || 0); });
-
-  const drafts = getObjects_(CS_SHEETS.DRAFTS)
-    .filter(function (row) { return String(row.case_key) === String(caseKey); })
+  const drafts = allDrafts
+    .filter(function (row) { return String(row.case_key) === caseKey; })
     .sort(function (a, b) { return Number(b.version || 0) - Number(a.version || 0); });
-
   return {
-    ok: true,
     case: publicCase_(caseRow),
     messages: messages,
     drafts: drafts,
     human_reply_source: 'MARKETPLACE_ONLY',
     auto_send: false,
   };
+}
+
+function getCaseBatch_(caseKeysValue, fresh) {
+  const keys = normalizeCaseKeys_(caseKeysValue);
+  const cacheKey = 'caseBatch:' + String(PropertiesService.getScriptProperties().getProperty('CS_READ_CACHE_VERSION') || '0') + ':' + keys.join(',');
+  const cached = isTruthy_(fresh) ? null : readJsonCache_(cacheKey);
+  if (cached) return cached;
+
+  const allCases = getObjects_(CS_SHEETS.CASES);
+  const allMessages = getObjects_(CS_SHEETS.MESSAGES);
+  const allDrafts = getObjects_(CS_SHEETS.DRAFTS);
+  const caseMap = {};
+  allCases.forEach(function (row) { caseMap[String(row.case_key || '')] = row; });
+  const items = keys.filter(function (key) { return Boolean(caseMap[key]); }).map(function (key) {
+    return detailFromRows_(caseMap[key], allMessages, allDrafts);
+  });
+  const payload = {
+    ok: true,
+    items: items,
+    not_found_keys: keys.filter(function (key) { return !caseMap[key]; }),
+    human_reply_source: 'MARKETPLACE_ONLY',
+    auto_send: false,
+  };
+  writeJsonCache_(cacheKey, payload, 30);
+  return payload;
+}
+
+function caseIndex_() {
+  const liveRows = getObjects_(CS_SHEETS.CASES)
+    .filter(function (row) { return String(row.record_type || '') === 'LIVE'; });
+  const rows = liveRows.slice(0, 5000).map(function (row) {
+      return {
+        source_key: String(row.case_key || ''),
+        content_hash: String(row.content_hash || ''),
+        ai_draft_state: String(row.ai_draft_state || 'NONE'),
+        reply_state: String(row.reply_state || ''),
+        last_seen_at: serializeCell_(row.last_seen_at),
+      };
+    })
+    .filter(function (row) { return row.source_key && row.content_hash; });
+  return { ok: true, items: rows, total: rows.length, total_available: liveRows.length, truncated: liveRows.length > rows.length };
 }
 
 function searchVerifiedAnswers_(request) {
@@ -886,6 +956,9 @@ function publicAnswerExample_(row, score) {
     product_name: productName,
     human_answer: answer,
     required_checks: String(row.required_checks || ''),
+    enabled: true,
+    quality_state: 'USE',
+    pii_scan: 'PASS',
     score: Number(score || 0),
     last_verified_at: serializeCell_(row.last_verified_at),
   };

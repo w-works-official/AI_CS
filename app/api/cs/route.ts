@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { normalizeReviewRequest, normalizeSyncRequest } from './policy';
+import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeReviewRequest, normalizeSyncRequest } from './policy';
 
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ACTIONS = new Set(['health', 'overview', 'dashboard', 'cases', 'case']);
-const ALLOWED_PARAMS = new Set(['action', 'case_key', 'record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit', 'cursor']);
+const ALLOWED_ACTIONS = new Set(['health', 'overview', 'dashboard', 'cases', 'case', 'caseBatch']);
+const ALLOWED_PARAMS = new Set(['action', 'case_key', 'case_keys', 'record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit', 'cursor', 'fresh']);
+const LOCAL_ONLY_PARAMS = new Set(['t']);
 type CacheEntry = { expiresAt: number; payload: unknown };
 const cacheScope = globalThis as typeof globalThis & { __pinkRocketCsCache?: Map<string, CacheEntry> };
 const responseCache = cacheScope.__pinkRocketCsCache ?? new Map<string, CacheEntry>();
@@ -48,7 +49,19 @@ export async function GET(request: NextRequest) {
 
   const action = request.nextUrl.searchParams.get('action') ?? 'overview';
   if (!ALLOWED_ACTIONS.has(action)) return privateJson({ ok: false, error: 'UNKNOWN_ACTION' }, 400);
+  try { assertSingletonReadParams(request.nextUrl.searchParams); } catch (error) {
+    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'READ_PARAM_DUPLICATE' }, 400);
+  }
+  for (const key of request.nextUrl.searchParams.keys()) {
+    if (!ALLOWED_PARAMS.has(key) && !LOCAL_ONLY_PARAMS.has(key)) return privateJson({ ok: false, error: `READ_PARAM_NOT_ALLOWED:${key}` }, 400);
+  }
   if (action === 'case' && !request.nextUrl.searchParams.get('case_key')) return privateJson({ ok: false, error: 'CASE_KEY_REQUIRED' }, 400);
+  if (action === 'caseBatch') {
+    const rawKeys = request.nextUrl.searchParams.get('case_keys') ?? '';
+    try { normalizeCaseBatchKeys(rawKeys); } catch (error) {
+      return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CASE_KEYS_INVALID' }, 400);
+    }
+  }
 
   const fresh = request.nextUrl.searchParams.get('fresh') === '1';
   const cacheKey = Array.from(request.nextUrl.searchParams.entries())
@@ -57,7 +70,8 @@ export async function GET(request: NextRequest) {
     .map(([key, value]) => `${key}=${value}`)
     .join('&');
   const cached = responseCache.get(cacheKey);
-  if (!fresh && cached && cached.expiresAt > Date.now()) return privateJson(cached.payload, 200, action === 'case' ? 60 : 30);
+  const isDetailAction = action === 'case' || action === 'caseBatch';
+  if (!fresh && cached && cached.expiresAt > Date.now()) return privateJson(cached.payload, 200, isDetailAction ? 60 : 30);
 
   const upstream = new URL(target.endpoint);
   request.nextUrl.searchParams.forEach((value, key) => {
@@ -90,9 +104,9 @@ export async function GET(request: NextRequest) {
     };
     responseCache.set(cacheKey, {
       payload: safePayload,
-      expiresAt: Date.now() + (action === 'case' ? 120_000 : 60_000),
+      expiresAt: Date.now() + (isDetailAction ? 120_000 : 60_000),
     });
-    return privateJson(safePayload, 200, action === 'case' ? 60 : 30);
+    return privateJson(safePayload, 200, isDetailAction ? 60 : 30);
   } catch {
     return privateJson({ ok: false, error: 'CS_DATA_CONNECTION_FAILED' }, 502);
   }

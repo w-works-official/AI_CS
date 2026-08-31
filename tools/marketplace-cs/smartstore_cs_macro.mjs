@@ -2,13 +2,13 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { chromium } from "playwright";
 import { buildReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.mjs";
-import { loadSyncConfig, readCsData, syncReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.mjs";
+import { loadSyncConfig, readCaseIndex, readCsData, syncReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.mjs";
 import {
   acquireCollectorLock,
   inspectGoogleChromeSession,
   resolveBrowserSession,
 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/browser-session-core.mjs";
-import { filterChatMessages, parseTalktalkTotalText } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/collector-ui-core.mjs";
+import { detectAuthChallengeState, filterChatMessages, parseTalktalkTotalText } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/collector-ui-core.mjs";
 
 const OUTPUT_DIR = new URL("../../output/", import.meta.url);
 const STORE_ORIGIN = "https://sell.smartstore.naver.com";
@@ -166,10 +166,14 @@ function normalizeFlexibleDate(label, endDate) {
 async function requireLoggedIn(page) {
   await page.goto(ROUTES.talktalk, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1_000);
-  if (/accounts\.commerce\.naver\.com\/login/.test(page.url())) {
-    throw new Error("스마트스토어 로그인 세션이 없습니다. 전용 Chrome에서 먼저 로그인하세요.");
-  }
+  await assertNoAuthChallenge(page, "SMARTSTORE");
   await page.getByText("문의/리뷰관리", { exact: false }).waitFor({ state: "visible" });
+}
+
+async function assertNoAuthChallenge(page, channelLabel) {
+  const visibleText = await page.locator("body").innerText({ timeout: 5_000 }).catch(() => "");
+  const state = detectAuthChallengeState(page.url(), visibleText.slice(0, 20_000));
+  if (state) throw new Error(`${channelLabel}_${state}`);
 }
 
 async function collectComments(context, range) {
@@ -334,7 +338,12 @@ async function collectCustomerQna(context, range) {
     visibleTotal: records.length,
     records: records.filter((record) => record.received_at.slice(0, 10) >= range.start),
     openQueueRecords: records.filter((record) => isOpenReplyStatus(record.status)),
-    openQueueComplete: paginationComplete,
+    // The page currently exposes no independently verified unanswered total.
+    // Keep reconciliation disabled even when pagination itself completed.
+    openQueueComplete: false,
+    openQueueError: paginationComplete
+      ? "AUTHORITATIVE_OPEN_TOTAL_UNAVAILABLE"
+      : "PAGINATION_INCOMPLETE",
     openQueueWindowStart: startOfOneMonth(range.end),
   };
 }
@@ -563,7 +572,7 @@ async function collectZigzagTable(context, range, channel) {
   try {
     await page.goto(route, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await page.waitForTimeout(1_200);
-    if (/login|signin|auth/i.test(page.url())) throw new Error(`ZIGZAG_LOGIN_REQUIRED:${channel}`);
+    await assertNoAuthChallenge(page, `ZIGZAG_${channel.toUpperCase()}`);
     await page.getByRole("tab").first().waitFor({ state: "visible", timeout: 10_000 });
 
     const tabTexts = await page.getByRole("tab").allTextContents();
@@ -657,7 +666,12 @@ async function collectZigzagTable(context, range, channel) {
       verifiedZero: false,
       openVisibleTotal,
       openQueueRecords,
-      openQueueComplete: openQueueRecords.length === openVisibleTotal,
+      // Only the current table page is collected. Do not close older cases until
+      // a full pagination walk proves this is a complete unanswered snapshot.
+      openQueueComplete: false,
+      openQueueError: openQueueRecords.length === openVisibleTotal
+        ? "PAGINATION_COMPLETENESS_UNPROVEN"
+        : "OPEN_TOTAL_MISMATCH",
       openQueueWindowStart: daysBefore(range.end, 7),
     };
   } finally {
@@ -670,7 +684,7 @@ async function collectAbly(context, range) {
   try {
     await page.goto(ROUTES.ably, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await page.waitForTimeout(1_500);
-    if (/login|signin|auth/i.test(page.url())) throw new Error("ABLY_LOGIN_REQUIRED");
+    await assertNoAuthChallenge(page, "ABLY");
     const outerFrame = page.locator("iframe#seller-admin-iframe");
     await outerFrame.waitFor({ state: "visible", timeout: 10_000 });
     const frame = outerFrame.contentFrame();
@@ -868,6 +882,7 @@ const rawCollection = {
       open_queue_scope: "one_month_unanswered", open_queue_window_start: customerQna.openQueueWindowStart,
       open_queue_visible_total: customerQna.openQueueRecords.length, open_queue_records: customerQna.openQueueRecords,
       open_queue_complete: requestedChannels.has("customer_qna") && customerQna.openQueueComplete,
+      open_queue_error: customerQna.openQueueError || "",
     },
     smartstore_customer_center: { market: "smartstore", channel: "customer_center", attempted: requestedChannels.has("customer_center"), visible_total: customerCenter.length, records: customerCenter },
     smartstore_talktalk: {
@@ -884,6 +899,7 @@ const rawCollection = {
       open_queue_scope: "one_week_unanswered", open_queue_window_start: zigzagOrder.openQueueWindowStart,
       open_queue_visible_total: zigzagOrder.openVisibleTotal, open_queue_records: zigzagOrder.openQueueRecords,
       open_queue_complete: requestedChannels.has("zigzag_order_inquiry") && zigzagOrder.openQueueComplete,
+      open_queue_error: zigzagOrder.openQueueError || "",
     },
     zigzag_item_question: {
       market: "zigzag", channel: "item_question", attempted: requestedChannels.has("zigzag_item_question"),
@@ -891,6 +907,7 @@ const rawCollection = {
       open_queue_scope: "one_week_unanswered", open_queue_window_start: zigzagItem.openQueueWindowStart,
       open_queue_visible_total: zigzagItem.openVisibleTotal, open_queue_records: zigzagItem.openQueueRecords,
       open_queue_complete: requestedChannels.has("zigzag_item_question") && zigzagItem.openQueueComplete,
+      open_queue_error: zigzagItem.openQueueError || "",
     },
     ably_inquiry: {
       market: "ably", channel: "inquiry", attempted: requestedChannels.has("ably_inquiry"),
@@ -901,10 +918,28 @@ const rawCollection = {
     },
   },
 };
-const report = buildReport(rawCollection, []);
+let syncConfig = null;
+let previousRecords = [];
+let caseIndexStatus = "UNAVAILABLE";
+try {
+  const candidateConfig = await loadSyncConfig();
+  if (candidateConfig.web_app_url && candidateConfig.api_key && candidateConfig.environment === "development") {
+    const health = await readCsData("health", {}, candidateConfig);
+    if (health.environment !== "development" || health.auto_send !== false || Number(health.marketplace_write_actions || 0) !== 0) {
+      throw new Error("UNSAFE_DEVELOPMENT_HEALTH");
+    }
+    previousRecords = await readCaseIndex(candidateConfig);
+    caseIndexStatus = "AVAILABLE";
+    syncConfig = candidateConfig;
+  }
+} catch (error) {
+  if (syncMode === "sync") throw error;
+}
+const report = buildReport(rawCollection, previousRecords);
+report.summary.case_index_status = caseIndexStatus;
 let syncResult = { skipped: true, reason: "PREPARE_ONLY" };
 if (syncMode === "sync") {
-  const syncConfig = await loadSyncConfig();
+  syncConfig = syncConfig || await loadSyncConfig();
   if (syncConfig.environment !== "development") throw new Error("DEVELOPMENT_SYNC_REQUIRED");
   const health = await readCsData("health", {}, syncConfig);
   if (health.environment !== "development" || health.auto_send !== false || Number(health.marketplace_write_actions || 0) !== 0) {
