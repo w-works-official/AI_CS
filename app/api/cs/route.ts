@@ -3,7 +3,7 @@ import { normalizeReviewRequest, normalizeSyncRequest } from './policy';
 
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ACTIONS = new Set(['health', 'overview', 'cases', 'case']);
+const ALLOWED_ACTIONS = new Set(['health', 'overview', 'dashboard', 'cases', 'case']);
 const ALLOWED_PARAMS = new Set(['action', 'case_key', 'record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit', 'cursor']);
 type CacheEntry = { expiresAt: number; payload: unknown };
 const cacheScope = globalThis as typeof globalThis & { __pinkRocketCsCache?: Map<string, CacheEntry> };

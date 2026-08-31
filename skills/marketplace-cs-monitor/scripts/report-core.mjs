@@ -86,6 +86,7 @@ function inferReplyState(status, lastActor, lastMessage) {
 
 function normalizeMessage(message) {
   return {
+    source_message_id: compact(message?.source_message_id),
     direction: ["customer", "seller", "automatic", "system"].includes(message?.direction) ? message.direction : "unknown",
     at: compact(message?.at ?? message?.time),
     text: maskSensitiveText(message?.text),

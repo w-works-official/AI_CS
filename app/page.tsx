@@ -35,8 +35,15 @@ type CsCase = {
 };
 type Overview = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number };
 type EnvironmentName = 'development' | 'production' | 'unconfigured';
+type DashboardSnapshot = { savedAt: number; cases: CsCase[]; total: number; overview: Overview; environment: EnvironmentName };
+type DetailSnapshot = { savedAt: number; item: CsCase };
 
 const EMPTY_OVERVIEW: Overview = { total_live: 0, needs_reply: 0, answered: 0, review: 0, no_reply_required: 0, ai_ready: 0 };
+const INITIAL_CASE_LIMIT = 50;
+const SESSION_CACHE_TTL = 5 * 60 * 1000;
+const DETAIL_CACHE_TTL = 2 * 60 * 1000;
+const DASHBOARD_CACHE_PREFIX = 'pinkrocket-cs-dashboard-v2:';
+const DETAIL_CACHE_PREFIX = 'pinkrocket-cs-detail-v2:';
 const statusMeta: Record<CaseStatus, { label: string; shortLabel: string; tone: string; dot: string }> = {
   unanswered: { label: '미응답', shortLabel: '미응답', tone: 'status-red', dot: '#e24b4b' },
   'ai-ready': { label: 'AI 답변 준비', shortLabel: 'AI 준비', tone: 'status-purple', dot: '#7257d7' },
@@ -142,6 +149,16 @@ async function postJson(path: string, body: Record<string, unknown>): Promise<Re
   if (!response.ok || !payload?.ok) throw new Error(text(payload?.error, 'REVIEW_SAVE_FAILED'));
   return payload;
 }
+function readSessionCache<T>(key: string, maxAge: number): T | null {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(key) ?? 'null') as { savedAt?: number } | null;
+    if (!parsed?.savedAt || Date.now() - parsed.savedAt > maxAge) return null;
+    return parsed as T;
+  } catch { return null; }
+}
+function writeSessionCache(key: string, value: unknown) {
+  try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* A full/disabled cache must not block the review desk. */ }
+}
 
 export default function Home() {
   const [activeFilter, setActiveFilter] = useState<'all' | CaseStatus>('all');
@@ -151,66 +168,95 @@ export default function Home() {
   const [search, setSearch] = useState(''); const [editor, setEditor] = useState(''); const [toast, setToast] = useState('');
   const [reviewSaving, setReviewSaving] = useState(false);
   const [loading, setLoading] = useState(true); const [loadingMore, setLoadingMore] = useState(false); const [detailLoading, setDetailLoading] = useState(false); const [error, setError] = useState('');
-  const listRequestId = useRef(0); const detailRequestId = useRef(0);
+  const [totalCases, setTotalCases] = useState(0); const [detailEpoch, setDetailEpoch] = useState(0);
+  const listRequestId = useRef(0); const detailRequestId = useRef(0); const detailCache = useRef(new Map<string, DetailSnapshot>());
 
-  const setOverviewPayload = (payload: Record<string, unknown>) => {
-    setEnvironment(['development', 'production'].includes(text(payload.environment)) ? text(payload.environment) as EnvironmentName : 'unconfigured');
-    setOverview({
-      total_live: Number(payload.total_live ?? 0), needs_reply: Number(payload.needs_reply ?? 0), answered: Number(payload.answered ?? 0),
-      review: Number(payload.review ?? 0), no_reply_required: Number(payload.no_reply_required ?? 0), ai_ready: Number(payload.ai_ready ?? 0),
-    });
-  };
   const fetchCases = useCallback(async (filter: 'all' | CaseStatus, limit: number, cursor: number, signal?: AbortSignal, fresh = false) => {
     const payload = await getJson(`/api/cs?action=cases&limit=${limit}&cursor=${cursor}${statusQuery(filter)}${fresh ? '&fresh=1' : ''}`, signal);
     return { items: (payload.items as RawRow[]).map(baseCase), total: Number(payload.total ?? 0) };
   }, []);
+  const fetchDashboard = useCallback(async (filter: 'all' | CaseStatus, signal?: AbortSignal, fresh = false) => {
+    const payload = await getJson(`/api/cs?action=dashboard&limit=${INITIAL_CASE_LIMIT}${statusQuery(filter)}${fresh ? `&fresh=1&t=${Date.now()}` : ''}`, signal);
+    const overviewPayload = (payload.overview ?? {}) as Record<string, unknown>;
+    return {
+      items: sortCasesRecent(((payload.items ?? []) as RawRow[]).map(baseCase)),
+      total: Number(payload.total ?? 0),
+      overview: {
+        total_live: Number(overviewPayload.total_live ?? 0), needs_reply: Number(overviewPayload.needs_reply ?? 0), answered: Number(overviewPayload.answered ?? 0),
+        review: Number(overviewPayload.review ?? 0), no_reply_required: Number(overviewPayload.no_reply_required ?? 0), ai_ready: Number(overviewPayload.ai_ready ?? 0),
+      } as Overview,
+      environment: ['development', 'production'].includes(text(payload.environment)) ? text(payload.environment) as EnvironmentName : 'unconfigured' as EnvironmentName,
+    };
+  }, []);
   const refresh = useCallback(async () => {
     const requestId = ++listRequestId.current; setLoading(true); setLoadingMore(false); setError('');
     try {
-      const first = await fetchCases(activeFilter, 3, 0, undefined, true);
+      const next = await fetchDashboard(activeFilter, undefined, true);
       if (requestId !== listRequestId.current) return;
-      setCases(first.items); setEditor(''); setDetailLoading(first.items.length > 0); setLoading(false); setLoadingMore(first.total > first.items.length);
-      setSelectedId((current) => first.items.some((item) => item.id === current) ? current : (first.items[0]?.id ?? ''));
-      const [overviewPayload, rest] = await Promise.all([
-        getJson('/api/cs?action=overview&fresh=1'),
-        first.total > first.items.length ? fetchCases(activeFilter, 197, 3, undefined, true) : Promise.resolve({ items: [], total: first.total }),
-      ]);
-      if (requestId !== listRequestId.current) return;
-      setOverviewPayload(overviewPayload); setCases(sortCasesRecent([...first.items, ...rest.items])); setLoadingMore(false);
+      setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setEditor('');
+      setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
+      detailCache.current.clear(); setSelectedDetail(null); setDetailEpoch((value) => value + 1);
     } catch (cause) {
       if (requestId === listRequestId.current) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
     } finally {
       if (requestId === listRequestId.current) { setLoading(false); setLoadingMore(false); }
     }
-  }, [activeFilter, fetchCases]);
+  }, [activeFilter, fetchDashboard]);
 
   useEffect(() => {
     const controller = new AbortController(); const requestId = ++listRequestId.current;
-    fetchCases(activeFilter, 3, 0, controller.signal)
-      .then(async (first) => {
+    const cached = readSessionCache<DashboardSnapshot>(`${DASHBOARD_CACHE_PREFIX}${activeFilter}`, SESSION_CACHE_TTL);
+    if (cached) {
+      queueMicrotask(() => {
         if (requestId !== listRequestId.current) return;
-        setCases(first.items); setEditor(''); setDetailLoading(first.items.length > 0); setLoading(false); setLoadingMore(first.total > first.items.length);
-        setSelectedId((current) => first.items.some((item) => item.id === current) ? current : (first.items[0]?.id ?? ''));
-        const [payload, rest] = await Promise.all([
-          getJson('/api/cs?action=overview', controller.signal),
-          first.total > first.items.length ? fetchCases(activeFilter, 197, 3, controller.signal) : Promise.resolve({ items: [], total: first.total }),
-        ]);
+        setCases(cached.cases); setTotalCases(cached.total); setOverview(cached.overview); setEnvironment(cached.environment); setLoading(false);
+        setSelectedId((current) => cached.cases.some((item) => item.id === current) ? current : (cached.cases[0]?.id ?? ''));
+      });
+    }
+    fetchDashboard(activeFilter, controller.signal)
+      .then((next) => {
         if (requestId !== listRequestId.current) return;
-        setOverviewPayload(payload); setCases(sortCasesRecent([...first.items, ...rest.items])); setLoadingMore(false);
+        setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment);
+        setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
+        writeSessionCache(`${DASHBOARD_CACHE_PREFIX}${activeFilter}`, { savedAt: Date.now(), cases: next.items, total: next.total, overview: next.overview, environment: next.environment } satisfies DashboardSnapshot);
       }).catch((cause) => {
         if (requestId === listRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
       }).finally(() => { if (requestId === listRequestId.current) { setLoading(false); setLoadingMore(false); } });
     return () => controller.abort();
-  }, [activeFilter, fetchCases]);
+  }, [activeFilter, fetchDashboard]);
   useEffect(() => {
     const requestId = ++detailRequestId.current; if (!selectedId) return;
+    const memoryCached = detailCache.current.get(selectedId);
+    const cached = memoryCached && Date.now() - memoryCached.savedAt <= DETAIL_CACHE_TTL
+      ? memoryCached
+      : readSessionCache<DetailSnapshot>(`${DETAIL_CACHE_PREFIX}${selectedId}`, DETAIL_CACHE_TTL);
+    if (cached) {
+      queueMicrotask(() => {
+        if (requestId !== detailRequestId.current) return;
+        detailCache.current.set(selectedId, cached); setSelectedDetail(cached.item); setEditor(cached.item.humanRevision?.text ?? ''); setDetailLoading(false);
+      });
+      return;
+    }
+    setDetailLoading(true);
     const controller = new AbortController();
     getJson(`/api/cs?action=case&case_key=${encodeURIComponent(selectedId)}`, controller.signal)
-      .then((payload) => { if (requestId === detailRequestId.current) { const hydrated = hydrateCase(payload.case as RawRow, (payload.messages ?? []) as RawRow[], (payload.drafts ?? []) as RawRow[]); setSelectedDetail(hydrated); setEditor(hydrated.humanRevision?.text ?? ''); } })
+      .then((payload) => { if (requestId === detailRequestId.current) { const hydrated = hydrateCase(payload.case as RawRow, (payload.messages ?? []) as RawRow[], (payload.drafts ?? []) as RawRow[]); const snapshot = { savedAt: Date.now(), item: hydrated }; detailCache.current.set(selectedId, snapshot); writeSessionCache(`${DETAIL_CACHE_PREFIX}${selectedId}`, snapshot); setSelectedDetail(hydrated); setEditor(hydrated.humanRevision?.text ?? ''); } })
       .catch((cause) => { if (requestId === detailRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) setError(cause instanceof Error ? cause.message : 'DETAIL_LOAD_FAILED'); })
       .finally(() => { if (requestId === detailRequestId.current) setDetailLoading(false); });
     return () => controller.abort();
-  }, [selectedId]);
+  }, [selectedId, detailEpoch]);
+
+  const loadMore = useCallback(async () => {
+    if (loadingMore || cases.length >= totalCases) return;
+    setLoadingMore(true); setError('');
+    try {
+      const next = await fetchCases(activeFilter, INITIAL_CASE_LIMIT, cases.length);
+      setCases((current) => sortCasesRecent([...current, ...next.items.filter((item) => !current.some((existing) => existing.id === item.id))]));
+      setTotalCases(next.total);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
+    } finally { setLoadingMore(false); }
+  }, [activeFilter, cases, fetchCases, loadingMore, totalCases]);
 
   const filteredCases = useMemo(() => {
     const term = search.trim().toLowerCase(); if (!term) return cases;
@@ -224,7 +270,7 @@ export default function Home() {
   const copyText = async (value: string) => { try { await navigator.clipboard.writeText(value); notify('클립보드에 복사했습니다.'); } catch { notify('브라우저에서 복사를 허용해 주세요.'); } };
   const selectFilter = (filter: 'all' | CaseStatus) => {
     if (filter === activeFilter) return;
-    listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setCases([]); setSelectedId(''); setSelectedDetail(null); setActiveFilter(filter);
+    listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setCases([]); setTotalCases(0); setSelectedId(''); setSelectedDetail(null); setActiveFilter(filter);
   };
   const selectCase = (id: string) => { if (id === selectedId) return; detailRequestId.current += 1; setEditor(''); setDetailLoading(true); setSelectedId(id); };
   const countFor = (status: CaseStatus) => ({ unanswered: overview.needs_reply, 'ai-ready': overview.ai_ready, review: overview.review, 'no-reply': overview.no_reply_required, replied: overview.answered })[status];
@@ -251,8 +297,8 @@ export default function Home() {
       {error && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
       <section className="status-strip" aria-label="문의 상태 요약">{filters.slice(1).map((filter) => { const meta = statusMeta[filter.key as CaseStatus]; return <button key={filter.key} className={`stat-card ${activeFilter === filter.key ? 'selected' : ''}`} onClick={() => selectFilter(filter.key as CaseStatus)}><span className="stat-dot" style={{ background: meta.dot }} /><span>{filter.label}</span><strong>{countFor(filter.key as CaseStatus).toLocaleString()}</strong></button>; })}</section>
       <div className="desk-grid">
-        <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최신순 최대 {cases.length || 200}건 표시 {loadingMore ? '· 나머지 불러오는 중' : ''} · 민감정보 마스킹</p></div>
-          <div className="case-list">{loading && !cases.length && <div className="empty-list loading-list"><span>⌁</span><strong>문의 목록을 불러오는 중입니다.</strong><p>구글시트 동기화 상태에 따라 약 5~15초 걸릴 수 있어요.</p></div>}{filteredCases.map((item) => { const meta = statusMeta[item.status]; return <button key={item.id} className={`case-item ${selected?.id === item.id ? 'active' : ''}`} onClick={() => selectCase(item.id)}><div className="case-item-top"><span className={`status-pill ${meta.tone}`}>{meta.shortLabel}</span><time>{item.updatedAt}</time></div><div className="case-title-row"><strong>{item.customer}</strong></div><p className="case-product">{item.product}</p><p className="case-preview">{item.preview}</p><div className="case-meta"><span className={`surface-tag ${item.surface}`}>{item.surface === 'chat' ? '● 채팅형' : '▤ 게시글형'}</span><span>{item.channel}</span><span>{item.category}</span></div></button>; })}{!loading && !filteredCases.length && <div className="empty-list">조건에 맞는 문의가 없습니다.</div>}</div>
+        <section className="case-column" aria-label="문의 목록"><div className="case-toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="현재 목록에서 고객, 상품, 문의 검색" /></label><div className="filter-row" role="tablist">{filters.map((filter) => <button key={filter.key} className={activeFilter === filter.key ? 'active' : ''} onClick={() => selectFilter(filter.key)}>{filter.label}</button>)}</div><p className="list-scope">현재 조건 최신순 {cases.length.toLocaleString()} / {totalCases.toLocaleString()}건 {loading && cases.length ? '· 최신 정보 확인 중' : ''} · 민감정보 마스킹</p></div>
+          <div className="case-list">{loading && !cases.length && <div className="empty-list loading-list"><span>⌁</span><strong>첫 연결을 확인하고 있습니다.</strong><p>한 번 불러온 뒤에는 같은 탭에서 즉시 표시하고, 최신 정보는 뒤에서 확인합니다.</p></div>}{filteredCases.map((item) => { const meta = statusMeta[item.status]; return <button key={item.id} className={`case-item ${selected?.id === item.id ? 'active' : ''}`} onClick={() => selectCase(item.id)}><div className="case-item-top"><span className={`status-pill ${meta.tone}`}>{meta.shortLabel}</span><time>{item.updatedAt}</time></div><div className="case-title-row"><strong>{item.customer}</strong></div><p className="case-product">{item.product}</p><p className="case-preview">{item.preview}</p><div className="case-meta"><span className={`surface-tag ${item.surface}`}>{item.surface === 'chat' ? '● 채팅형' : '▤ 게시글형'}</span><span>{item.channel}</span><span>{item.category}</span></div></button>; })}{!loading && !filteredCases.length && <div className="empty-list">조건에 맞는 문의가 없습니다.</div>}{cases.length < totalCases && <div className="load-more-row"><button className="secondary-button" onClick={loadMore} disabled={loadingMore}>{loadingMore ? '불러오는 중…' : `다음 ${Math.min(INITIAL_CASE_LIMIT, totalCases - cases.length)}건 보기`}</button></div>}</div>
         </section>
         <section className="conversation-column" aria-label="전체 대화">{!selected ? <div className="panel-empty"><span>⌁</span><strong>표시할 문의가 없습니다.</strong><p>상태 필터를 바꾸거나 데이터를 다시 불러와 주세요.</p></div> : <>
           <header className="case-header"><div><div className="case-heading-line"><span className={`status-pill ${statusMeta[selected.status].tone}`}>{statusMeta[selected.status].label}</span><span className={`surface-label ${selected.surface}`}>{selected.surface === 'chat' ? '● 채팅형 문의' : '▤ 게시글형 문의'}</span><span className="case-id">{selected.id}</span></div><h2>{selected.product}</h2><p>{selected.channel} · 고객 {selected.customer}</p></div><button className="icon-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && window.open(selected.sourceUrl, '_blank', 'noopener,noreferrer')}>원문 열기 ↗</button></header>

@@ -69,10 +69,20 @@ assert.equal(caseObject.title, undefined);
 
 const messages = context.prepareMessages_(record, new Date("2026-08-25T01:01:00Z"));
 assert.equal(messages.length, 1);
-assert.match(messages[0].message_key, /^MSG:/);
+assert.match(messages[0].message_key, /^MSG2:/);
 assert.equal(messages[0].actor_type, "CUSTOMER");
 assert.equal(messages[0].message_text_masked, "8mm가 가능한가요?");
 assert.equal(messages[0].message_id, undefined);
+
+const repeated = context.prepareMessages_({
+  ...record,
+  messages: [
+    { source_message_id: '_msgId1', direction: 'customer', at: '오전 10:00', text: '네', image_count: 0 },
+    { source_message_id: '_msgId2', direction: 'customer', at: '오전 10:00', text: '네', image_count: 0 },
+  ],
+}, new Date('2026-08-25T01:01:00Z'));
+assert.equal(repeated.length, 2);
+assert.notEqual(repeated[0].message_key, repeated[1].message_key);
 
 assert.equal(context.mapReplyState_("NO_REPLY"), "NO_REPLY_REQUIRED");
 assert.equal(context.channelInfo_("zigzag", "item_question").channel, "상품 문의");

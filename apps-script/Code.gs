@@ -20,6 +20,7 @@ function doGet(e) {
 
     if (action === 'health') return json_(health_());
     if (action === 'overview') return json_(overview_());
+    if (action === 'dashboard') return json_(dashboard_(request));
     if (action === 'cases') return json_(listCases_(request));
     if (action === 'case') return json_(getCase_(request.case_key));
 
@@ -174,6 +175,7 @@ function syncRun_(request) {
 
   const runRows = buildRunRows_(report, runId, results, now);
   appendObjects_(runsSheet, runsTable, runRows);
+  invalidateReadCache_();
 
   return {
     ok: true,
@@ -247,26 +249,20 @@ function caseObjectFromRecord_(record, existing, changeState, draft, now) {
 function prepareMessages_(record, now) {
   const result = [];
   const input = [];
-  const signatures = {};
-  const pushUnique = function (message) {
-    const signature = [String(message.actor || ''), String(message.at || ''), String(message.text || ''), Number(message.image_count || 0)].join('|');
-    if (signatures[signature]) return;
-    signatures[signature] = true;
-    input.push(message);
-  };
-  (Array.isArray(record.messages) ? record.messages : []).forEach(function (message) {
-    pushUnique({ at: message.at, actor: message.direction, text: message.text, image_count: message.image_count });
+  (Array.isArray(record.messages) ? record.messages : []).forEach(function (message, index) {
+    input.push({ at: message.at, actor: message.direction, text: message.text, image_count: message.image_count, source_message_id: String(message.source_message_id || ('sequence-' + (index + 1))) });
   });
-  (Array.isArray(record.seller_replies) ? record.seller_replies : []).forEach(function (reply) {
-    pushUnique({ at: reply.at, actor: 'seller', text: reply.text, image_count: 0 });
+  (Array.isArray(record.seller_replies) ? record.seller_replies : []).forEach(function (reply, index) {
+    input.push({ at: reply.at, actor: 'seller', text: reply.text, image_count: 0, source_message_id: String(reply.source_message_id || ('seller-reply-' + (index + 1))) });
   });
 
   input.forEach(function (message, index) {
     const actor = mapActor_(message.actor);
     const text = String(message.text || '');
-    const contentHash = sha256_([record.source_key, index + 1, actor, message.at || '', text, Number(message.image_count || 0)].join('|'));
+    const sourceMessageId = String(message.source_message_id || ('sequence-' + (index + 1)));
+    const contentHash = sha256_([record.source_key, sourceMessageId, index + 1, actor, message.at || '', text, Number(message.image_count || 0)].join('|'));
     result.push({
-      message_key: 'MSG:' + String(record.source_key) + ':' + contentHash.slice(0, 20),
+      message_key: 'MSG2:' + String(record.source_key) + ':' + contentHash.slice(0, 20),
       record_type: 'LIVE',
       case_key: String(record.source_key),
       sequence: index + 1,
@@ -478,6 +474,10 @@ function appendObjects_(sheet, table, objects) {
 
 function overview_() {
   const cases = getObjects_(CS_SHEETS.CASES);
+  return overviewFromCases_(cases);
+}
+
+function overviewFromCases_(cases) {
   const live = cases.filter(function (row) { return row.record_type === 'LIVE'; });
   const count = function (field, value) {
     return live.filter(function (row) { return String(row[field] || '') === value; }).length;
@@ -503,10 +503,14 @@ function overview_() {
 }
 
 function listCases_(request) {
+  return listCasesFromRows_(getObjects_(CS_SHEETS.CASES), request);
+}
+
+function listCasesFromRows_(caseRows, request) {
   const limit = Math.min(Math.max(Number(request.limit || 50), 1), 200);
   const cursor = Math.max(Number(request.cursor || 0), 0);
   const filters = ['record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state'];
-  let rows = getObjects_(CS_SHEETS.CASES);
+  let rows = caseRows.slice();
 
   filters.forEach(function (field) {
     if (!request[field]) return;
@@ -537,6 +541,18 @@ function listCases_(request) {
   };
 }
 
+function dashboard_(request) {
+  const safeRequest = Object.assign({}, request, { limit: Math.min(Math.max(Number(request.limit || 50), 1), 100), cursor: 0 });
+  const cacheKey = dashboardCacheKey_(safeRequest);
+  const cached = readJsonCache_(cacheKey);
+  if (cached) return cached;
+  const cases = getObjects_(CS_SHEETS.CASES);
+  const listing = listCasesFromRows_(cases, safeRequest);
+  const payload = Object.assign({ ok: true, overview: overviewFromCases_(cases) }, listing);
+  writeJsonCache_(cacheKey, payload, 45);
+  return payload;
+}
+
 function getCase_(caseKey) {
   if (!caseKey) throw new Error('CASE_KEY_REQUIRED');
   const caseRow = getObjects_(CS_SHEETS.CASES).find(function (row) {
@@ -544,8 +560,10 @@ function getCase_(caseKey) {
   });
   if (!caseRow) throw new Error('CASE_NOT_FOUND');
 
-  const messages = getObjects_(CS_SHEETS.MESSAGES)
-    .filter(function (row) { return String(row.case_key) === String(caseKey); })
+  const allMessages = getObjects_(CS_SHEETS.MESSAGES)
+    .filter(function (row) { return String(row.case_key) === String(caseKey); });
+  const versionTwoMessages = allMessages.filter(function (row) { return String(row.message_key || '').indexOf('MSG2:') === 0; });
+  const messages = (versionTwoMessages.length ? versionTwoMessages : allMessages)
     .sort(function (a, b) { return Number(a.sequence || 0) - Number(b.sequence || 0); });
 
   const drafts = getObjects_(CS_SHEETS.DRAFTS)
@@ -596,6 +614,7 @@ function reviewDraft_(request) {
   if (caseRow && String(caseRow.values[caseData.headerMap.active_ai_draft_id] || '') === draftId) {
     caseSheet.getRange(caseRow.rowNumber, caseData.headerMap.ai_draft_state + 1).setValue(nextState);
   }
+  invalidateReadCache_();
 
   return {
     ok: true,
@@ -626,6 +645,24 @@ function getObjects_(sheetName) {
     });
     return result;
   });
+}
+
+function dashboardCacheKey_(request) {
+  const fields = ['record_type', 'market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit'];
+  const version = String(PropertiesService.getScriptProperties().getProperty('CS_READ_CACHE_VERSION') || '0');
+  return 'dashboard:' + version + ':' + fields.map(function (field) { return field + '=' + String(request[field] || ''); }).join('&');
+}
+
+function readJsonCache_(key) {
+  try { const value = CacheService.getScriptCache().get(key); return value ? JSON.parse(value) : null; } catch (error) { return null; }
+}
+
+function writeJsonCache_(key, payload, seconds) {
+  try { const value = JSON.stringify(payload); if (value.length <= 90000) CacheService.getScriptCache().put(key, value, seconds); } catch (error) {}
+}
+
+function invalidateReadCache_() {
+  PropertiesService.getScriptProperties().setProperty('CS_READ_CACHE_VERSION', String(Date.now()));
 }
 
 function readTable_(sheet) {
