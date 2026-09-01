@@ -102,7 +102,8 @@ test("a bound development D1 exposes only the local CS health route", async () =
     prepare() { return statement; },
     async batch<T>() { return [] as D1Result<T>[]; },
   };
-  const response = await worker.fetch(request("/api/cs/health"), bindings({ AI_CS_DB: database }));
+  const env = bindings({ AI_CS_DB: database, AI_CS_DEV_D1_SYNC_KEY: "development-d1-key" });
+  const response = await worker.fetch(request("/api/cs/health"), env);
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
     ok: true,
@@ -113,4 +114,18 @@ test("a bound development D1 exposes only the local CS health route", async () =
     auto_send: false,
     marketplace_write_actions: 0,
   });
+
+  const templateBody = JSON.stringify({
+    template_key: "qa-template", template_version: "v1", template_name: "QA template",
+    template_text: "Masked QA response.", required_checks: [],
+    environment: "development", auto_send: false, marketplace_write_actions: 0,
+  });
+  const denied = await worker.fetch(request("/api/cs/templates", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-CS-Sync-Key": "wrong" }, body: templateBody,
+  }), env);
+  assert.equal(denied.status, 401);
+  const accepted = await worker.fetch(request("/api/cs/templates", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-CS-Sync-Key": "development-d1-key" }, body: templateBody,
+  }), env);
+  assert.equal(accepted.status, 201);
 });

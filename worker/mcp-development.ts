@@ -9,6 +9,7 @@ export type WorkerBindings = {
   AI_CS_DEV_ALLOWED_SUBJECTS?: string;
   AI_CS_DEV_APPS_SCRIPT_URL?: string;
   AI_CS_DEV_APPS_SCRIPT_KEY?: string;
+  AI_CS_DEV_D1_SYNC_KEY?: string;
   AI_CS_DB?: CsD1Database;
   [name: string]: string | CsD1Database | undefined;
 };
@@ -94,7 +95,7 @@ function runtimeFor(env: WorkerBindings): Runtime {
     mcp: createAuthenticatedMcpHandler({ config }),
     csApi: env.AI_CS_DB ? createCsApiHandler({
       store: new CsStoreAdapter(new CsDataRepository(env.AI_CS_DB)),
-      syncKey: String(env.AI_CS_DEV_APPS_SCRIPT_KEY ?? ""),
+      syncKey: String(env.AI_CS_DEV_D1_SYNC_KEY ?? ""),
       allowedOrigins: [reviewOrigin, "http://localhost:3000", "http://127.0.0.1:3000"],
     }) : null,
   };
