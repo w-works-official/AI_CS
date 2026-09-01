@@ -54,6 +54,7 @@ const SESSION_CACHE_TTL = 5 * 60 * 1000;
 const DETAIL_CACHE_TTL = 2 * 60 * 1000;
 const DASHBOARD_CACHE_PREFIX = 'pinkrocket-cs-dashboard-v2:';
 const DETAIL_CACHE_PREFIX = 'pinkrocket-cs-detail-v2:';
+const D1_READ_API_BASE = 'https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs';
 const statusMeta: Record<CaseStatus, { label: string; shortLabel: string; tone: string; dot: string }> = {
   unanswered: { label: '미응답', shortLabel: '미응답', tone: 'status-red', dot: '#e24b4b' },
   'ai-ready': { label: 'AI 답변 준비', shortLabel: 'AI 준비', tone: 'status-purple', dot: '#7257d7' },
@@ -115,38 +116,38 @@ function riskLevel(value: unknown): '낮음' | '중간' | '높음' {
   return '낮음';
 }
 function baseCase(row: RawRow): CsCase {
-  const status = caseStatus(row); const scan = text(row.pii_scan).toUpperCase(); const rawPreview = text(row.preview);
+  const status = caseStatus(row); const scan = text(row.pii_scan).toUpperCase(); const rawPreview = text(row.preview ?? row.preview_masked);
   const sourceUrl = safeExternalUrl(row.source_url); const rawSourceUrlKind = text(row.source_url_kind).toUpperCase();
   const sourceUrlKind: SourceUrlKind = rawSourceUrlKind === 'EXACT' || rawSourceUrlKind === 'LIST' || rawSourceUrlKind === 'UNAVAILABLE'
     ? rawSourceUrlKind : (sourceUrl ? 'LIST' : 'UNAVAILABLE');
   return {
     id: text(row.case_key, 'CASE_KEY_MISSING'), channel: `${marketLabel(row.market)} · ${text(row.channel, '문의')}`,
     surface: text(row.ui_type).toUpperCase() === 'CHAT' ? 'chat' : 'post', customer: text(row.customer_masked, '고객정보 마스킹'),
-    category: text(row.category, '미분류'), product: text(row.product_name, text(row.subject, '상품정보 미수집')),
+    category: text(row.category ?? row.category_masked, '미분류'), product: text(row.product_name ?? row.product_name_masked, text(row.subject ?? row.subject_masked, '상품정보 미수집')),
     preview: rawPreview || '과거 이관 데이터 · 문의 본문 미수집', updatedAt: formatDate(row.last_changed_at ?? row.last_seen_at ?? row.last_message_at),
     updatedRaw: text(row.last_seen_at ?? row.last_changed_at ?? row.last_message_at), status, sourceUrl, sourceUrlKind,
-    sourceReference: text(row.source_reference), productUrl: safeExternalUrl(row.product_url), productId: text(row.product_id),
+    sourceReference: text(row.source_reference ?? row.source_reference_masked), productUrl: safeExternalUrl(row.product_url), productId: text(row.product_id),
     productThumbnailUrl: safeExternalUrl(row.product_thumbnail_url), imageCount: Math.max(0, Number(row.image_count ?? 0) || 0), bodyCollected: Boolean(rawPreview),
     alert: status === 'review' ? '수집 상태 또는 답변 여부 확인 필요' : (scan.includes('WARN') || scan.includes('FAIL') ? `개인정보 검사 ${text(row.pii_scan)}` : undefined),
-    postTitle: text(row.subject, text(row.category, '문의 내용')), messages: [],
+    postTitle: text(row.subject ?? row.subject_masked, text(row.category ?? row.category_masked, '문의 내용')), messages: [],
     actualReply: bool(row.human_reply_exists) ? { text: text(row.latest_human_reply_preview, '답변 존재 · 본문 미수집'), sentAt: formatDate(row.human_reply_at), verifiedAt: formatDate(row.last_seen_at) } : undefined,
   };
 }
 function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[]): CsCase {
   const item = baseCase(row);
   item.messages = messageRows.map((message): Message | null => {
-    const body = text(message.message_text_masked); if (!body) return null;
-    const actorRaw = text(message.actor_type).toUpperCase();
-    return { actor: actorRaw.includes('SELLER') || actorRaw.includes('ADMIN') ? 'seller' : 'customer', time: formatDate(message.message_at), text: body, image: Number(message.image_count ?? 0) > 0 };
+    const body = text(message.message_text_masked ?? message.text_masked); if (!body) return null;
+    const actorRaw = text(message.actor_type ?? message.actor).toUpperCase();
+    return { actor: actorRaw.includes('SELLER') || actorRaw.includes('ADMIN') ? 'seller' : 'customer', time: formatDate(message.message_at ?? message.sent_at), text: body, image: Number(message.image_count ?? 0) > 0 || bool(message.has_image) };
   }).filter((message): message is Message => message !== null);
   item.imageCount = Math.max(item.imageCount, messageRows.reduce((total, message) => total + Math.max(0, Number(message.image_count ?? 0) || 0), 0));
   if (!item.messages.length && item.bodyCollected) item.messages.push({ actor: 'customer', time: item.updatedAt, text: item.preview });
   if (item.actualReply && !item.messages.some((message) => message.actor === 'seller')) item.messages.push({ actor: 'seller', time: item.actualReply.sentAt, text: item.actualReply.text });
   const draft = draftRows.find((row) => ['READY', 'APPROVED', 'EVAL'].includes(text(row.draft_state).toUpperCase()));
-  if (draft && text(draft.draft_text)) {
+  if (draft && text(draft.draft_text ?? draft.draft_text_masked)) {
     const draftState = text(draft.draft_state).toUpperCase();
     item.draftId = text(draft.draft_id);
-    item.ai = { text: text(draft.draft_text), reason: draftReason(draft.required_checks), generatedAt: formatDate(draft.generated_at), risk: riskLevel(draft.pii_scan), mode: draftState === 'EVAL' ? 'eval' : 'reply' };
+    item.ai = { text: text(draft.draft_text ?? draft.draft_text_masked), reason: draftReason(draft.required_checks), generatedAt: formatDate(draft.generated_at ?? draft.created_at), risk: riskLevel(draft.pii_scan), mode: text(draft.purpose).toUpperCase() === 'EVAL' || draftState === 'EVAL' ? 'eval' : 'reply' };
   }
   const reviewedDraft = draftRows.find((row) => text(row.human_revision));
   if (reviewedDraft) item.humanRevision = { text: text(reviewedDraft.human_revision), state: text(reviewedDraft.draft_state, '검토됨'), reviewedAt: formatDate(reviewedDraft.reviewed_at) };
@@ -195,6 +196,34 @@ function readSessionCache<T>(key: string, maxAge: number): T | null {
 function writeSessionCache(key: string, value: unknown) {
   try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* A full/disabled cache must not block the review desk. */ }
 }
+
+function totalForFilter(filter: 'all' | CaseStatus, overview: Overview) {
+  if (filter === 'unanswered') return overview.needs_reply;
+  if (filter === 'ai-ready') return overview.ai_ready;
+  if (filter === 'review') return overview.review;
+  if (filter === 'no-reply') return overview.no_reply_required;
+  if (filter === 'replied') return overview.answered;
+  if (filter === 'closed') return overview.closed;
+  return overview.total_live;
+}
+
+function nativeDetail(payload: RawRow): DetailPayload {
+  const reviewRows = Array.isArray(payload.review_events) ? payload.review_events as RawRow[] : [];
+  const reviewByDraft = new Map(reviewRows.map((row) => [text(row.draft_id), row]));
+  const drafts = (Array.isArray(payload.drafts) ? payload.drafts as RawRow[] : []).map((draft) => {
+    const review = reviewByDraft.get(text(draft.draft_id));
+    return {
+      ...draft,
+      draft_text: draft.draft_text ?? draft.draft_text_masked,
+      generated_at: draft.generated_at ?? draft.created_at,
+      draft_state: review?.review_state ?? draft.draft_state ?? draft.state,
+      human_revision: review?.human_revision_masked ?? draft.human_revision,
+      reviewed_at: review?.created_at ?? draft.reviewed_at,
+      pii_scan: draft.pii_scan ?? 'PASS',
+    };
+  });
+  return { case: payload.case as RawRow | undefined, messages: payload.messages as RawRow[] | undefined, drafts };
+}
 function clearSessionCachePrefix(prefix: string) {
   try {
     for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
@@ -217,27 +246,34 @@ export default function Home() {
   const [totalCases, setTotalCases] = useState(0); const [detailEpoch, setDetailEpoch] = useState(0);
   const listRequestId = useRef(0); const detailRequestId = useRef(0); const detailCache = useRef(new Map<string, DetailSnapshot>());
 
-  const fetchCases = useCallback(async (filter: 'all' | CaseStatus, limit: number, cursor: number, signal?: AbortSignal, fresh = false) => {
-    const payload = await getJson(`/api/cs?action=cases&limit=${limit}&cursor=${cursor}${statusQuery(filter)}${fresh ? '&fresh=1' : ''}`, signal);
-    return { items: (payload.items as RawRow[]).map(baseCase), total: Number(payload.total ?? 0) };
+  const fetchCases = useCallback(async (filter: 'all' | CaseStatus, limit: number, cursor: number, signal?: AbortSignal) => {
+    const [payload, overviewPayload] = await Promise.all([
+      getJson(`${D1_READ_API_BASE}/cases?limit=${limit}&cursor=${cursor}${statusQuery(filter)}`, signal),
+      getJson(`${D1_READ_API_BASE}/overview`, signal),
+    ]);
+    const normalizedOverview = { ...EMPTY_OVERVIEW, ...overviewPayload } as Overview;
+    return { items: (payload.items as RawRow[]).map(baseCase), total: totalForFilter(filter, normalizedOverview) };
   }, []);
-  const fetchDashboard = useCallback(async (filter: 'all' | CaseStatus, signal?: AbortSignal, fresh = false) => {
-    const payload = await getJson(`/api/cs?action=dashboard&limit=${INITIAL_CASE_LIMIT}${statusQuery(filter)}${fresh ? `&fresh=1&t=${Date.now()}` : ''}`, signal);
-    const overviewPayload = (payload.overview ?? {}) as Record<string, unknown>;
+  const fetchDashboard = useCallback(async (filter: 'all' | CaseStatus, signal?: AbortSignal) => {
+    const [payload, overviewPayload] = await Promise.all([
+      getJson(`${D1_READ_API_BASE}/cases?limit=${INITIAL_CASE_LIMIT}${statusQuery(filter)}`, signal),
+      getJson(`${D1_READ_API_BASE}/overview`, signal),
+    ]);
+    const normalizedOverview = {
+      total_live: Number(overviewPayload.total_live ?? 0), needs_reply: Number(overviewPayload.needs_reply ?? 0), answered: Number(overviewPayload.answered ?? 0),
+      review: Number(overviewPayload.review ?? 0), no_reply_required: Number(overviewPayload.no_reply_required ?? 0), ai_ready: Number(overviewPayload.ai_ready ?? 0), closed: Number(overviewPayload.closed ?? 0),
+    } as Overview;
     return {
       items: sortCasesRecent(((payload.items ?? []) as RawRow[]).map(baseCase)),
-      total: Number(payload.total ?? 0),
-      overview: {
-        total_live: Number(overviewPayload.total_live ?? 0), needs_reply: Number(overviewPayload.needs_reply ?? 0), answered: Number(overviewPayload.answered ?? 0),
-        review: Number(overviewPayload.review ?? 0), no_reply_required: Number(overviewPayload.no_reply_required ?? 0), ai_ready: Number(overviewPayload.ai_ready ?? 0), closed: Number(overviewPayload.closed ?? 0),
-      } as Overview,
+      total: totalForFilter(filter, normalizedOverview),
+      overview: normalizedOverview,
       environment: ['development', 'production'].includes(text(payload.environment)) ? text(payload.environment) as EnvironmentName : 'unconfigured' as EnvironmentName,
     };
   }, []);
   const refresh = useCallback(async () => {
     const requestId = ++listRequestId.current; setLoading(true); setLoadingMore(false); setError(''); setFreshness('refreshing');
     try {
-      const next = await fetchDashboard(activeFilter, undefined, true);
+      const next = await fetchDashboard(activeFilter);
       if (requestId !== listRequestId.current) return;
       setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setEditor('');
       setFreshness('fresh');
@@ -261,7 +297,7 @@ export default function Home() {
         setSelectedId((current) => cached.cases.some((item) => item.id === current) ? current : (cached.cases[0]?.id ?? ''));
       });
     }
-    fetchDashboard(activeFilter, controller.signal, true)
+    fetchDashboard(activeFilter, controller.signal)
       .then((next) => {
         if (requestId !== listRequestId.current) return;
         setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment);
@@ -296,14 +332,7 @@ export default function Home() {
     const batchKeys = [selectedId, ...cases.slice(selectedIndex + 1, selectedIndex + 3).map((item) => item.id)]
       .filter((id, index, all) => id && all.indexOf(id) === index)
       .slice(0, 3);
-    const freshDetail = detailEpoch > 0 ? '&fresh=1' : '';
-    const loadBatch = () => getJson(`/api/cs?action=caseBatch&case_keys=${encodeURIComponent(batchKeys.join(','))}${freshDetail}`, controller.signal)
-      .then((payload) => (payload.items ?? []) as DetailPayload[])
-      .catch(async (cause) => {
-        if (!(cause instanceof Error) || !/UNKNOWN_ACTION|CASE_KEYS/.test(cause.message)) throw cause;
-        const payload = await getJson(`/api/cs?action=case&case_key=${encodeURIComponent(selectedId)}`, controller.signal);
-        return [payload as DetailPayload];
-      });
+    const loadBatch = () => Promise.all(batchKeys.map((caseKey) => getJson(`${D1_READ_API_BASE}/cases/${encodeURIComponent(caseKey)}`, controller.signal).then(nativeDetail)));
     loadBatch()
       .then((payloadItems) => {
         const hydratedItems = payloadItems.map(hydrateDetailPayload).filter((item): item is CsCase => item !== null);
