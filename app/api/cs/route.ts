@@ -38,11 +38,10 @@ function d1Target() {
 
 function d1ReviewTarget() {
   if (process.env.AI_CS_WEB_ENVIRONMENT === 'production') return null;
-  // The development Worker intentionally reuses the same server-side Apps Script
-  // key for its narrow D1 write routes. Sites already stores this value as a
-  // hidden secret, so no second credential or client-visible configuration is
-  // needed for the review-desk vertical slice.
-  const syncKey = process.env.AI_CS_DEV_D1_SYNC_KEY ?? process.env.MARKETPLACE_CS_SYNC_KEY;
+  // Sites cannot call a public workers.dev Worker server-to-server. Keep this
+  // opt-in for non-Sites runtimes; Sites falls back to its existing Apps Script
+  // review path without exposing a credential to the browser.
+  const syncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
   if (!syncKey) return null;
   try {
     const endpoint = new URL(DEFAULT_D1_API_URL);

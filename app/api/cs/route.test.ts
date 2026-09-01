@@ -125,14 +125,14 @@ test('POST retains the existing server-side Apps Script review path', async () =
   }
 });
 
-test('POST uses the development Worker PATCH review route with the existing hidden development sync key', async () => {
+test('POST uses the development Worker PATCH review route only with the explicit D1 sync key', async () => {
   const previousFetch = globalThis.fetch;
   const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
   const previousMarketplaceSyncKey = process.env.MARKETPLACE_CS_SYNC_KEY;
   const previousD1Url = process.env.AI_CS_D1_API_URL;
   const captured: { url?: string; method?: string; syncKey?: string | null; body?: Record<string, unknown> } = {};
-  delete process.env.AI_CS_DEV_D1_SYNC_KEY;
-  process.env.MARKETPLACE_CS_SYNC_KEY = 'worker-test-sync-key';
+  process.env.AI_CS_DEV_D1_SYNC_KEY = 'worker-test-sync-key';
+  delete process.env.MARKETPLACE_CS_SYNC_KEY;
   process.env.AI_CS_D1_API_URL = 'https://worker.example/api/cs';
   globalThis.fetch = async (input, init) => {
     captured.url = new URL(input instanceof Request ? input.url : String(input)).href;
