@@ -38,6 +38,7 @@ function d1Target() {
 
 function d1ReviewTarget() {
   if (process.env.AI_CS_WEB_ENVIRONMENT === 'production') return null;
+  if (process.env.AI_CS_ENABLE_D1_REVIEW !== 'true') return null;
   // Sites cannot call a public workers.dev Worker server-to-server. Keep this
   // opt-in for non-Sites runtimes; Sites falls back to its existing Apps Script
   // review path without exposing a credential to the browser.

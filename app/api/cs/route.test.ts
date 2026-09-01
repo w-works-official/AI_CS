@@ -86,12 +86,14 @@ test('POST retains the existing server-side Apps Script review path', async () =
   const previousUrl = process.env.AI_CS_DEV_APPS_SCRIPT_URL;
   const previousKey = process.env.AI_CS_DEV_APPS_SCRIPT_KEY;
   const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
+  const previousD1ReviewEnabled = process.env.AI_CS_ENABLE_D1_REVIEW;
   const previousMarketplaceSyncKey = process.env.MARKETPLACE_CS_SYNC_KEY;
   const captured: { upstream?: string; body?: string } = {};
   process.env.AI_CS_WEB_ENVIRONMENT = 'development';
   process.env.AI_CS_DEV_APPS_SCRIPT_URL = 'https://script.example/exec';
   process.env.AI_CS_DEV_APPS_SCRIPT_KEY = 'apps-script-only-test-key';
   delete process.env.AI_CS_DEV_D1_SYNC_KEY;
+  delete process.env.AI_CS_ENABLE_D1_REVIEW;
   delete process.env.MARKETPLACE_CS_SYNC_KEY;
   globalThis.fetch = async (input, init) => {
     captured.upstream = new URL(input instanceof Request ? input.url : String(input)).href;
@@ -121,6 +123,7 @@ test('POST retains the existing server-side Apps Script review path', async () =
     if (previousUrl === undefined) delete process.env.AI_CS_DEV_APPS_SCRIPT_URL; else process.env.AI_CS_DEV_APPS_SCRIPT_URL = previousUrl;
     if (previousKey === undefined) delete process.env.AI_CS_DEV_APPS_SCRIPT_KEY; else process.env.AI_CS_DEV_APPS_SCRIPT_KEY = previousKey;
     if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
+    if (previousD1ReviewEnabled === undefined) delete process.env.AI_CS_ENABLE_D1_REVIEW; else process.env.AI_CS_ENABLE_D1_REVIEW = previousD1ReviewEnabled;
     if (previousMarketplaceSyncKey === undefined) delete process.env.MARKETPLACE_CS_SYNC_KEY; else process.env.MARKETPLACE_CS_SYNC_KEY = previousMarketplaceSyncKey;
   }
 });
@@ -128,10 +131,12 @@ test('POST retains the existing server-side Apps Script review path', async () =
 test('POST uses the development Worker PATCH review route only with the explicit D1 sync key', async () => {
   const previousFetch = globalThis.fetch;
   const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
+  const previousD1ReviewEnabled = process.env.AI_CS_ENABLE_D1_REVIEW;
   const previousMarketplaceSyncKey = process.env.MARKETPLACE_CS_SYNC_KEY;
   const previousD1Url = process.env.AI_CS_D1_API_URL;
   const captured: { url?: string; method?: string; syncKey?: string | null; body?: Record<string, unknown> } = {};
   process.env.AI_CS_DEV_D1_SYNC_KEY = 'worker-test-sync-key';
+  process.env.AI_CS_ENABLE_D1_REVIEW = 'true';
   delete process.env.MARKETPLACE_CS_SYNC_KEY;
   process.env.AI_CS_D1_API_URL = 'https://worker.example/api/cs';
   globalThis.fetch = async (input, init) => {
@@ -161,6 +166,7 @@ test('POST uses the development Worker PATCH review route only with the explicit
   } finally {
     globalThis.fetch = previousFetch;
     if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
+    if (previousD1ReviewEnabled === undefined) delete process.env.AI_CS_ENABLE_D1_REVIEW; else process.env.AI_CS_ENABLE_D1_REVIEW = previousD1ReviewEnabled;
     if (previousMarketplaceSyncKey === undefined) delete process.env.MARKETPLACE_CS_SYNC_KEY; else process.env.MARKETPLACE_CS_SYNC_KEY = previousMarketplaceSyncKey;
     if (previousD1Url === undefined) delete process.env.AI_CS_D1_API_URL; else process.env.AI_CS_D1_API_URL = previousD1Url;
   }
