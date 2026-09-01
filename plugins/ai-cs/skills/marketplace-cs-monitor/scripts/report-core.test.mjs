@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { applyAiDrafts, buildReport, normalizeMarketplaceUrl } from "./report-core.mjs";
+import { applyAiDrafts, applyDraftDecisions, buildReport, normalizeMarketplaceUrl } from "./report-core.mjs";
 import { selectDraftCandidates } from "./ai-draft-core.mjs";
+import { isCustomerAcknowledgement } from "./conversation-policy.mjs";
 
 const base = {
   mode: "changes_today",
@@ -26,7 +27,7 @@ const base = {
     zigzag_item_question: { market: "zigzag", channel: "item_question", attempted: true, visible_total: 0, records: [] },
     ably_inquiry: {
       market: "ably", channel: "inquiry", attempted: true, visible_total: 1,
-      records: [{ room_id: "95162904", status: "진행중", customer_name: "혜진", occurred_at: "2026-08-25 10:02", messages: [{ direction: "seller", text: "확인했습니다" }, { direction: "customer", text: "감사합니다" }] }],
+      records: [{ room_id: "95162904", status: "진행중", customer_name: "혜진", occurred_at: "2026-08-25 10:02", conversation_complete: true, messages: [{ direction: "seller", text: "확인했습니다" }, { direction: "customer", text: "감사합니다" }] }],
     },
   },
 };
@@ -45,6 +46,54 @@ assert.equal(first.channels.zigzag_order_inquiry.open_queue_complete, true);
 assert.equal(first.channels.zigzag_order_inquiry.open_queue_source_keys.length, 1);
 assert.match(first.channels.zigzag_order_inquiry.open_queue_source_keys[0], /^zigzag:order_inquiry:/);
 assert.equal(JSON.stringify(first).includes("23423568"), false);
+
+assert.equal(isCustomerAcknowledgement("네네 감사합니다~!"), true);
+assert.equal(isCustomerAcknowledgement("네에 감사합니다아"), true);
+assert.equal(isCustomerAcknowledgement("감사합니다. 그런데 배송은 언제 오나요?"), false);
+const acknowledgementInput = structuredClone(base);
+acknowledgementInput.channels.smartstore_talktalk = {
+  market: "smartstore", channel: "talktalk", attempted: true, visible_total: 3,
+  records: [
+    { thread_id: "ack-one", status: "진행중", conversation_complete: true, messages: [{ direction: "seller", text: "안내드렸습니다." }, { direction: "customer", text: "네네 감사합니다~!" }] },
+    { thread_id: "ack-two", status: "진행중", conversation_complete: true, messages: [{ direction: "seller", text: "안내드렸습니다." }, { direction: "customer", text: "네에 감사합니다아" }] },
+    { thread_id: "question-after-thanks", status: "진행중", conversation_complete: true, messages: [{ direction: "seller", text: "안내드렸습니다." }, { direction: "customer", text: "감사합니다. 그런데 배송은 언제 오나요?" }] },
+  ],
+};
+const acknowledgementReport = buildReport(acknowledgementInput, []);
+assert.equal(acknowledgementReport.records.find((row) => row.messages.at(-1)?.text === "네네 감사합니다~!")?.reply_state, "NO_REPLY");
+assert.equal(acknowledgementReport.records.find((row) => row.messages.at(-1)?.text === "네에 감사합니다아")?.reply_state, "NO_REPLY");
+assert.equal(acknowledgementReport.records.find((row) => row.messages.at(-1)?.text.includes("배송은 언제"))?.reply_state, "NEEDS_REPLY");
+const incompleteChatInput = structuredClone(base);
+incompleteChatInput.channels.smartstore_talktalk = {
+  market: "smartstore", channel: "talktalk", attempted: true, visible_total: 1,
+  records: [{ thread_id: "completeness-missing", status: "진행중", messages: [{ direction: "customer", text: "배송은 언제 오나요?" }] }],
+};
+const incompleteChatReport = buildReport(incompleteChatInput, []);
+assert.equal(incompleteChatReport.records.find((row) => row.channel === "talktalk")?.reply_state, "REVIEW");
+
+const unsafeQueueInput = structuredClone(base);
+unsafeQueueInput.channels.zigzag_order_inquiry = {
+  market: "zigzag", channel: "order_inquiry", attempted: false, visible_total: 0,
+  error: "SELECTOR_FAILURE", records: [], open_queue_complete: true,
+  open_queue_visible_total: 0, open_queue_records: [], open_queue_scope: "", open_queue_window_start: "",
+};
+const unsafeQueueReport = buildReport(unsafeQueueInput, []);
+assert.equal(unsafeQueueReport.channels.zigzag_order_inquiry.open_queue_complete, false);
+assert.match(unsafeQueueReport.channels.zigzag_order_inquiry.open_queue_error, /OPEN_QUEUE_NOT_RECONCILABLE/);
+assert.equal(unsafeQueueReport.summary.reconciled_channel_count, 0);
+const decisionTarget = first.records.find((row) => row.reply_state === "NEEDS_REPLY");
+const decisionHash = decisionTarget.content_hash;
+const withDecision = applyDraftDecisions(first, [{
+  source_key: decisionTarget.source_key,
+  purpose: "REPLY",
+  decision: "SKIP",
+  reason_code: "IMAGE_REVIEW_REQUIRED",
+  required_checks: ["첨부 이미지 원문 확인"],
+}]);
+assert.equal(withDecision.summary.draft_decision_count, 1);
+assert.equal(withDecision.summary.draft_skipped_count, 1);
+assert.equal(withDecision.records.find((row) => row.source_key === decisionTarget.source_key).content_hash, decisionHash);
+assert.equal(withDecision.draft_decisions[0].reason_code, "IMAGE_REVIEW_REQUIRED");
 
 assert.equal(
   normalizeMarketplaceUrl("https://talk.naver.com/ct/example?filter.read=unread"),
@@ -81,7 +130,8 @@ assert.equal(linkedRecord.conversation_complete, true);
 const legacyCompletenessInput = structuredClone(linkedTalktalkInput);
 delete legacyCompletenessInput.channels.smartstore_talktalk.records[0].conversation_complete;
 const legacyCompletenessRecord = buildReport(legacyCompletenessInput, []).records.find((row) => row.channel === "talktalk");
-assert.equal(linkedRecord.content_hash, legacyCompletenessRecord.content_hash);
+assert.notEqual(linkedRecord.content_hash, legacyCompletenessRecord.content_hash);
+assert.equal(legacyCompletenessRecord.reply_state, "REVIEW");
 
 const incompleteTalktalkInput = structuredClone(linkedTalktalkInput);
 incompleteTalktalkInput.channels.smartstore_talktalk.records[0].conversation_complete = false;
@@ -246,6 +296,7 @@ ablyCompleted.channels.ably_inquiry.records = [{
   status: "완료",
   customer_name: "혜진",
   occurred_at: "2026-08-25 11:00",
+  conversation_complete: true,
   messages: [{ direction: "customer", text: "전체 취소 철회가 가능한가요? 상품 주문번호 648997240" }],
   last_actor: "customer",
 }];

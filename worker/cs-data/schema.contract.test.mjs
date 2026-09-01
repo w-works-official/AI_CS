@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const schemaPath = fileURLToPath(new URL("./migrations/0001_initial.sql", import.meta.url));
+const diagnosticsPath = fileURLToPath(new URL("./migrations/0002_draft_decision_diagnostics.sql", import.meta.url));
 const schema = (await readFile(schemaPath, "utf8")).replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
 
 function createTable(name) {
@@ -17,6 +18,27 @@ test("migration executes in the local SQLite engine used for D1-compatible check
   const database = new DatabaseSync(":memory:");
   try {
     database.exec(await readFile(schemaPath, "utf8"));
+    database.exec(await readFile(diagnosticsPath, "utf8"));
+  } finally {
+    database.close();
+  }
+});
+
+test("draft decision diagnostics migration adds required checks without rebuilding stored decisions", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(await readFile(schemaPath, "utf8"));
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.prepare(`INSERT INTO draft_decisions
+      (decision_id, run_id, case_key, purpose, source_content_hash, decision, reason_code, draft_id, created_at)
+      VALUES (?, ?, ?, 'REPLY', ?, 'SKIP', ?, NULL, ?)`)
+      .run("decision-existing", "run-existing", "case-existing", "a".repeat(64), "NO_REPLY_REQUIRED", "2026-09-01T00:00:00.000Z");
+    database.exec(await readFile(diagnosticsPath, "utf8"));
+    const columns = database.prepare("PRAGMA table_info(draft_decisions)").all();
+    assert.equal(columns.some((column) => column.name === "required_checks_json"), true);
+    const preserved = database.prepare("SELECT decision_id, required_checks_json FROM draft_decisions WHERE decision_id = ?").get("decision-existing");
+    assert.equal(preserved.decision_id, "decision-existing");
+    assert.equal(preserved.required_checks_json, "[]");
   } finally {
     database.close();
   }

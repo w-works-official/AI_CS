@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isCustomerAcknowledgement } from "./conversation-policy.mjs";
 
 const CHANNEL_KEYS = [
   "smartstore_comments",
@@ -96,6 +97,10 @@ function contentHashForRecord(record) {
     "ai_draft_purpose",
     "ai_draft_required_checks",
     "ai_draft_pii_scan",
+    "ai_draft_decision",
+    "ai_draft_decision_purpose",
+    "ai_draft_reason_code",
+    "ai_draft_decision_checks",
   ]) {
     delete material[field];
   }
@@ -176,14 +181,9 @@ function sourceKeyForRaw(market, channel, record) {
   return `${market}:${channel}:${sha256(sourceId).slice(0, 24)}`;
 }
 
-function isAcknowledgement(text) {
-  const value = compact(text).replace(/[.!~♡♥️😊🙂]+/g, "");
-  return /^(네|넵|네네|넹|예|확인|확인했습니다|알겠습니다|감사|감사합니다|고맙습니다|아하|아 네|좋아요)$/.test(value);
-}
-
 function inferReplyState(status, lastActor, lastMessage) {
   const state = compact(status);
-  if (lastActor === "customer" && isAcknowledgement(lastMessage)) return "NO_REPLY";
+  if (lastActor === "customer" && isCustomerAcknowledgement(lastMessage)) return "NO_REPLY";
   if (lastActor === "customer") return "NEEDS_REPLY";
   if (lastActor === "seller") return "ANSWERED";
   if (/답변완료|완료|종료/.test(state)) return "ANSWERED";
@@ -246,7 +246,8 @@ function normalizeRecord(market, channel, raw) {
   const inferredReplyState = market === "ably" && /완료|종료/.test(compact(raw.status))
     ? (lastActor === "seller" ? "ANSWERED" : "NO_REPLY")
     : inferReplyState(raw.status, lastActor, lastMessage?.text ?? raw.last_message ?? "");
-  const replyState = conversation.complete === false ? "REVIEW" : inferredReplyState;
+  const isChat = channel === "talktalk" || channel === "inquiry" || compact(raw.ui_type ?? raw.conversation_type).toUpperCase() === "CHAT";
+  const replyState = isChat && conversation.complete !== true ? "REVIEW" : inferredReplyState;
   const aiDraft = maskSensitiveText(raw.ai_draft);
   const requestedDraftPurpose = compact(raw.ai_draft_purpose).toUpperCase();
   const aiDraftPurpose = aiDraft
@@ -329,10 +330,20 @@ export function buildReport(rawCollection, previousRecords = []) {
       throw new Error(`OPEN_QUEUE_DUPLICATE_SOURCE_KEY:${key}`);
     }
     const openQueueVisibleTotal = Number(source.open_queue_visible_total ?? uniqueOpenQueueKeys.length) || 0;
-    const openQueueComplete = Boolean(source.open_queue_complete);
-    if (openQueueComplete && openQueueVisibleTotal !== uniqueOpenQueueKeys.length) {
+    const requestedOpenQueueComplete = Boolean(source.open_queue_complete);
+    if (requestedOpenQueueComplete && openQueueVisibleTotal !== uniqueOpenQueueKeys.length) {
       throw new Error(`OPEN_QUEUE_TOTAL_MISMATCH:${key}:${openQueueVisibleTotal}:${uniqueOpenQueueKeys.length}`);
     }
+    const queueBlockers = [];
+    if (!source.attempted) queueBlockers.push("CHANNEL_NOT_ATTEMPTED");
+    if (compact(source.error)) queueBlockers.push("CHANNEL_ERROR");
+    if (compact(source.open_queue_error)) queueBlockers.push("QUEUE_ERROR");
+    if (!compact(source.open_queue_scope)) queueBlockers.push("SCOPE_MISSING");
+    if (!compact(source.open_queue_window_start)) queueBlockers.push("WINDOW_MISSING");
+    const openQueueComplete = requestedOpenQueueComplete && queueBlockers.length === 0;
+    const openQueueError = compact(source.open_queue_error)
+      || (requestedOpenQueueComplete && queueBlockers.length ? `OPEN_QUEUE_NOT_RECONCILABLE:${queueBlockers.join("+")}` : "")
+      || (!requestedOpenQueueComplete && source.attempted ? "OPEN_QUEUE_INCOMPLETE" : "");
     channelReports[key] = {
       market,
       channel,
@@ -354,7 +365,7 @@ export function buildReport(rawCollection, previousRecords = []) {
       open_queue_visible_total: openQueueVisibleTotal,
       open_queue_observed_count: uniqueOpenQueueKeys.length,
       open_queue_source_keys: uniqueOpenQueueKeys,
-      open_queue_error: compact(source.open_queue_error),
+      open_queue_error: openQueueError,
     };
   }
 
@@ -433,6 +444,50 @@ export function applyAiDrafts(report, drafts = []) {
   if (draftByKey.size) throw new Error(`AI_DRAFT_CASE_NOT_FOUND:${[...draftByKey.keys()][0]}`);
   next.summary.reply_draft_count = next.records.filter((row) => row.ai_draft_purpose === "REPLY").length;
   next.summary.eval_draft_count = next.records.filter((row) => row.ai_draft_purpose === "EVAL").length;
+  return next;
+}
+
+export function applyDraftDecisions(report, decisions = []) {
+  if (!report || Number(report.schema_version) !== 1 || !Array.isArray(report.records)) {
+    throw new Error("INVALID_REPORT_SCHEMA");
+  }
+  const next = structuredClone(report);
+  const recordByKey = new Map(next.records.map((record) => [record.source_key, record]));
+  const seen = new Set();
+  next.draft_decisions = (decisions ?? []).map((decision) => {
+    const sourceKey = compact(decision?.source_key);
+    const purpose = compact(decision?.purpose).toUpperCase();
+    const action = compact(decision?.decision).toUpperCase();
+    const reasonCode = compact(decision?.reason_code).toUpperCase();
+    const record = recordByKey.get(sourceKey);
+    if (!record) throw new Error(`DRAFT_DECISION_CASE_NOT_FOUND:${sourceKey}`);
+    if (!["REPLY", "EVAL"].includes(purpose)) throw new Error(`DRAFT_DECISION_PURPOSE_INVALID:${sourceKey}`);
+    if (!["GENERATE", "SKIP"].includes(action)) throw new Error(`DRAFT_DECISION_INVALID:${sourceKey}`);
+    if (!/^[A-Z][A-Z0-9_]{1,99}$/.test(reasonCode)) throw new Error(`DRAFT_DECISION_REASON_INVALID:${sourceKey}`);
+    const identity = sourceKey;
+    if (seen.has(identity)) throw new Error(`DUPLICATE_DRAFT_DECISION:${identity}`);
+    seen.add(identity);
+    const checks = [...new Set((decision?.required_checks ?? []).map(compact).filter(Boolean))]
+      .map((value) => maskSensitiveText(value));
+    record.ai_draft_decision = action;
+    record.ai_draft_decision_purpose = purpose;
+    record.ai_draft_reason_code = reasonCode;
+    record.ai_draft_decision_checks = checks;
+    return {
+      source_key: sourceKey,
+      source_content_hash: record.content_hash,
+      purpose,
+      decision: action,
+      reason_code: reasonCode,
+      required_checks: checks,
+    };
+  });
+  next.summary.draft_decision_count = next.draft_decisions.length;
+  next.summary.draft_generated_count = next.draft_decisions.filter((item) => item.decision === "GENERATE").length;
+  next.summary.draft_skipped_count = next.draft_decisions.filter((item) => item.decision === "SKIP").length;
+  next.summary.draft_skip_reason_counts = next.draft_decisions
+    .filter((item) => item.decision === "SKIP")
+    .reduce((counts, item) => ({ ...counts, [item.reason_code]: Number(counts[item.reason_code] ?? 0) + 1 }), {});
   return next;
 }
 

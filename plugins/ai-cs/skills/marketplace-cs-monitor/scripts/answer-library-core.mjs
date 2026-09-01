@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { maskSensitiveText } from "./report-core.mjs";
+import { isCustomerAcknowledgement } from "./conversation-policy.mjs";
 
 export const ANSWER_LIBRARY_HEADERS = [
   "example_id",
@@ -32,11 +33,6 @@ const STOPWORDS = new Set([
   "다른", "언제든지", "말씀해주세요", "좋은", "하루", "이용해주셔서", "관련", "현재", "가능", "합니다",
 ]);
 
-function isAcknowledgement(value) {
-  const text = compact(value).replace(/[.!~♡♥️😊🙂]+/g, "");
-  return /^(네|넵|네네|넹|예|확인|확인했습니다|알겠습니다|감사|감사합니다|고맙습니다|아하|아 네|좋아요)$/.test(text);
-}
-
 function hasUnmaskedPii(value) {
   const text = compact(value);
   return /\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(text)
@@ -49,7 +45,7 @@ function hasUnmaskedPii(value) {
 
 function isGenericAnswer(value) {
   const text = compact(value);
-  if (text.length < 10 || isAcknowledgement(text)) return true;
+  if (text.length < 10 || isCustomerAcknowledgement(text)) return true;
   return /^(안녕하세요\s*)?(확인|처리|전달)(했습니다|하겠습니다|드리겠습니다)?[.!~ ]*$/.test(text)
     || /어떤\s*(제품|상품).*말씀하시는걸까요/.test(text)
     || /제품명.*(?:알려|말씀).*주세요/.test(text);
@@ -108,7 +104,7 @@ function deriveQuestionAndAnswer(record) {
   const messages = Array.isArray(record?.messages) ? record.messages : [];
   const replies = Array.isArray(record?.seller_replies) ? record.seller_replies : [];
   const customerIndexes = messages
-    .map((message, index) => message?.direction === "customer" && !isAcknowledgement(message?.text) ? index : -1)
+    .map((message, index) => message?.direction === "customer" && !isCustomerAcknowledgement(message?.text) ? index : -1)
     .filter((index) => index >= 0);
   const lastCustomerIndex = customerIndexes.at(-1) ?? -1;
   const customerMessage = lastCustomerIndex >= 0 ? messages[lastCustomerIndex] : null;
@@ -138,7 +134,7 @@ export function buildAnswerLibrary(records, { verifiedAt = new Date().toISOStrin
   for (const record of records ?? []) {
     if (record?.reply_state !== "ANSWERED" || record?.pii_scan !== "PASS") continue;
     const pair = deriveQuestionAndAnswer(record);
-    if (!pair?.question || !pair?.answer || isAcknowledgement(pair.question) || isGenericAnswer(pair.answer)) continue;
+    if (!pair?.question || !pair?.answer || isCustomerAcknowledgement(pair.question) || isGenericAnswer(pair.answer)) continue;
 
     const question = maskSensitiveText(pair.question);
     const answer = maskSensitiveText(pair.answer);

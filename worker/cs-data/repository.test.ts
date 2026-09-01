@@ -66,26 +66,36 @@ function input(): SyncRunInput {
       { message_key: "MSG:case-1:seller", case_key: caseRow.case_key, sequence: 2, actor: "SELLER", text_masked: "확인 중입니다", sent_at: time, has_image: false, image_count: 0, content_hash: "c".repeat(64) },
     ],
     drafts: [{ draft_id: "DRAFT:case-1", case_key: caseRow.case_key, purpose: "REPLY", draft_text_masked: "확인 후 안내드리겠습니다.", intent: "DELIVERY", required_checks: "송장 확인", reference_ids: ["answer-1"], source_content_hash: caseRow.content_hash, source_customer_message_key: "MSG:case-1:customer", source_seller_message_key: null, generation_version: "v1", created_at: time, created_run_id: "SYNC:case-1" }],
-    decisions: [{ decision_id: "DECISION:case-1", run_id: "SYNC:case-1", case_key: caseRow.case_key, purpose: "REPLY", source_content_hash: caseRow.content_hash, decision: "GENERATE", reason_code: "ELIGIBLE", draft_id: "DRAFT:case-1", created_at: time }],
+    decisions: [{ decision_id: "DECISION:case-1", run_id: "SYNC:case-1", case_key: caseRow.case_key, purpose: "REPLY", source_content_hash: caseRow.content_hash, decision: "GENERATE", reason_code: "ELIGIBLE", required_checks: ["송장 확인"], draft_id: "DRAFT:case-1", created_at: time }],
   };
 }
 async function repository(): Promise<{ db: SqliteD1; store: CsDataRepository }> {
   const db = new SqliteD1();
-  const schemaPath = fileURLToPath(new URL("./migrations/0001_initial.sql", import.meta.url));
-  db.database.exec(await readFile(schemaPath, "utf8"));
+  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql"]) {
+    const schemaPath = fileURLToPath(new URL(`./migrations/${migration}`, import.meta.url));
+    db.database.exec(await readFile(schemaPath, "utf8"));
+  }
   return { db, store: new CsDataRepository(db) };
 }
 
-test("actual 0001 migration accepts repository sync, detail, overview, and cursor queries", async () => {
+test("actual migrations accept repository sync, detail, overview, and cursor queries", async () => {
   const { db, store } = await repository();
   try {
     assert.deepEqual(await store.health(), { ok: true, service: "ai-cs-d1-repository", schema_version: "v1", write_policy: "MASKED_DTO_ONLY" });
     assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: false, inserted_cases: 1, updated_cases: 0, inserted_messages: 2, inserted_drafts: 1 });
-    assert.deepEqual(await store.overview(), { total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, by_market: { SMARTSTORE: 1 } });
+    assert.deepEqual(await store.overview(), {
+      total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, closed: 0,
+      by_market: { SMARTSTORE: 1 },
+      latest_sync: { run_id: "SYNC:case-1", status: "COMPLETED", started_at: "2026-09-01T09:59:00.000Z", finished_at: time, collected_count: 1, new_count: 1, changed_count: 0, unchanged_count: 0, draft_created_count: 1, pii_rejected_count: 0, error_count: 0 },
+    });
     const list = await store.listCases({ limit: 1, cursor: 0, filters: { market: "SMARTSTORE", ai_draft_state: "READY" } });
     assert.equal(list.items[0].case_key, caseRow.case_key); assert.equal(list.next_cursor, null);
     const detail = await store.getCase(caseRow.case_key);
     assert.equal(detail?.messages.length, 2); assert.equal(detail?.drafts.length, 1); assert.equal(detail?.decisions.length, 1);
+    assert.equal(detail?.decisions[0].required_checks_json, '["송장 확인"]');
+    db.database.prepare("UPDATE cs_cases SET reply_state = 'NO_REPLY' WHERE case_key = ?").run(caseRow.case_key);
+    const noReply = await store.listCases({ filters: { reply_state: "NO_REPLY_REQUIRED" } });
+    assert.equal(noReply.items[0].case_key, caseRow.case_key);
   } finally { db.close(); }
 });
 

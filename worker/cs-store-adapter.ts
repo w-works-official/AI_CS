@@ -1,6 +1,6 @@
 import { CsApiError, type CaseListQuery, type CsStore, type JsonObject, type ReviewDraftInput, type SyncRunInput as ApiSyncRunInput, type UpsertDraftInput } from "./cs-api.ts";
 import type { CsDataRepository } from "./cs-data/repository.ts";
-import type { Actor, CsCaseInput, CsMessageInput, DraftInput, DraftReviewInput, ReplyState, SyncRunInput } from "./cs-data/types.ts";
+import type { Actor, CsCaseInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, ReplyState, SyncRunInput } from "./cs-data/types.ts";
 
 type RepositoryPort = Pick<CsDataRepository, "health" | "overview" | "listCases" | "getCase" | "syncRun" | "upsertDraft" | "reviewReplyDraft">;
 
@@ -82,6 +82,11 @@ function assertMaskedRecord(record: JsonObject): void {
     if (/^\d{10,}$/.test(text(record[key], 300))) throw new CsApiError("UNMASKED_LONG_NUMBER", 400);
   }
   if (text(record.pii_scan, 20).toUpperCase() !== "PASS") throw new CsApiError("PII_SCAN_PASS_REQUIRED", 400);
+}
+
+function assertNoPlainContact(value: string): void {
+  if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(value)) throw new CsApiError("UNMASKED_PHONE", 400);
+  if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)) throw new CsApiError("UNMASKED_EMAIL", 400);
 }
 
 function messageInputs(record: JsonObject, caseKey: string): CsMessageInput[] {
@@ -221,9 +226,44 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
     const draft = draftFromRecord(record, caseMessages, input.run_id, collectedAt);
     if (draft) drafts.push(draft);
   }
+  const decisionKeys = new Set<string>();
+  const decisions: DraftDecisionInput[] = rows(report.draft_decisions, 4_000, "INVALID_DRAFT_DECISIONS").map((decision) => {
+    const caseKey = text(decision.source_key, 300);
+    if (decisionKeys.has(caseKey)) throw new CsApiError("DUPLICATE_DRAFT_DECISION", 400);
+    decisionKeys.add(caseKey);
+    const caseRow = cases.find((item) => item.case_key === caseKey);
+    if (!caseRow) throw new CsApiError("DRAFT_DECISION_CASE_NOT_FOUND", 400);
+    const purpose = text(decision.purpose, 20).toUpperCase();
+    if (!new Set(["REPLY", "EVAL"]).has(purpose)) throw new CsApiError("DRAFT_DECISION_PURPOSE_INVALID", 400);
+    const action = text(decision.decision, 20).toUpperCase();
+    if (action !== "GENERATE" && action !== "SKIP") throw new CsApiError("DRAFT_DECISION_INVALID", 400);
+    const reasonCode = text(decision.reason_code, 100).toUpperCase();
+    if (!/^[A-Z][A-Z0-9_]{1,99}$/.test(reasonCode)) throw new CsApiError("DRAFT_DECISION_REASON_INVALID", 400);
+    const sourceHash = text(decision.source_content_hash, 128);
+    if (sourceHash !== caseRow.content_hash) throw new CsApiError("DRAFT_DECISION_CONTENT_HASH_MISMATCH", 400);
+    const rawChecks = decision.required_checks;
+    if (rawChecks !== undefined && (!Array.isArray(rawChecks) || rawChecks.length > 20 || rawChecks.some((item) => typeof item !== "string" || item.length > 500))) {
+      throw new CsApiError("DRAFT_DECISION_CHECKS_INVALID", 400);
+    }
+    for (const check of (rawChecks as string[] | undefined) ?? []) assertNoPlainContact(check);
+    const draft = drafts.find((item) => item.case_key === caseKey && item.purpose === purpose);
+    if (action === "GENERATE" && !draft) throw new CsApiError("DRAFT_DECISION_GENERATED_DRAFT_REQUIRED", 400);
+    return {
+      decision_id: `DECISION:${stableToken(`${input.run_id}|${caseKey}|${purpose}|${sourceHash}`)}`,
+      run_id: input.run_id,
+      case_key: caseKey,
+      purpose: purpose as "REPLY" | "EVAL",
+      source_content_hash: sourceHash,
+      decision: action,
+      reason_code: reasonCode,
+      required_checks: (rawChecks as string[] | undefined) ?? [],
+      draft_id: action === "GENERATE" ? draft?.draft_id ?? null : null,
+      created_at: collectedAt,
+    };
+  });
   return {
     run_id: input.run_id, environment: "development", mode: "READ_ONLY",
-    started_at: collectedAt, finished_at: collectedAt, cases, messages, drafts,
+    started_at: collectedAt, finished_at: collectedAt, cases, messages, drafts, decisions,
   };
 }
 

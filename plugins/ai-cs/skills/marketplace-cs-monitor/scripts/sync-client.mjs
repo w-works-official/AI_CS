@@ -36,6 +36,9 @@ export function validateSyncReport(report) {
   if (report.records.some((row) => !row?.content_hash)) throw new Error("CONTENT_HASH_REQUIRED");
   for (const [channelKey, channel] of Object.entries(report.channels ?? {})) {
     if (!channel?.open_queue_complete) continue;
+    if (!channel.attempted || channel.error || channel.open_queue_error || !channel.open_queue_scope || !channel.open_queue_window_start) {
+      throw new Error(`OPEN_QUEUE_NOT_RECONCILABLE:${channelKey}`);
+    }
     const openKeys = channel.open_queue_source_keys;
     if (!Array.isArray(openKeys)) throw new Error(`OPEN_QUEUE_SOURCE_KEYS_REQUIRED:${channelKey}`);
     if (new Set(openKeys).size !== openKeys.length) throw new Error(`OPEN_QUEUE_DUPLICATE_SOURCE_KEY:${channelKey}`);

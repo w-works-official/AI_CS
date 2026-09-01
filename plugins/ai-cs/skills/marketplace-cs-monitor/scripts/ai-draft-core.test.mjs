@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   buildAiDraftJob,
   buildAnswerSearchRequest,
+  buildDraftDecisions,
   extractLastCustomerTurn,
   selectDraftCandidates,
   validateGeneratedDraft,
@@ -16,6 +17,7 @@ const replyRecord = {
   product_name: "샘플 피어싱",
   change_state: "NEW",
   reply_state: "NEEDS_REPLY",
+  conversation_complete: true,
   messages: [
     { direction: "customer", text: "언제 출고되나요?", at: "오전 10:00" },
     { direction: "seller", text: "확인하겠습니다.", at: "오전 10:01" },
@@ -47,6 +49,37 @@ assert.equal(JSON.stringify(selected.candidates[1]).includes("seller_replies"), 
 const unchanged = selectDraftCandidates({ records: [{ ...replyRecord, change_state: "UNCHANGED" }] });
 assert.equal(unchanged.candidates.length, 0);
 assert.equal(unchanged.skipped[0].reason, "UNCHANGED");
+
+const acknowledgementSkipped = selectDraftCandidates({ records: [{
+  ...replyRecord,
+  source_key: "smartstore:talktalk:acknowledgement",
+  messages: [
+    { direction: "seller", text: "안내드렸습니다." },
+    { direction: "customer", text: "네네 감사합니다~!" },
+  ],
+}] });
+assert.equal(acknowledgementSkipped.candidates.length, 0);
+assert.equal(acknowledgementSkipped.skipped[0].reason, "NO_REPLY_REQUIRED");
+const completenessMissing = selectDraftCandidates({ records: [{
+  ...replyRecord,
+  source_key: "smartstore:talktalk:completeness-missing",
+  conversation_complete: null,
+}] });
+assert.equal(completenessMissing.candidates.length, 0);
+assert.equal(completenessMissing.skipped[0].reason, "CONVERSATION_INCOMPLETE");
+assert.ok(completenessMissing.skipped[0].required_checks.includes("COMPLETENESS_NOT_REPORTED"));
+const decisionReport = { records: [replyRecord, {
+  ...replyRecord,
+  source_key: "smartstore:talktalk:decision-ack",
+  messages: [{ direction: "customer", text: "네 감사합니다" }],
+}] };
+const decisionSelection = selectDraftCandidates(decisionReport);
+const decisions = buildDraftDecisions(decisionReport, decisionSelection, [{ source_key: replyRecord.source_key }]);
+assert.equal(decisions.length, 2);
+assert.deepEqual(decisions.map((item) => [item.decision, item.reason_code, item.purpose]), [
+  ["GENERATE", "DRAFT_GENERATED", "REPLY"],
+  ["SKIP", "NO_REPLY_REQUIRED", "REPLY"],
+]);
 
 const search = buildAnswerSearchRequest(selected.candidates[0]);
 assert.equal(search.limit, 3);

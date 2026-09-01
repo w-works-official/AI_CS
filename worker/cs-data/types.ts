@@ -18,6 +18,7 @@ export type Actor = "CUSTOMER" | "SELLER" | "AUTOMATIC" | "SYSTEM" | "UNKNOWN";
 export type ReplyState = "NEEDS_REPLY" | "ANSWERED" | "REVIEW" | "NO_REPLY" | "NO_REPLY_REQUIRED" | "CLOSED";
 export type ProcessingState = "NEW" | "CHANGED" | "UNCHANGED" | "REVIEW";
 export type DraftPurpose = "REPLY" | "EVAL";
+export type DraftDecisionPurpose = DraftPurpose;
 export type DraftState = "READY" | "APPROVED" | "REJECTED" | "REVISED" | "USED" | "SUPERSEDED" | "FAILED";
 
 /** These fields map one-to-one to cs_cases in 0001_initial.sql. */
@@ -41,7 +42,7 @@ export type DraftInput = {
   source_content_hash: string; source_customer_message_key: string; source_seller_message_key: string | null;
   generation_version: string; created_at: string; created_run_id: string;
 };
-export type DraftDecisionInput = { decision_id: string; run_id: string; case_key: string; purpose: DraftPurpose; source_content_hash: string; decision: "GENERATE" | "SKIP"; reason_code: string; draft_id: string | null; created_at: string };
+export type DraftDecisionInput = { decision_id: string; run_id: string; case_key: string; purpose: DraftDecisionPurpose; source_content_hash: string; decision: "GENERATE" | "SKIP"; reason_code: string; required_checks: string[]; draft_id: string | null; created_at: string };
 export type SyncRunInput = {
   run_id: string; environment?: "local" | "development"; mode?: "READ_ONLY"; started_at: string; finished_at: string | null;
   pii_rejected_count?: number; error_count?: number; cases: CsCaseInput[]; messages: CsMessageInput[]; drafts: DraftInput[]; decisions?: DraftDecisionInput[];
@@ -50,7 +51,8 @@ export type CaseFilters = Partial<Pick<CsCaseInput, "market" | "channel" | "ui_t
 export type CursorListInput = { limit?: number; cursor?: number; filters?: CaseFilters };
 export type DraftReviewInput = { draft_id: string; draft_state: "APPROVED" | "REJECTED" | "REVISED"; review_note_masked: string; human_revision_masked: string; reviewed_at: string; reviewer_ref: string };
 export type HealthResult = { ok: true; service: "ai-cs-d1-repository"; schema_version: "v1"; write_policy: "MASKED_DTO_ONLY" };
-export type OverviewResult = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; by_market: Record<string, number> };
+export type LatestSyncResult = { run_id: string; status: string; started_at: string; finished_at: string | null; collected_count: number; new_count: number; changed_count: number; unchanged_count: number; draft_created_count: number; pii_rejected_count: number; error_count: number } | null;
+export type OverviewResult = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; closed: number; by_market: Record<string, number>; latest_sync: LatestSyncResult };
 export type CaseListItem = {
   case_key: string; market: string; channel: string; ui_type: string; occurred_at: string | null;
   customer_masked: string; subject_masked: string | null; preview_masked: string | null;

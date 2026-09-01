@@ -9,7 +9,12 @@ const report = {
     smartstore_comments: {
       market: "smartstore",
       channel: "comments",
+      attempted: true,
+      error: "",
       open_queue_complete: true,
+      open_queue_scope: "today_unanswered",
+      open_queue_window_start: "2026-08-25",
+      open_queue_error: "",
       open_queue_visible_total: 1,
       open_queue_source_keys: ["smartstore:comments:abc"],
     },
@@ -33,6 +38,13 @@ assert.throws(
     channels: { smartstore_comments: { ...report.channels.smartstore_comments, open_queue_visible_total: 2 } },
   }),
   /OPEN_QUEUE_TOTAL_MISMATCH/,
+);
+assert.throws(
+  () => validateSyncReport({
+    ...report,
+    channels: { smartstore_comments: { ...report.channels.smartstore_comments, attempted: false } },
+  }),
+  /OPEN_QUEUE_NOT_RECONCILABLE/,
 );
 
 let captured;

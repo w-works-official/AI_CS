@@ -1,5 +1,6 @@
 import { classifyIntent, requiredChecksFor, retrieveAnswerExamples } from "./answer-library-core.mjs";
 import { inspectUnmaskedPii, maskSensitiveText } from "./report-core.mjs";
+import { isCustomerAcknowledgement } from "./conversation-policy.mjs";
 
 const compact = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
 const ACTIVE_DRAFT_STATES = new Set(["READY", "APPROVED", "USED"]);
@@ -35,6 +36,7 @@ function isChatRecord(record) {
 }
 
 function conversationIsIncomplete(record) {
+  if (isChatRecord(record) && record?.conversation_complete !== true) return true;
   return [
     record?.conversation_complete,
     record?.messages_complete,
@@ -46,7 +48,9 @@ function conversationIncompleteChecks(record) {
   const detailReason = Array.isArray(record?.conversation_incomplete_reason)
     ? record.conversation_incomplete_reason
     : [record?.conversation_incomplete_reason];
-  return ["전체 대화 수집 후 재확인", ...detailReason.map(compact).filter(Boolean)];
+  const reasons = detailReason.map(compact).filter(Boolean);
+  if (isChatRecord(record) && record?.conversation_complete !== true && !reasons.length) reasons.push("COMPLETENESS_NOT_REPORTED");
+  return ["전체 대화 수집 후 재확인", ...reasons];
 }
 const UI_CONTROL_TEXT = /^(?:문의\s*종료하기|답변\s*등록|상담\s*완료|처리\s*완료)$/;
 
@@ -189,6 +193,15 @@ export function selectDraftCandidates(report, existingCasesByKey = new Map(), {
       }));
       continue;
     }
+    if (isCustomerAcknowledgement(turn.text)) {
+      skipped.push(skip(record?.source_key, "NO_REPLY_REQUIRED", {
+        purpose,
+        change_state: changeState,
+        reply_state: replyState,
+        required_checks: ["종료 인사로 판정 · 추가 답변 불필요"],
+      }));
+      continue;
+    }
     if (purpose === "EVAL" && !hasActualSellerAnswer(record)) {
       skipped.push(skip(record?.source_key, "SELLER_ANSWER_NOT_FOUND", {
         purpose,
@@ -309,4 +322,39 @@ export function validateGeneratedDraft(candidate, generated) {
       ai_draft_pii_scan: "PASS",
     },
   };
+}
+
+export function buildDraftDecisions(report, selection, generatedDrafts = []) {
+  const records = new Map((report?.records ?? []).map((record) => [compact(record?.source_key), record]));
+  const generated = new Set((generatedDrafts ?? []).map((draft) => compact(draft?.source_key)).filter(Boolean));
+  const decisions = [];
+  const decisionPurpose = (item, sourceKey) => {
+    const explicit = compact(item?.purpose).toUpperCase();
+    if (["REPLY", "EVAL"].includes(explicit)) return explicit;
+    return compact(records.get(sourceKey)?.reply_state).toUpperCase() === "ANSWERED" ? "EVAL" : "REPLY";
+  };
+  for (const candidate of selection?.candidates ?? []) {
+    const sourceKey = compact(candidate?.source_key);
+    if (!records.has(sourceKey)) throw new Error(`DRAFT_DECISION_CASE_NOT_FOUND:${sourceKey}`);
+    const wasGenerated = generated.has(sourceKey);
+    decisions.push({
+      source_key: sourceKey,
+      purpose: decisionPurpose(candidate, sourceKey),
+      decision: wasGenerated ? "GENERATE" : "SKIP",
+      reason_code: wasGenerated ? "DRAFT_GENERATED" : "DRAFT_GENERATION_FAILED",
+      required_checks: [...new Set((candidate?.required_checks ?? candidate?.last_customer_turn?.required_checks ?? []).map(compact).filter(Boolean))],
+    });
+  }
+  for (const item of selection?.skipped ?? []) {
+    const sourceKey = compact(item?.source_key);
+    if (!records.has(sourceKey)) throw new Error(`DRAFT_DECISION_CASE_NOT_FOUND:${sourceKey}`);
+    decisions.push({
+      source_key: sourceKey,
+      purpose: decisionPurpose(item, sourceKey),
+      decision: "SKIP",
+      reason_code: compact(item?.reason_code ?? item?.reason).toUpperCase(),
+      required_checks: [...new Set((item?.required_checks ?? []).map(compact).filter(Boolean))],
+    });
+  }
+  return decisions;
 }

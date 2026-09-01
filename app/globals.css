@@ -1278,6 +1278,32 @@ button {
   font-size: 9px;
 }
 
+.decision-empty {
+  margin-top: 10px;
+  padding: 18px 14px;
+  border: 1px solid #d9e5f4;
+  border-radius: 10px;
+  background: #f7faff;
+}
+
+.decision-empty > span {
+  color: #3677d2;
+}
+
+.decision-empty small,
+.decision-empty code {
+  display: block;
+  margin-top: 7px;
+  color: #718096;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.decision-empty code {
+  color: #5d6f89;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 .editor-label {
   display: block;
   color: #7c8491;

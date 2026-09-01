@@ -28,19 +28,34 @@ export class CsDataRepository {
   }
 
   async overview(): Promise<OverviewResult> {
-    const [totals, markets] = await Promise.all([
+    const [totals, markets, latestSync] = await Promise.all([
       this.db.prepare(`SELECT COUNT(*) AS total_live,
         SUM(CASE WHEN reply_state = 'NEEDS_REPLY' THEN 1 ELSE 0 END) AS needs_reply,
         SUM(CASE WHEN reply_state = 'ANSWERED' THEN 1 ELSE 0 END) AS answered,
         SUM(CASE WHEN reply_state = 'REVIEW' THEN 1 ELSE 0 END) AS review,
         SUM(CASE WHEN reply_state IN ('NO_REPLY', 'NO_REPLY_REQUIRED') THEN 1 ELSE 0 END) AS no_reply_required,
+        SUM(CASE WHEN reply_state = 'CLOSED' THEN 1 ELSE 0 END) AS closed,
         SUM(CASE WHEN EXISTS (SELECT 1 FROM ai_drafts d WHERE d.case_key = cs_cases.case_key AND d.state = 'READY') THEN 1 ELSE 0 END) AS ai_ready
         FROM cs_cases`).first<CountRow>(),
       this.db.prepare("SELECT market, COUNT(*) AS count FROM cs_cases GROUP BY market").all<MarketRow>(),
+      this.db.prepare(`SELECT run_id, status, started_at, finished_at, collected_count, new_count, changed_count,
+        unchanged_count, draft_created_count, pii_rejected_count, error_count
+        FROM sync_runs ORDER BY COALESCE(finished_at, started_at) DESC, run_id DESC LIMIT 1`).first<Record<string, unknown>>(),
     ]);
     const by_market: Record<string, number> = {};
     for (const row of markets.results) by_market[row.market] = asNumber(row.count);
-    return { total_live: asNumber(totals?.total_live), needs_reply: asNumber(totals?.needs_reply), answered: asNumber(totals?.answered), review: asNumber(totals?.review), no_reply_required: asNumber(totals?.no_reply_required), ai_ready: asNumber(totals?.ai_ready), by_market };
+    return {
+      total_live: asNumber(totals?.total_live), needs_reply: asNumber(totals?.needs_reply), answered: asNumber(totals?.answered),
+      review: asNumber(totals?.review), no_reply_required: asNumber(totals?.no_reply_required), ai_ready: asNumber(totals?.ai_ready),
+      closed: asNumber(totals?.closed), by_market,
+      latest_sync: latestSync ? {
+        run_id: String(latestSync.run_id ?? ""), status: String(latestSync.status ?? ""), started_at: String(latestSync.started_at ?? ""),
+        finished_at: latestSync.finished_at == null ? null : String(latestSync.finished_at), collected_count: asNumber(latestSync.collected_count as number | string | null),
+        new_count: asNumber(latestSync.new_count as number | string | null), changed_count: asNumber(latestSync.changed_count as number | string | null),
+        unchanged_count: asNumber(latestSync.unchanged_count as number | string | null), draft_created_count: asNumber(latestSync.draft_created_count as number | string | null),
+        pii_rejected_count: asNumber(latestSync.pii_rejected_count as number | string | null), error_count: asNumber(latestSync.error_count as number | string | null),
+      } : null,
+    };
   }
 
   async listCases(input: CursorListInput = {}): Promise<CursorListResult> {
@@ -59,7 +74,9 @@ export class CsDataRepository {
     if (!item) return null;
     const [messages, drafts, decisions, reviewEvents] = await Promise.all([
       this.db.prepare("SELECT * FROM cs_messages WHERE case_key = ? ORDER BY sequence ASC, message_key ASC").bind(caseKey).all<Record<string, unknown>>(),
-      this.db.prepare("SELECT * FROM ai_drafts WHERE case_key = ? ORDER BY created_at DESC, draft_id DESC").bind(caseKey).all<Record<string, unknown>>(),
+      this.db.prepare(`SELECT d.*, seller.message_key AS comparison_seller_message_key, seller.text_masked AS comparison_seller_text_masked, seller.sent_at AS comparison_seller_sent_at
+        FROM ai_drafts d LEFT JOIN cs_messages seller ON seller.message_key = d.source_seller_message_key
+        WHERE d.case_key = ? ORDER BY d.created_at DESC, d.draft_id DESC`).bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM draft_decisions WHERE case_key = ? ORDER BY created_at DESC, decision_id DESC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM review_events WHERE case_key = ? ORDER BY created_at DESC, review_event_id DESC").bind(caseKey).all<Record<string, unknown>>(),
     ]);
@@ -117,7 +134,9 @@ export class CsDataRepository {
   private caseFilterClause(filters: CaseFilters): { clause: string; values: string[] } {
     const clauses: string[] = []; const values: string[] = [];
     for (const key of ["market", "channel", "ui_type", "reply_state"] as const) {
-      const value = filters[key]; if (!value) continue; clauses.push(` AND c.${key} = ?`); values.push(value);
+      const value = filters[key]; if (!value) continue;
+      if (key === "reply_state" && value === "NO_REPLY_REQUIRED") clauses.push(" AND c.reply_state IN ('NO_REPLY', 'NO_REPLY_REQUIRED')");
+      else { clauses.push(` AND c.${key} = ?`); values.push(value); }
     }
     if (filters.ai_draft_state) {
       clauses.push(" AND COALESCE((SELECT d.state FROM ai_drafts d WHERE d.case_key = c.case_key ORDER BY d.created_at DESC, d.draft_id DESC LIMIT 1), 'NONE') = ?");
@@ -165,13 +184,13 @@ export class CsDataRepository {
   private upsertDraftStatement(item: DraftInput): D1PreparedStatement {
     return this.db.prepare(`INSERT INTO ai_drafts (draft_id, case_key, purpose, state, draft_text_masked, intent, required_checks, reference_ids_json, source_content_hash, source_customer_message_key, source_seller_message_key, generation_version, pii_scan, created_run_id, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PASS', ?, ?, ?)
-      ON CONFLICT(draft_id) DO UPDATE SET state = excluded.state, draft_text_masked = excluded.draft_text_masked, intent = excluded.intent, required_checks = excluded.required_checks, reference_ids_json = excluded.reference_ids_json, source_content_hash = excluded.source_content_hash, generation_version = excluded.generation_version, updated_at = excluded.updated_at`).bind(
+      ON CONFLICT(draft_id) DO UPDATE SET state = CASE WHEN ai_drafts.state IN ('APPROVED', 'REJECTED', 'REVISED', 'USED') THEN ai_drafts.state ELSE excluded.state END, draft_text_masked = excluded.draft_text_masked, intent = excluded.intent, required_checks = excluded.required_checks, reference_ids_json = excluded.reference_ids_json, source_content_hash = excluded.source_content_hash, generation_version = excluded.generation_version, updated_at = excluded.updated_at`).bind(
       item.draft_id, item.case_key, item.purpose, item.state ?? "READY", item.draft_text_masked, item.intent, item.required_checks, JSON.stringify(item.reference_ids), item.source_content_hash, item.source_customer_message_key, item.source_seller_message_key, item.generation_version, item.created_run_id, item.created_at, item.created_at,
     );
   }
 
   private insertDecision(item: DraftDecisionInput): D1PreparedStatement {
-    return this.db.prepare(`INSERT INTO draft_decisions (decision_id, run_id, case_key, purpose, source_content_hash, decision, reason_code, draft_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, case_key, purpose, source_content_hash) DO NOTHING`).bind(item.decision_id, item.run_id, item.case_key, item.purpose, item.source_content_hash, item.decision, item.reason_code, item.draft_id, item.created_at);
+    return this.db.prepare(`INSERT INTO draft_decisions (decision_id, run_id, case_key, purpose, source_content_hash, decision, reason_code, required_checks_json, draft_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, case_key, purpose, source_content_hash) DO NOTHING`).bind(item.decision_id, item.run_id, item.case_key, item.purpose, item.source_content_hash, item.decision, item.reason_code, JSON.stringify(item.required_checks), item.draft_id, item.created_at);
   }
 }

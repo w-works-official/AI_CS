@@ -40,12 +40,14 @@ type CsCase = {
   ai?: { text: string; reason: string; generatedAt: string; risk: '낮음' | '중간' | '높음'; mode: 'reply' | 'eval' };
   humanRevision?: { text: string; state: string; reviewedAt: string };
   actualReply?: { text: string; sentAt: string; verifiedAt: string };
+  skipDecision?: { reason: string; reasonCode: string; checks: string[] };
 };
 type Overview = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; closed: number };
+type LatestSync = { run_id: string; status: string; finished_at: string; collected_count: number; draft_created_count: number; error_count: number } | null;
 type EnvironmentName = 'development' | 'production' | 'unconfigured';
-type DashboardSnapshot = { savedAt: number; cases: CsCase[]; total: number; overview: Overview; environment: EnvironmentName };
+type DashboardSnapshot = { savedAt: number; cases: CsCase[]; total: number; overview: Overview; environment: EnvironmentName; latestSync?: LatestSync };
 type DetailSnapshot = { savedAt: number; item: CsCase };
-type DetailPayload = { case?: RawRow; messages?: RawRow[]; drafts?: RawRow[] };
+type DetailPayload = { case?: RawRow; messages?: RawRow[]; drafts?: RawRow[]; decisions?: RawRow[] };
 type DataFreshness = 'fresh' | 'refreshing' | 'stale';
 
 const EMPTY_OVERVIEW: Overview = { total_live: 0, needs_reply: 0, answered: 0, review: 0, no_reply_required: 0, ai_ready: 0, closed: 0 };
@@ -101,9 +103,25 @@ function caseStatus(row: RawRow): CaseStatus {
   const state = text(row.reply_state).toUpperCase();
   if (state === 'NEEDS_REPLY') return 'unanswered';
   if (state === 'REVIEW') return 'review';
-  if (state === 'NO_REPLY_REQUIRED') return 'no-reply';
+  if (state === 'NO_REPLY_REQUIRED' || state === 'NO_REPLY') return 'no-reply';
   if (state === 'CLOSED') return 'closed';
   return 'replied';
+}
+const decisionReasonLabels: Record<string, string> = {
+  ACTIVE_DRAFT_EXISTS: '같은 문의 내용으로 이미 생성된 AI 초안이 있습니다.',
+  CONVERSATION_INCOMPLETE: '채팅 대화 전체가 확인되지 않아 초안을 만들지 않았습니다.',
+  ACTOR_UNCERTAIN: '고객과 판매자 발화 구분이 불확실해 사람 확인이 필요합니다.',
+  CUSTOMER_TURN_NOT_FOUND: '답변 기준이 되는 마지막 고객 문의를 찾지 못했습니다.',
+  IMAGE_REVIEW_REQUIRED: '첨부 이미지 확인이 필요한 문의라 자동 초안을 보류했습니다.',
+  EVAL_DISABLED: '답변 완료 건의 학습·검증 초안 생성이 꺼져 있습니다.',
+  EVAL_LIMIT_REACHED: '이번 수집의 학습·검증 초안 생성 한도에 도달했습니다.',
+  SELLER_ANSWER_NOT_FOUND: '비교할 실제 판매자 답변을 찾지 못했습니다.',
+  NO_REPLY_REQUIRED: '마지막 고객 메시지가 단순 확인·감사 표현이라 추가 답변이 필요하지 않습니다.',
+  UNCHANGED: '이전 수집과 문의 내용이 같아 새 초안을 만들지 않았습니다.',
+};
+function jsonStringList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => text(item)).filter(Boolean);
+  try { const parsed = JSON.parse(text(value, '[]')); return Array.isArray(parsed) ? parsed.map((item) => text(item)).filter(Boolean) : []; } catch { return []; }
 }
 function draftReason(value: unknown) {
   const raw = text(value, '추천 근거가 별도로 기록되지 않았습니다.');
@@ -133,7 +151,7 @@ function baseCase(row: RawRow): CsCase {
     actualReply: bool(row.human_reply_exists) ? { text: text(row.latest_human_reply_preview, '답변 존재 · 본문 미수집'), sentAt: formatDate(row.human_reply_at), verifiedAt: formatDate(row.last_seen_at) } : undefined,
   };
 }
-function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[]): CsCase {
+function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[], decisionRows: RawRow[] = []): CsCase {
   const item = baseCase(row);
   item.messages = messageRows.map((message): Message | null => {
     const body = text(message.message_text_masked ?? message.text_masked); if (!body) return null;
@@ -148,6 +166,15 @@ function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[]): C
     const draftState = text(draft.draft_state).toUpperCase();
     item.draftId = text(draft.draft_id);
     item.ai = { text: text(draft.draft_text ?? draft.draft_text_masked), reason: draftReason(draft.required_checks), generatedAt: formatDate(draft.generated_at ?? draft.created_at), risk: riskLevel(draft.pii_scan), mode: text(draft.purpose).toUpperCase() === 'EVAL' || draftState === 'EVAL' ? 'eval' : 'reply' };
+    if (item.ai.mode === 'eval' && text(draft.comparison_seller_text_masked)) {
+      item.actualReply = { text: text(draft.comparison_seller_text_masked), sentAt: formatDate(draft.comparison_seller_sent_at), verifiedAt: item.updatedAt };
+    }
+  }
+  const contentHash = text(row.content_hash);
+  const skipDecision = decisionRows.find((decision) => text(decision.decision).toUpperCase() === 'SKIP' && (!contentHash || text(decision.source_content_hash) === contentHash));
+  if (skipDecision) {
+    const reasonCode = text(skipDecision.reason_code).toUpperCase();
+    item.skipDecision = { reasonCode, reason: decisionReasonLabels[reasonCode] ?? `AI 초안 생성 제외 사유: ${reasonCode || '미기록'}`, checks: jsonStringList(skipDecision.required_checks_json ?? skipDecision.required_checks) };
   }
   const reviewedDraft = draftRows.find((row) => text(row.human_revision));
   if (reviewedDraft) item.humanRevision = { text: text(reviewedDraft.human_revision), state: text(reviewedDraft.draft_state, '검토됨'), reviewedAt: formatDate(reviewedDraft.reviewed_at) };
@@ -155,7 +182,7 @@ function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[]): C
 }
 function hydrateDetailPayload(payload: DetailPayload): CsCase | null {
   if (!payload?.case) return null;
-  return hydrateCase(payload.case, payload.messages ?? [], payload.drafts ?? []);
+  return hydrateCase(payload.case, payload.messages ?? [], payload.drafts ?? [], payload.decisions ?? []);
 }
 function statusQuery(filter: 'all' | CaseStatus) {
   if (filter === 'all') return '';
@@ -209,7 +236,11 @@ function totalForFilter(filter: 'all' | CaseStatus, overview: Overview) {
 
 function nativeDetail(payload: RawRow): DetailPayload {
   const reviewRows = Array.isArray(payload.review_events) ? payload.review_events as RawRow[] : [];
-  const reviewByDraft = new Map(reviewRows.map((row) => [text(row.draft_id), row]));
+  const reviewByDraft = new Map<string, RawRow>();
+  for (const row of reviewRows) {
+    const draftId = text(row.draft_id);
+    if (draftId && !reviewByDraft.has(draftId)) reviewByDraft.set(draftId, row);
+  }
   const drafts = (Array.isArray(payload.drafts) ? payload.drafts as RawRow[] : []).map((draft) => {
     const review = reviewByDraft.get(text(draft.draft_id));
     return {
@@ -222,7 +253,7 @@ function nativeDetail(payload: RawRow): DetailPayload {
       pii_scan: draft.pii_scan ?? 'PASS',
     };
   });
-  return { case: payload.case as RawRow | undefined, messages: payload.messages as RawRow[] | undefined, drafts };
+  return { case: payload.case as RawRow | undefined, messages: payload.messages as RawRow[] | undefined, drafts, decisions: payload.decisions as RawRow[] | undefined };
 }
 function clearSessionCachePrefix(prefix: string) {
   try {
@@ -238,6 +269,7 @@ export default function Home() {
   const [cases, setCases] = useState<CsCase[]>([]); const [selectedId, setSelectedId] = useState('');
   const [selectedDetail, setSelectedDetail] = useState<CsCase | null>(null); const [overview, setOverview] = useState<Overview>(EMPTY_OVERVIEW);
   const [environment, setEnvironment] = useState<EnvironmentName>('unconfigured');
+  const [latestSync, setLatestSync] = useState<LatestSync>(null);
   const [search, setSearch] = useState(''); const [editor, setEditor] = useState(''); const [toast, setToast] = useState('');
   const [sourceGuide, setSourceGuide] = useState<SourceGuide | null>(null);
   const [reviewSaving, setReviewSaving] = useState(false);
@@ -263,11 +295,13 @@ export default function Home() {
       total_live: Number(overviewPayload.total_live ?? 0), needs_reply: Number(overviewPayload.needs_reply ?? 0), answered: Number(overviewPayload.answered ?? 0),
       review: Number(overviewPayload.review ?? 0), no_reply_required: Number(overviewPayload.no_reply_required ?? 0), ai_ready: Number(overviewPayload.ai_ready ?? 0), closed: Number(overviewPayload.closed ?? 0),
     } as Overview;
+    const rawLatestSync = overviewPayload.latest_sync && typeof overviewPayload.latest_sync === 'object' ? overviewPayload.latest_sync as RawRow : null;
     return {
       items: sortCasesRecent(((payload.items ?? []) as RawRow[]).map(baseCase)),
       total: totalForFilter(filter, normalizedOverview),
       overview: normalizedOverview,
       environment: ['development', 'production'].includes(text(payload.environment)) ? text(payload.environment) as EnvironmentName : 'unconfigured' as EnvironmentName,
+      latestSync: rawLatestSync ? { run_id: text(rawLatestSync.run_id), status: text(rawLatestSync.status), finished_at: text(rawLatestSync.finished_at), collected_count: Number(rawLatestSync.collected_count ?? 0), draft_created_count: Number(rawLatestSync.draft_created_count ?? 0), error_count: Number(rawLatestSync.error_count ?? 0) } as LatestSync : null,
     };
   }, []);
   const refresh = useCallback(async () => {
@@ -275,7 +309,7 @@ export default function Home() {
     try {
       const next = await fetchDashboard(activeFilter);
       if (requestId !== listRequestId.current) return;
-      setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setEditor('');
+      setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setLatestSync(next.latestSync); setEditor('');
       setFreshness('fresh');
       setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
       detailCache.current.clear(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX); setSelectedDetail(null); setDetailEpoch((value) => value + 1);
@@ -293,18 +327,18 @@ export default function Home() {
       queueMicrotask(() => {
         if (requestId !== listRequestId.current) return;
         setFreshness('refreshing');
-        setCases(cached.cases); setTotalCases(cached.total); setOverview(cached.overview); setEnvironment(cached.environment); setLoading(false);
+        setCases(cached.cases); setTotalCases(cached.total); setOverview(cached.overview); setEnvironment(cached.environment); setLatestSync(cached.latestSync ?? null); setLoading(false);
         setSelectedId((current) => cached.cases.some((item) => item.id === current) ? current : (cached.cases[0]?.id ?? ''));
       });
     }
     fetchDashboard(activeFilter, controller.signal)
       .then((next) => {
         if (requestId !== listRequestId.current) return;
-        setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment);
+        setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setLatestSync(next.latestSync);
         detailCache.current.clear(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX);
         setFreshness('fresh'); setError('');
         setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
-        writeSessionCache(`${DASHBOARD_CACHE_PREFIX}${activeFilter}`, { savedAt: Date.now(), cases: next.items, total: next.total, overview: next.overview, environment: next.environment } satisfies DashboardSnapshot);
+        writeSessionCache(`${DASHBOARD_CACHE_PREFIX}${activeFilter}`, { savedAt: Date.now(), cases: next.items, total: next.total, overview: next.overview, environment: next.environment, latestSync: next.latestSync } satisfies DashboardSnapshot);
       }).catch((cause) => {
         if (requestId === listRequestId.current && !(cause instanceof DOMException && cause.name === 'AbortError')) {
           if (cached) setFreshness('stale'); else setError(cause instanceof Error ? cause.message : 'DATA_LOAD_FAILED');
@@ -412,7 +446,7 @@ export default function Home() {
   return <main className="app-shell">
     <aside className="nav-rail"><div className="brand-mark">PR</div><nav aria-label="주 메뉴"><button className="rail-button active"><span>◫</span><small>검수함</small></button><button className="rail-button"><span>⌁</span><small>통계</small></button><button className="rail-button"><span>⚙</span><small>설정</small></button></nav><div className="rail-footer">LIVE</div></aside>
     <section className="workspace">
-      <header className="topbar"><div><div className="eyebrow">PINK ROCKET · CS REVIEW</div><h1>AI 답변 검수함</h1></div><div className="sync-area"><span className={`environment-badge ${environment}`}>{environment}</span><div className="sync-copy"><span className={`live-dot ${error ? 'error' : ''}`} /><strong>{error && !cases.length ? '연결 확인 필요' : `실데이터 ${overview.total_live.toLocaleString()}건`}</strong><small>{freshness === 'stale' ? '연결이 지연되어 저장된 목록을 표시 중' : syncAt ? `최근 수집 기록 ${formatDate(syncAt)}` : '수집 기록 확인 중'}</small></div><button className="secondary-button" onClick={refresh} disabled={loading}>↻ {loading ? '확인 중' : '최신 확인'}</button></div></header>
+      <header className="topbar"><div><div className="eyebrow">PINK ROCKET · CS REVIEW</div><h1>AI 답변 검수함</h1></div><div className="sync-area"><span className={`environment-badge ${environment}`}>{environment}</span><div className="sync-copy"><span className={`live-dot ${error || (latestSync?.error_count ?? 0) > 0 ? 'error' : ''}`} /><strong>{error && !cases.length ? '연결 확인 필요' : `실데이터 ${overview.total_live.toLocaleString()}건`}</strong><small>{freshness === 'stale' ? '연결이 지연되어 저장된 목록을 표시 중' : latestSync?.finished_at ? `최근 동기화 ${formatDate(latestSync.finished_at)} · 수집 ${latestSync.collected_count} / AI ${latestSync.draft_created_count}` : syncAt ? `최근 수집 기록 ${formatDate(syncAt)}` : '수집 기록 확인 중'}</small></div><button className="secondary-button" onClick={refresh} disabled={loading}>↻ {loading ? '확인 중' : '최신 확인'}</button></div></header>
       {error && !cases.length && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
       <section className="status-strip" aria-label="문의 상태 요약">{filters.slice(1).map((filter) => { const meta = statusMeta[filter.key as CaseStatus]; return <button key={filter.key} className={`stat-card ${activeFilter === filter.key ? 'selected' : ''}`} onClick={() => selectFilter(filter.key as CaseStatus)}><span className="stat-dot" style={{ background: meta.dot }} /><span>{filter.label}</span><strong>{countFor(filter.key as CaseStatus).toLocaleString()}</strong></button>; })}</section>
       <div className="desk-grid">
@@ -427,7 +461,7 @@ export default function Home() {
           <footer className="source-footer"><span>🔒 고객정보 마스킹됨</span><span>{selected.surface === 'chat' ? '채팅형' : '게시글형'} · 읽기 전용 수집 기록</span><span>원본 확인 {selected.updatedAt}</span></footer></>}
         </section>
         <aside className="reply-column" aria-label="답변 검수">{!selected ? <div className="panel-empty"><strong>문의를 선택해 주세요.</strong></div> : <><div className="reply-scroll">
-          <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>{selected.ai?.mode === 'eval' ? 'AI 검증 초안' : 'AI 추천답변'}</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">{selected.ai?.mode === 'eval' ? '답변 완료 후 생성된 학습·검증용 초안 · 실제 사람 답변과 비교' : '사람 답변과 구분 · 자동 전송되지 않은 참고 문장'}</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>{selected.ai.mode === 'eval' ? '검증 조건' : '필수 확인사항'}</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · {selected.ai.mode === 'eval' ? 'EVAL 섀도 초안' : '저장된 AI 초안'}</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button>{selected.ai.mode !== 'eval' && <button className="purple-button" onClick={() => setEditor(selected.ai!.text)}>수정란에 적용</button>}</div></> : <div className="empty-draft"><span>✦</span><strong>저장된 AI 추천답변이 없습니다.</strong><p>AI 초안이 생성되면 사람 답변과 분리되어 여기에 표시됩니다.</p></div>}</section>
+          <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>{selected.ai?.mode === 'eval' ? 'AI 검증 초안' : 'AI 추천답변'}</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">{selected.ai?.mode === 'eval' ? '답변 완료 후 생성된 학습·검증용 초안 · 실제 사람 답변과 비교' : '사람 답변과 구분 · 자동 전송되지 않은 참고 문장'}</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>{selected.ai.mode === 'eval' ? '검증 조건' : '필수 확인사항'}</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · {selected.ai.mode === 'eval' ? 'EVAL 섀도 초안' : '저장된 AI 초안'}</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button>{selected.ai.mode !== 'eval' && <button className="purple-button" onClick={() => setEditor(selected.ai!.text)}>수정란에 적용</button>}</div></> : selected.skipDecision ? <div className="empty-draft decision-empty"><span>✓</span><strong>{selected.status === 'no-reply' ? '답변 불필요로 분류했습니다.' : '이번 수집에서는 AI 초안을 만들지 않았습니다.'}</strong><p>{selected.skipDecision.reason}</p>{selected.skipDecision.checks.length > 0 && <small>확인사항 · {selected.skipDecision.checks.join(' · ')}</small>}<code>{selected.skipDecision.reasonCode}</code></div> : <div className="empty-draft"><span>✦</span><strong>AI 처리 결과를 기다리고 있습니다.</strong><p>다음 수집에서 생성 여부와 제외 사유가 함께 표시됩니다.</p></div>}</section>
           <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>{selected.ai?.mode === 'eval' ? '검증 메모' : '사람 수정본'}</h3></div><span className="draft-status">{selected.ai?.mode === 'eval' ? 'EVAL · 실제 답변과 비교' : (selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력')}</span></div><label className="editor-label" htmlFor="human-draft">{selected.ai?.mode === 'eval' ? '학습·검증용 초안은 실제 답변과 비교만 합니다.' : '쇼핑몰에 복사할 최종 문장을 확인하세요.'}</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} disabled={selected.ai?.mode === 'eval'} placeholder={selected.ai?.mode === 'eval' ? '아래 실제 사람 답변과 AI 검증 초안을 비교해 주세요.' : 'AI 추천을 적용하거나 직접 답변을 작성하세요.'}/><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" disabled={!selected.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || reviewSaving} onClick={() => saveReview('REJECTED')}>초안 거절</button><button className="primary-button" disabled={!selected.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || !editor.trim() || reviewSaving} onClick={() => saveReview('APPROVED')}>{reviewSaving ? '저장 중' : '검수 저장'}</button><button className="secondary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">{selected.ai?.mode === 'eval' ? '학습·검증용 섀도 초안입니다. 운영 상태와 쇼핑몰 답변에는 영향을 주지 않습니다.' : (localReviewEnabled ? '개발 Sheet에 사람 검수본만 저장합니다. 쇼핑몰로는 전송하지 않습니다.' : '검수 저장은 로컬 development 화면에서만 사용할 수 있습니다. 쇼핑몰로는 전송하지 않습니다.')}</p></section>
           <section className={`reply-section actual-section ${selected.actualReply ? 'verified' : ''}`}><div className="section-title"><div><span className="section-kicker actual">실제</span><h3>쇼핑몰 실제 답변</h3></div>{selected.actualReply ? <span className="verified-label">✓ 확인 완료</span> : <span className="unverified-label">미확인</span>}</div>{selected.actualReply ? <><div className="draft-card actual-draft">{selected.actualReply.text}</div><div className="verification-meta"><span>답변 시각 {selected.actualReply.sentAt}</span><span>최근 수집 확인 {selected.actualReply.verifiedAt}</span></div></> : <div className="verification-empty"><span className="scan-icon">⌁</span><div><strong>판매자 답변이 아직 확인되지 않았습니다.</strong><p>다음 수집에서 쇼핑몰 메시지와 답변 상태를 다시 확인합니다.</p></div></div>}</section>
         </div><div className="reply-bottom-bar"><div><span className="reply-state-dot" style={{ background: statusMeta[selected.status].dot }}/><strong>{statusMeta[selected.status].label}</strong></div><button onClick={() => notify('이 버튼은 아직 수집 매크로를 실행하지 않습니다.')}>답변 재확인 준비중</button></div></>}</aside>

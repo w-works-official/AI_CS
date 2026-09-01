@@ -13,7 +13,7 @@ class FakeRepository {
   review?: DraftReviewInput;
   detail: CaseDetailResult | null = null;
   async health() { return { ok: true as const, service: "ai-cs-d1-repository" as const, schema_version: "v1" as const, write_policy: "MASKED_DTO_ONLY" as const }; }
-  async overview() { return { total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, by_market: { SMARTSTORE: 1 } }; }
+  async overview() { return { total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, closed: 0, by_market: { SMARTSTORE: 1 }, latest_sync: null }; }
   async listCases(input: CursorListInput) { void input; return { items: [], cursor: 0, next_cursor: null }; }
   async getCase(caseKey: string) { void caseKey; return this.detail; }
   async syncRun(input: SyncRunInput) { this.sync = input; return { run_id: input.run_id, duplicate_run: false, inserted_cases: input.cases.length, updated_cases: 0, inserted_messages: input.messages.length, inserted_drafts: input.drafts.length }; }
@@ -29,6 +29,10 @@ function report() {
     schema_version: 1,
     collected_at: now,
     summary: { marketplace_write_actions: 0 },
+    draft_decisions: [{
+      source_key: "smartstore:talktalk:12345678901234", purpose: "REPLY", decision: "GENERATE",
+      reason_code: "DRAFT_GENERATED", required_checks: ["출고 일정 확인"], source_content_hash: "a".repeat(64),
+    }],
     records: [{
       market: "smartstore", channel: "talktalk", source_key: "smartstore:talktalk:12345678901234",
       occurred_at: now, status: "미답변", category: "배송", customer_masked: "고***",
@@ -63,6 +67,8 @@ test("HTTP sync maps a masked collector report into stable D1 DTOs", async () =>
   assert.equal(repository.sync?.messages[0].actor, "CUSTOMER");
   assert.equal(repository.sync?.drafts[0].purpose, "REPLY");
   assert.equal(repository.sync?.drafts[0].created_run_id, "SYNC:20260901:001");
+  assert.equal(repository.sync?.decisions?.[0].decision, "GENERATE");
+  assert.deepEqual(repository.sync?.decisions?.[0].required_checks, ["출고 일정 확인"]);
   assert.match(repository.sync?.messages[0].message_key ?? "", /^MSG:[a-f0-9]{16}:[a-f0-9]{16}$/);
   assert.deepEqual(await response.json(), {
     ok: true, run_id: "SYNC:20260901:001", duplicate_run: false, inserted_cases: 1, updated_cases: 0,
