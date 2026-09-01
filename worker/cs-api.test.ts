@@ -6,8 +6,10 @@ import {
   type CaseListQuery,
   type CsStore,
   type ReviewDraftInput,
+  type ReviewLibraryInput,
   type SyncRunInput,
   type UpsertDraftInput,
+  type UpsertTemplateInput,
 } from "./cs-api.ts";
 
 const syncKey = "test-sync-key";
@@ -18,8 +20,12 @@ class FakeStore implements CsStore {
   async overview(): Promise<Record<string, unknown>> { this.calls.push({ name: "overview" }); return { ok: true, total_live: 1 }; }
   async listCases(query: CaseListQuery) { this.calls.push({ name: "listCases", value: query }); return { ok: true, items: [], limit: query.limit }; }
   async getCase(caseKey: string) { this.calls.push({ name: "getCase", value: caseKey }); return caseKey === "missing" ? null : { ok: true, case_key: caseKey }; }
+  async listTemplates(qualityState?: "CANDIDATE" | "USE" | "EXCLUDE") { this.calls.push({ name: "listTemplates", value: qualityState }); return { ok: true, items: [] }; }
+  async listLibraryEntries(qualityState?: "CANDIDATE" | "USE" | "EXCLUDE") { this.calls.push({ name: "listLibraryEntries", value: qualityState }); return { ok: true, items: [] }; }
   async syncRun(input: SyncRunInput) { this.calls.push({ name: "syncRun", value: input }); return { ok: true, run_id: input.run_id }; }
   async upsertDraft(input: UpsertDraftInput) { this.calls.push({ name: "upsertDraft", value: input }); return { ok: true, draft_id: "draft-1", purpose: input.purpose }; }
+  async upsertTemplate(input: UpsertTemplateInput) { this.calls.push({ name: "upsertTemplate", value: input }); return { ok: true, template_id: input.template_key }; }
+  async reviewLibraryEntry(entryId: string, input: ReviewLibraryInput) { this.calls.push({ name: "reviewLibraryEntry", value: { entryId, input } }); return { ok: true, library_entry_id: entryId, quality_state: input.quality_state }; }
   async reviewReplyDraft(draftId: string, input: ReviewDraftInput) {
     this.calls.push({ name: "reviewReplyDraft", value: { draftId, input } });
     if (draftId === "eval-draft") throw new CsApiError("EVAL_REVIEW_FORBIDDEN", 409);
@@ -95,6 +101,22 @@ test("EVAL reviews are rejected by API input and by the store contract", async (
   assert.equal(store.calls.at(-1)?.name, "reviewReplyDraft");
   assert.equal((await api(request("/api/cs/drafts/reply-draft/review", { ...json({ ...review, purpose: "EVAL" }), method: "PATCH" }))).status, 409);
   assert.equal((await api(request("/api/cs/drafts/eval-draft/review", { ...json(review), method: "PATCH" }))).status, 409);
+});
+
+test("template and answer-library routes expose only review-safe operations", async () => {
+  const { api, store } = makeApi();
+  assert.equal((await api(request("/api/cs/templates?quality_state=USE"))).status, 200);
+  assert.deepEqual(store.calls.at(-1), { name: "listTemplates", value: "USE" });
+  assert.equal((await api(request("/api/cs/library?quality_state=CANDIDATE"))).status, 200);
+  assert.deepEqual(store.calls.at(-1), { name: "listLibraryEntries", value: "CANDIDATE" });
+  assert.equal((await api(request("/api/cs/templates?quality_state=USE&quality_state=EXCLUDE"))).status, 400);
+  const template = { template_key: "delivery", template_version: "v1", template_name: "배송 확인", template_text: "출고 일정을 확인해 안내드리겠습니다.", required_checks: ["출고 일정 확인"], ...safety };
+  assert.equal((await api(request("/api/cs/templates", json(template)))).status, 201);
+  assert.equal(store.calls.at(-1)?.name, "upsertTemplate");
+  const libraryReview = { quality_state: "USE", review_note: "검증 완료", ...safety };
+  assert.equal((await api(request("/api/cs/library/ANSWER_abc", { ...json(libraryReview), method: "PATCH" }))).status, 200);
+  assert.equal(store.calls.at(-1)?.name, "reviewLibraryEntry");
+  assert.equal((await api(request("/api/cs/library/ANSWER_abc", { ...json({ ...libraryReview, quality_state: "CANDIDATE" }), method: "PATCH" }))).status, 400);
 });
 
 test("unsafe store output is fail-closed", async () => {

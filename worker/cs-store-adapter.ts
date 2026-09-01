@@ -1,8 +1,8 @@
-import { CsApiError, type CaseListQuery, type CsStore, type JsonObject, type ReviewDraftInput, type SyncRunInput as ApiSyncRunInput, type UpsertDraftInput } from "./cs-api.ts";
+import { CsApiError, type CaseListQuery, type CsStore, type JsonObject, type ReviewDraftInput, type ReviewLibraryInput, type SyncRunInput as ApiSyncRunInput, type UpsertDraftInput, type UpsertTemplateInput } from "./cs-api.ts";
 import type { CsDataRepository } from "./cs-data/repository.ts";
-import type { Actor, CsCaseInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, ReplyState, SyncRunInput } from "./cs-data/types.ts";
+import type { Actor, AnswerLibraryEntryInput, AnswerLibrarySourceType, CaseSummaryInput, CsCaseInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, NoReplyPatternInput, ReplyState, ReplyTemplateInput, SyncRunInput } from "./cs-data/types.ts";
 
-type RepositoryPort = Pick<CsDataRepository, "health" | "overview" | "listCases" | "getCase" | "syncRun" | "upsertDraft" | "reviewReplyDraft">;
+type RepositoryPort = Pick<CsDataRepository, "health" | "overview" | "listCases" | "getCase" | "listTemplates" | "listLibraryEntries" | "syncRun" | "upsertDraft" | "upsertTemplate" | "upsertLibraryEntry" | "reviewLibraryEntry" | "reviewReplyDraft">;
 
 const CHANNELS: Record<string, { market: string; channel: string; ui_type: "CHAT" | "POST" }> = {
   smartstore_comments: { market: "SMARTSTORE", channel: "문의 관리", ui_type: "POST" },
@@ -124,7 +124,11 @@ function publicCase(item: Record<string, unknown>): JsonObject {
   };
 }
 
-function publicDetail(detail: NonNullable<Awaited<ReturnType<RepositoryPort["getCase"]>>>): JsonObject {
+function publicDetail(
+  detail: NonNullable<Awaited<ReturnType<RepositoryPort["getCase"]>>>,
+  templates: Record<string, unknown>[] = [],
+  libraryEntries: Record<string, unknown>[] = [],
+): JsonObject {
   return {
     ok: true,
     case: publicCase(detail.case),
@@ -132,6 +136,22 @@ function publicDetail(detail: NonNullable<Awaited<ReturnType<RepositoryPort["get
     drafts: detail.drafts.map((draft) => ({ ...draft, draft_text: draft.draft_text_masked ?? "", draft_state: draft.state ?? "" })),
     decisions: detail.decisions,
     review_events: detail.review_events,
+    summary: detail.summary ?? null,
+    templates: templates.map((item) => ({
+      ...item,
+      id: item.template_id,
+      title: item.template_name_masked,
+      text: item.template_text_masked,
+      version: item.template_version,
+      variables: item.required_checks_json,
+    })),
+    library_examples: libraryEntries.slice(0, 3).map((item) => ({
+      ...item,
+      id: item.library_entry_id,
+      title: item.intent || "검증된 과거 답변",
+      text: item.answer_text_masked,
+      version: item.source_version,
+    })),
     human_reply_source: "MARKETPLACE_ONLY",
   };
 }
@@ -261,9 +281,90 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
       created_at: collectedAt,
     };
   });
+  const caseByKey = new Map(cases.map((item) => [item.case_key, item] as const));
+  const caseSummaries: CaseSummaryInput[] = rows(report.case_summaries, 2_000, "INVALID_CASE_SUMMARIES").map((summaryRow) => {
+    const caseKey = text(summaryRow.source_key, 300);
+    const caseRow = caseByKey.get(caseKey);
+    if (!caseRow) throw new CsApiError("CASE_SUMMARY_CASE_NOT_FOUND", 400);
+    const sourceHash = text(summaryRow.source_content_hash, 128);
+    if (sourceHash !== caseRow.content_hash) throw new CsApiError("CASE_SUMMARY_CONTENT_HASH_MISMATCH", 400);
+    if (text(summaryRow.pii_scan, 20).toUpperCase() !== "PASS") throw new CsApiError("CASE_SUMMARY_PII_SCAN_REQUIRED", 400);
+    const summaryText = text(summaryRow.summary_text_masked, 20_000);
+    if (!summaryText) throw new CsApiError("CASE_SUMMARY_TEXT_REQUIRED", 400);
+    assertNoPlainContact(summaryText);
+    return {
+      case_key: caseKey,
+      summary_text_masked: summaryText,
+      summary_version: text(summaryRow.summary_version, 100) || "summary-v1",
+      source_content_hash: sourceHash,
+      created_run_id: input.run_id,
+      created_at: collectedAt,
+    };
+  });
+  const answerLibraryEntries: AnswerLibraryEntryInput[] = rows(report.answer_library_candidates, 2_000, "INVALID_ANSWER_LIBRARY_CANDIDATES").map((candidate) => {
+    const caseKey = text(candidate.source_case_key, 300);
+    const caseRow = caseByKey.get(caseKey);
+    if (!caseRow) throw new CsApiError("ANSWER_LIBRARY_CASE_NOT_FOUND", 400);
+    if (caseRow.reply_state !== "ANSWERED" && caseRow.reply_state !== "CLOSED") throw new CsApiError("ANSWER_LIBRARY_REPLY_STATE_INVALID", 400);
+    const sourceHash = text(candidate.source_content_hash, 128);
+    if (sourceHash !== caseRow.content_hash) throw new CsApiError("ANSWER_LIBRARY_CONTENT_HASH_MISMATCH", 400);
+    if (text(candidate.candidate_state, 20).toUpperCase() !== "CANDIDATE" || text(candidate.source_type, 50).toUpperCase() !== "ACTUAL_SELLER_REPLY") {
+      throw new CsApiError("ANSWER_LIBRARY_CANDIDATE_INVALID", 400);
+    }
+    const question = text(candidate.customer_question_masked, 20_000);
+    const answer = text(candidate.human_answer_masked, 20_000);
+    if (!question || !answer) throw new CsApiError("ANSWER_LIBRARY_TEXT_REQUIRED", 400);
+    assertNoPlainContact(question); assertNoPlainContact(answer);
+    const candidateId = text(candidate.candidate_id, 300);
+    const sourceId = text(candidate.seller_message_key, 300);
+    if (!candidateId || !sourceId) throw new CsApiError("ANSWER_LIBRARY_IDENTITY_REQUIRED", 400);
+    return {
+      library_entry_id: candidateId,
+      case_key: caseKey,
+      source_type: "ACTUAL_SELLER_REPLY",
+      source_id: sourceId,
+      source_version: text(candidate.seller_message_hash, 128) || sourceHash,
+      question_text_masked: question,
+      answer_text_masked: answer,
+      market: caseRow.market,
+      channel: caseRow.channel,
+      intent: text(candidate.category, 100),
+      quality_state: "CANDIDATE",
+      source_content_hash: sourceHash,
+      created_run_id: input.run_id,
+      created_at: collectedAt,
+    };
+  });
+  const noReplyPatterns: NoReplyPatternInput[] = rows(report.no_reply_pattern_candidates, 2_000, "INVALID_NO_REPLY_PATTERN_CANDIDATES").map((candidate) => {
+    const caseKey = text(candidate.source_case_key, 300);
+    const caseRow = caseByKey.get(caseKey);
+    if (!caseRow) throw new CsApiError("NO_REPLY_PATTERN_CASE_NOT_FOUND", 400);
+    if (caseRow.reply_state !== "NO_REPLY" && caseRow.reply_state !== "NO_REPLY_REQUIRED") throw new CsApiError("NO_REPLY_PATTERN_REPLY_STATE_INVALID", 400);
+    const sourceHash = text(candidate.source_content_hash, 128);
+    if (sourceHash !== caseRow.content_hash) throw new CsApiError("NO_REPLY_PATTERN_CONTENT_HASH_MISMATCH", 400);
+    if (text(candidate.candidate_state, 20).toUpperCase() !== "CANDIDATE" || text(candidate.reply_state, 30).toUpperCase() !== "NO_REPLY_REQUIRED") {
+      throw new CsApiError("NO_REPLY_PATTERN_CANDIDATE_INVALID", 400);
+    }
+    const patternText = text(candidate.customer_question_masked, 20_000);
+    if (!patternText) throw new CsApiError("NO_REPLY_PATTERN_TEXT_REQUIRED", 400);
+    assertNoPlainContact(patternText);
+    const candidateId = text(candidate.candidate_id, 300);
+    if (!candidateId) throw new CsApiError("NO_REPLY_PATTERN_IDENTITY_REQUIRED", 400);
+    return {
+      pattern_id: candidateId,
+      case_key: caseKey,
+      pattern_text_masked: patternText,
+      reason_code: "NO_REPLY_REQUIRED",
+      quality_state: "CANDIDATE",
+      source_content_hash: sourceHash,
+      created_run_id: input.run_id,
+      created_at: collectedAt,
+    };
+  });
   return {
     run_id: input.run_id, environment: "development", mode: "READ_ONLY",
     started_at: collectedAt, finished_at: collectedAt, cases, messages, drafts, decisions,
+    case_summaries: caseSummaries, answer_library_entries: answerLibraryEntries, no_reply_patterns: noReplyPatterns,
   };
 }
 
@@ -283,8 +384,18 @@ export class CsStoreAdapter implements CsStore {
     return { ok: true, ...result, items: result.items.map((item) => publicCase(item as unknown as Record<string, unknown>)) };
   }
   async getCase(caseKey: string): Promise<JsonObject | null> {
-    const detail = await this.repository.getCase(caseKey);
-    return detail ? publicDetail(detail) : null;
+    const [detail, templates, libraryEntries] = await Promise.all([
+      this.repository.getCase(caseKey),
+      this.repository.listTemplates("USE"),
+      this.repository.listLibraryEntries("USE"),
+    ]);
+    return detail ? publicDetail(detail, templates, libraryEntries) : null;
+  }
+  async listTemplates(qualityState?: "CANDIDATE" | "USE" | "EXCLUDE"): Promise<JsonObject> {
+    return { ok: true, items: await this.repository.listTemplates(qualityState) };
+  }
+  async listLibraryEntries(qualityState?: "CANDIDATE" | "USE" | "EXCLUDE"): Promise<JsonObject> {
+    return { ok: true, items: await this.repository.listLibraryEntries(qualityState) };
   }
   async syncRun(input: ApiSyncRunInput): Promise<JsonObject> { return { ok: true, ...(await this.repository.syncRun(repositoryInput(input))) }; }
 
@@ -316,15 +427,92 @@ export class CsStoreAdapter implements CsStore {
     return { ok: true, draft_id: draft.draft_id, purpose: draft.purpose, ...(await this.repository.upsertDraft(draft)) };
   }
 
+  async upsertTemplate(input: UpsertTemplateInput): Promise<JsonObject> {
+    assertNoPlainContact(input.template_name); assertNoPlainContact(input.template_text);
+    for (const check of input.required_checks ?? []) assertNoPlainContact(check);
+    const createdAt = this.now();
+    const template: ReplyTemplateInput = {
+      template_id: `TEMPLATE:${stableToken(`${input.template_key}|${input.template_version}`)}`,
+      template_key: input.template_key,
+      template_version: input.template_version,
+      template_name_masked: input.template_name,
+      template_text_masked: input.template_text,
+      market: input.market ?? null,
+      channel: input.channel ?? null,
+      intent: input.intent ?? null,
+      required_checks: input.required_checks ?? [],
+      quality_state: input.quality_state ?? "CANDIDATE",
+      created_at: createdAt,
+    };
+    return { ok: true, template_id: template.template_id, ...(await this.repository.upsertTemplate(template)) };
+  }
+
+  async reviewLibraryEntry(entryId: string, input: ReviewLibraryInput): Promise<JsonObject> {
+    const review: LibraryEntryReviewInput = {
+      library_entry_id: entryId,
+      quality_state: input.quality_state,
+      review_note_masked: input.review_note ?? "",
+      reviewer_ref: "development-reviewer",
+      reviewed_at: this.now(),
+    };
+    const result = await this.repository.reviewLibraryEntry(review);
+    if (!result.reviewed) throw new CsApiError("LIBRARY_ENTRY_NOT_FOUND", 404);
+    return { ok: true, ...result };
+  }
+
   async reviewReplyDraft(draftId: string, input: ReviewDraftInput): Promise<JsonObject> {
+    const reviewedAt = this.now();
     const review: DraftReviewInput = {
       draft_id: draftId, draft_state: input.draft_state,
       review_note_masked: input.review_note ?? "", human_revision_masked: input.human_revision ?? "",
-      reviewed_at: this.now(), reviewer_ref: "development-reviewer",
+      reviewed_at: reviewedAt, reviewer_ref: "development-reviewer",
+      composition_source_type: input.composition_source_type ?? "MANUAL",
+      composition_source_id: input.composition_source_id ?? null,
+      composition_source_version: input.composition_source_version ?? null,
+      base_text_hash: input.base_text_hash ?? null,
+      final_text_hash: input.final_text_hash ?? null,
+      unresolved_variables: input.unresolved_variables ?? [],
+      source_content_hash: input.source_content_hash ?? null,
     };
-    try { return { ok: true, ...(await this.repository.reviewReplyDraft(review)) }; }
+    try {
+      const result = await this.repository.reviewReplyDraft(review);
+      let libraryCandidateId: string | null = null;
+      if (input.draft_state === "APPROVED" && input.human_revision) {
+        const detail = await this.repository.getCase(result.case_key);
+        if (!detail) throw new CsApiError("CASE_NOT_FOUND", 404);
+        const customer = [...detail.messages].reverse().find((message) => text(message.actor, 20) === "CUSTOMER" && text(message.text_masked, 20_000));
+        if (!customer) throw new CsApiError("DRAFT_CUSTOMER_MESSAGE_REQUIRED", 409);
+        const question = text(customer.text_masked, 20_000);
+        const answer = input.human_revision;
+        assertNoPlainContact(question); assertNoPlainContact(answer);
+        const sourceType: AnswerLibrarySourceType = input.composition_source_type === "REPLY_TEMPLATE" ? "REVIEWED_TEMPLATE_REVISION"
+          : input.composition_source_type === "AI_DRAFT" ? "REVIEWED_AI_REVISION" : "MANUAL_REVIEW_REPLY";
+        const sourceId = input.composition_source_id || draftId;
+        const sourceVersion = input.composition_source_version || input.final_text_hash || stableToken(answer);
+        libraryCandidateId = `ANSWER:${stableToken(`${sourceType}|${sourceId}|${sourceVersion}|${result.case_key}`)}`;
+        const entry: AnswerLibraryEntryInput = {
+          library_entry_id: libraryCandidateId,
+          case_key: result.case_key,
+          source_type: sourceType,
+          source_id: sourceId,
+          source_version: sourceVersion,
+          question_text_masked: question,
+          answer_text_masked: answer,
+          market: text(detail.case.market, 50),
+          channel: text(detail.case.channel, 100),
+          intent: text(detail.drafts.find((item) => text(item.draft_id, 300) === draftId)?.intent, 100),
+          quality_state: "CANDIDATE",
+          source_content_hash: text(detail.case.content_hash, 128),
+          created_run_id: text(detail.case.last_sync_run_id, 300),
+          created_at: reviewedAt,
+        };
+        await this.repository.upsertLibraryEntry(entry);
+      }
+      return { ok: true, ...result, library_candidate_id: libraryCandidateId };
+    }
     catch (error) {
       if (error instanceof Error && error.message === "REPLY_DRAFT_NOT_FOUND") throw new CsApiError("EVAL_REVIEW_FORBIDDEN_OR_NOT_FOUND", 409);
+      if (error instanceof Error && error.message === "SOURCE_CONTENT_HASH_STALE") throw new CsApiError("SOURCE_CONTENT_HASH_STALE", 409);
       throw error;
     }
   }

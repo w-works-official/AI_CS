@@ -36,6 +36,34 @@ function d1Target() {
   return { endpoint: new URL(DEFAULT_D1_API_URL), environment: 'development' as const };
 }
 
+function d1ReviewTarget() {
+  if (process.env.AI_CS_WEB_ENVIRONMENT === 'production') return null;
+  // The development Worker intentionally reuses the same server-side Apps Script
+  // key for its narrow D1 write routes. Sites already stores this value as a
+  // hidden secret, so no second credential or client-visible configuration is
+  // needed for the review-desk vertical slice.
+  const syncKey = process.env.AI_CS_DEV_D1_SYNC_KEY ?? process.env.MARKETPLACE_CS_SYNC_KEY;
+  if (!syncKey) return null;
+  try {
+    const endpoint = new URL(DEFAULT_D1_API_URL);
+    if (endpoint.protocol !== 'https:') throw new Error('D1_REVIEW_URL_NOT_HTTPS');
+    return { endpoint, syncKey, environment: 'development' as const };
+  } catch {
+    throw new D1ReadError('CS_D1_REVIEW_TARGET_INVALID', 502);
+  }
+}
+
+function appsScriptWriteBody(writeRequest: ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeSyncRequest>) {
+  if (writeRequest.action !== 'reviewDraft') return writeRequest;
+  return {
+    action: writeRequest.action,
+    draft_id: writeRequest.draft_id,
+    draft_state: writeRequest.draft_state,
+    review_note: writeRequest.review_note,
+    human_revision: writeRequest.human_revision,
+  };
+}
+
 function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
   return NextResponse.json(body, {
     status,
@@ -70,6 +98,26 @@ async function readD1(base: URL, path: string, params?: URLSearchParams): Promis
   try {
     response = await fetch(upstream, { cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' } });
   } catch { throw new D1ReadError('CS_D1_CONNECTION_FAILED', 502); }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const code = payload && typeof payload === 'object' && !Array.isArray(payload) ? String((payload as D1Payload).error ?? `D1_HTTP_${response.status}`) : `D1_HTTP_${response.status}`;
+    throw new D1ReadError(code, response.status >= 400 && response.status < 500 ? response.status : 502);
+  }
+  return d1Safety(payload);
+}
+
+async function writeD1Review(target: NonNullable<ReturnType<typeof d1ReviewTarget>>, review: ReturnType<typeof normalizeReviewRequest>): Promise<D1Payload> {
+  const upstream = new URL(target.endpoint);
+  upstream.pathname = `${target.endpoint.pathname.replace(/\/$/, '')}/drafts/${encodeURIComponent(review.draft_id)}/review`;
+  const body = Object.fromEntries(Object.entries(review).filter(([key]) => key !== 'action'));
+  let response: Response;
+  try {
+    response = await fetch(upstream, {
+      method: 'PATCH', cache: 'no-store', redirect: 'error',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CS-Sync-Key': target.syncKey },
+      body: JSON.stringify(body),
+    });
+  } catch { throw new D1ReadError('CS_D1_REVIEW_CONNECTION_FAILED', 502); }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const code = payload && typeof payload === 'object' && !Array.isArray(payload) ? String((payload as D1Payload).error ?? `D1_HTTP_${response.status}`) : `D1_HTTP_${response.status}`;
@@ -224,20 +272,40 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  let target: ReturnType<typeof appsScriptTarget>;
-  try {
-    target = appsScriptTarget();
-    if (target.environment !== 'development') throw new Error('DEVELOPMENT_WRITE_ONLY');
-  } catch (error) {
-    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_REVIEW_NOT_CONFIGURED', environment: 'unconfigured', auto_send: false }, 403);
-  }
-
   let writeRequest: ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeSyncRequest>;
   try {
     const raw = await request.json() as Record<string, unknown>;
     writeRequest = raw?.action === 'syncRun' ? normalizeSyncRequest(raw) : normalizeReviewRequest(raw);
   } catch (error) {
-    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'INVALID_WRITE_REQUEST', environment: target.environment, auto_send: false }, 400);
+    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'INVALID_WRITE_REQUEST', environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 400);
+  }
+
+  let workerTarget: ReturnType<typeof d1ReviewTarget> = null;
+  try {
+    if (writeRequest.action === 'reviewDraft') workerTarget = d1ReviewTarget();
+  } catch (error) {
+    const code = error instanceof D1ReadError ? error.code : 'CS_D1_REVIEW_TARGET_INVALID';
+    return privateJson({ ok: false, error: code, environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 502);
+  }
+
+  if (workerTarget && writeRequest.action === 'reviewDraft') {
+    try {
+      const payload = await writeD1Review(workerTarget, writeRequest);
+      responseCache.clear();
+      return privateJson({ ...payload, environment: 'development', auto_send: false, marketplace_write_actions: 0 });
+    } catch (error) {
+      const status = error instanceof D1ReadError ? error.status : 502;
+      const code = error instanceof D1ReadError ? error.code : 'CS_D1_REVIEW_CONNECTION_FAILED';
+      return privateJson({ ok: false, error: code, environment: 'development', auto_send: false, marketplace_write_actions: 0 }, status);
+    }
+  }
+
+  let target: ReturnType<typeof appsScriptTarget>;
+  try {
+    target = appsScriptTarget();
+    if (target.environment !== 'development') throw new Error('DEVELOPMENT_WRITE_ONLY');
+  } catch (error) {
+    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_REVIEW_NOT_CONFIGURED', environment: 'unconfigured', auto_send: false, marketplace_write_actions: 0 }, 403);
   }
 
   try {
@@ -246,7 +314,7 @@ export async function POST(request: NextRequest) {
       cache: 'no-store',
       redirect: 'follow',
       headers: { Accept: 'application/json', 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ ...writeRequest, api_key: target.apiKey, environment: target.environment }),
+      body: JSON.stringify({ ...appsScriptWriteBody(writeRequest), api_key: target.apiKey, environment: target.environment }),
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload || payload.ok === false) {
@@ -256,8 +324,8 @@ export async function POST(request: NextRequest) {
       return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: 'development', auto_send: false }, 502);
     }
     responseCache.clear();
-    return privateJson(payload);
+    return privateJson({ ...payload, environment: 'development', auto_send: false, marketplace_write_actions: 0 });
   } catch {
-    return privateJson({ ok: false, error: 'CS_WRITE_CONNECTION_FAILED', environment: 'development', auto_send: false }, 502);
+    return privateJson({ ok: false, error: 'CS_WRITE_CONNECTION_FAILED', environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 502);
   }
 }

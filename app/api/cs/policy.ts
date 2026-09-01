@@ -1,5 +1,11 @@
 const ALLOWED_REVIEW_STATES = new Set(["APPROVED", "REJECTED"]);
-const ALLOWED_REVIEW_KEYS = new Set(["draft_id", "draft_state", "review_note", "human_revision"]);
+const ALLOWED_COMPOSITION_SOURCE_TYPES = new Set(["AI_DRAFT", "REPLY_TEMPLATE", "ANSWER_LIBRARY_ENTRY", "MANUAL"]);
+const ALLOWED_REVIEW_KEYS = new Set([
+  "draft_id", "draft_state", "review_note", "human_revision",
+  "composition_source_type", "composition_source_id", "composition_source_version",
+  "base_text_hash", "final_text_hash", "unresolved_variables", "source_content_hash",
+  "environment", "auto_send", "marketplace_write_actions",
+]);
 const ALLOWED_SYNC_KEYS = new Set(["action", "run_id", "report", "model", "prompt_version"]);
 const ALLOWED_REPORT_KEYS = new Set(["schema_version", "mode", "range", "collected_at", "duration_ms", "summary", "channels", "records"]);
 const ALLOWED_RECORD_KEYS = new Set([
@@ -48,6 +54,32 @@ export function assertMaskedReviewText(value: string): void {
   if (/\b\d{12,}\b/.test(value)) throw new Error("UNMASKED_LONG_NUMBER");
 }
 
+function optionalMaskedText(value: unknown, maxLength: number, error: string): string {
+  const normalized = safeText(value, maxLength);
+  assertMaskedReviewText(normalized);
+  if (String(value ?? "").trim().length > maxLength) throw new Error(error);
+  return normalized;
+}
+
+function optionalHash(value: unknown, error: string): string {
+  const normalized = safeText(value, 64).toLowerCase();
+  if (!normalized) return "";
+  if (!/^[a-f0-9]{64}$/.test(normalized) || String(value ?? "").trim().length !== 64) throw new Error(error);
+  return normalized;
+}
+
+function normalizedUnresolvedVariables(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 20) throw new Error("INVALID_UNRESOLVED_VARIABLES");
+  return value.map((item) => {
+    if (typeof item !== "string") throw new Error("INVALID_UNRESOLVED_VARIABLES");
+    const variable = item.trim();
+    if (!/^\[[^\[\]\r\n]{1,80}\]$/.test(variable)) throw new Error("INVALID_UNRESOLVED_VARIABLES");
+    assertMaskedReviewText(variable);
+    return variable;
+  });
+}
+
 export function normalizeCaseBatchKeys(value: string): string[] {
   const keys = String(value ?? "").split(",").map((key) => key.trim()).filter(Boolean);
   if (!keys.length) throw new Error("CASE_KEYS_REQUIRED");
@@ -73,9 +105,23 @@ export function normalizeReviewRequest(input: unknown) {
   const draftState = safeText(raw.draft_state, 20).toUpperCase();
   const reviewNote = safeText(raw.review_note, 1000);
   const humanRevision = safeText(raw.human_revision, 4000);
+  const sourceType = safeText(raw.composition_source_type, 50).toUpperCase() || "MANUAL";
+  const sourceId = optionalMaskedText(raw.composition_source_id, 300, "COMPOSITION_SOURCE_ID_TOO_LONG");
+  const sourceVersion = optionalMaskedText(raw.composition_source_version, 100, "COMPOSITION_SOURCE_VERSION_TOO_LONG");
+  const baseTextHash = optionalHash(raw.base_text_hash, "INVALID_BASE_TEXT_HASH");
+  const finalTextHash = optionalHash(raw.final_text_hash, "INVALID_FINAL_TEXT_HASH");
+  const sourceContentHash = optionalHash(raw.source_content_hash, "INVALID_SOURCE_CONTENT_HASH");
+  const unresolvedVariables = normalizedUnresolvedVariables(raw.unresolved_variables);
+  const environment = raw.environment === undefined ? "development" : safeText(raw.environment, 30);
+  const autoSend = raw.auto_send === undefined ? false : raw.auto_send;
+  const marketplaceWrites = raw.marketplace_write_actions === undefined ? 0 : raw.marketplace_write_actions;
   if (!draftId) throw new Error("DRAFT_ID_REQUIRED");
   if (!ALLOWED_REVIEW_STATES.has(draftState)) throw new Error("INVALID_DRAFT_STATE");
   if (draftState === "APPROVED" && !humanRevision) throw new Error("HUMAN_REVISION_REQUIRED");
+  if (!ALLOWED_COMPOSITION_SOURCE_TYPES.has(sourceType)) throw new Error("INVALID_COMPOSITION_SOURCE_TYPE");
+  if (sourceType !== "MANUAL" && (!sourceId || !sourceVersion)) throw new Error("COMPOSITION_SOURCE_REFERENCE_REQUIRED");
+  if (environment !== "development" || autoSend !== false || Number(marketplaceWrites) !== 0) throw new Error("DEVELOPMENT_SAFETY_REQUIRED");
+  if (draftState === "APPROVED" && unresolvedVariables.length > 0) throw new Error("UNRESOLVED_TEMPLATE_VARIABLES");
   assertMaskedReviewText(reviewNote);
   assertMaskedReviewText(humanRevision);
   return {
@@ -84,6 +130,16 @@ export function normalizeReviewRequest(input: unknown) {
     draft_state: draftState as "APPROVED" | "REJECTED",
     review_note: reviewNote,
     human_revision: humanRevision,
+    composition_source_type: sourceType as "AI_DRAFT" | "REPLY_TEMPLATE" | "ANSWER_LIBRARY_ENTRY" | "MANUAL",
+    composition_source_id: sourceId,
+    composition_source_version: sourceVersion,
+    base_text_hash: baseTextHash,
+    final_text_hash: finalTextHash,
+    unresolved_variables: unresolvedVariables,
+    source_content_hash: sourceContentHash,
+    environment: "development" as const,
+    auto_send: false as const,
+    marketplace_write_actions: 0 as const,
   };
 }
 

@@ -71,7 +71,7 @@ function input(): SyncRunInput {
 }
 async function repository(): Promise<{ db: SqliteD1; store: CsDataRepository }> {
   const db = new SqliteD1();
-  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql"]) {
+  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql", "0003_review_composition_and_knowledge.sql"]) {
     const schemaPath = fileURLToPath(new URL(`./migrations/${migration}`, import.meta.url));
     db.database.exec(await readFile(schemaPath, "utf8"));
   }
@@ -96,6 +96,49 @@ test("actual migrations accept repository sync, detail, overview, and cursor que
     db.database.prepare("UPDATE cs_cases SET reply_state = 'NO_REPLY' WHERE case_key = ?").run(caseRow.case_key);
     const noReply = await store.listCases({ filters: { reply_state: "NO_REPLY_REQUIRED" } });
     assert.equal(noReply.items[0].case_key, caseRow.case_key);
+  } finally { db.close(); }
+});
+
+test("repository persists masked summaries, library knowledge, no-reply patterns, templates, and review composition", async () => {
+  const { db, store } = await repository();
+  try {
+    await store.syncRun(input());
+    assert.deepEqual(await store.upsertCaseSummary({
+      case_key: caseRow.case_key, summary_text_masked: "고객은 배송 일정을 문의했습니다.", summary_version: "summary-v1",
+      source_content_hash: caseRow.content_hash, created_run_id: "SYNC:case-1", created_at: time,
+    }), { inserted: true });
+    assert.deepEqual(await store.upsertLibraryEntry({
+      library_entry_id: "LIB:case-1", case_key: caseRow.case_key, source_type: "ACTUAL_SELLER_REPLY", source_id: "MSG:case-1:seller",
+      source_version: "v1", question_text_masked: "언제 배송되나요", answer_text_masked: "확인 중입니다", market: "SMARTSTORE",
+      channel: "talktalk", intent: "DELIVERY", source_content_hash: caseRow.content_hash, created_run_id: "SYNC:case-1", created_at: time,
+    }), { inserted: true });
+    assert.deepEqual(await store.upsertNoReplyPattern({
+      pattern_id: "PATTERN:case-1", case_key: caseRow.case_key, pattern_text_masked: "확인했습니다", reason_code: "ACKNOWLEDGEMENT",
+      source_content_hash: caseRow.content_hash, created_run_id: "SYNC:case-1", created_at: time,
+    }), { inserted: true });
+    assert.deepEqual(await store.upsertTemplate({
+      template_id: "TEMPLATE:delivery:v1", template_key: "delivery-check", template_version: "v1",
+      template_name_masked: "배송 확인 안내", template_text_masked: "확인 후 안내드리겠습니다.", market: "SMARTSTORE",
+      channel: "talktalk", intent: "DELIVERY", required_checks: ["출고 상태 확인"], quality_state: "USE", created_at: time,
+    }), { inserted: true });
+    assert.deepEqual(await store.reviewLibraryEntry({
+      library_entry_id: "LIB:case-1", quality_state: "USE", review_note_masked: "검증 완료", reviewer_ref: "reviewer-1", reviewed_at: time,
+    }), { library_entry_id: "LIB:case-1", quality_state: "USE", reviewed: true });
+
+    const detail = await store.getCase(caseRow.case_key);
+    assert.equal(detail?.summary?.summary_text_masked, "고객은 배송 일정을 문의했습니다.");
+    assert.equal((await store.listLibraryEntries("USE"))[0].library_entry_id, "LIB:case-1");
+    assert.equal((await store.listTemplates("USE"))[0].template_id, "TEMPLATE:delivery:v1");
+    await store.reviewReplyDraft({
+      draft_id: "DRAFT:case-1", draft_state: "REVISED", review_note_masked: "검수", human_revision_masked: "확인 후 안내드리겠습니다.",
+      reviewer_ref: "reviewer-1", reviewed_at: "2026-09-01T10:02:00.000Z", composition_source_type: "REPLY_TEMPLATE",
+      composition_source_id: "TEMPLATE:delivery:v1", composition_source_version: "v1", base_text_hash: "b".repeat(64),
+      final_text_hash: "c".repeat(64), unresolved_variables: ["ORDER_STATUS"], source_content_hash: caseRow.content_hash,
+    });
+    const review = db.database.prepare("SELECT composition_source_type, unresolved_variables_json, source_content_hash FROM review_events ORDER BY created_at DESC LIMIT 1").get() as Record<string, string>;
+    assert.equal(review.composition_source_type, "REPLY_TEMPLATE");
+    assert.equal(review.unresolved_variables_json, '["ORDER_STATUS"]');
+    assert.equal(review.source_content_hash, caseRow.content_hash);
   } finally { db.close(); }
 });
 

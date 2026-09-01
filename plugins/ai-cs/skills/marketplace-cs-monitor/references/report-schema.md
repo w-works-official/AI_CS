@@ -89,3 +89,13 @@ An incomplete, unpaginated, or mismatched snapshot cannot change a stored case. 
 Compare only records returned inside the same locked scope. A previous record absent from an ordinary collection is `NOT_SEEN`; do not archive, delete, or label it deleted. The only exception is the separate complete, count-matched unanswered-queue reconciliation contract described above.
 
 Google Sheets or Notion persistence must store normalized masked records only. Keep human replies and `ai_draft` in separate columns so reviewers can always distinguish them. An `EVAL` draft remains comparison-only: it must not change `reply_state`, reply-needed counts, or the verified human-answer library.
+
+## Review-only summary and learning artifacts
+
+After AI drafts and draft decisions are attached, `attachSummaryLibraryArtifacts(report)` may add three top-level arrays without editing `records[]` or recomputing any record `content_hash`:
+
+- `case_summaries[]`: masked per-case review summaries with `summary_id`, `source_key`, `source_content_hash`, case metadata, observed customer/seller message keys and hashes, masked customer question/human answer where available, and explicit eligibility/exclusion reasons.
+- `answer_library_candidates[]`: `candidate_state=CANDIDATE` rows only. A row requires `reply_state=ANSWERED|CLOSED`, `pii_scan=PASS`, and an observed non-image-only `CUSTOMER -> SELLER` message pair. Its stable `candidate_id` derives from `source_key`, `content_hash`, and both observed message keys/hashes.
+- `no_reply_pattern_candidates[]`: `candidate_state=CANDIDATE` rows only. A row requires `reply_state=NO_REPLY_REQUIRED`, `pii_scan=PASS`, and an observed non-image-only customer message. Its stable `candidate_id` derives from `source_key`, `content_hash`, and the customer message key/hash.
+
+Exclude the candidate when the chat is incomplete, any actor is `UNKNOWN`, any observed message is image-only, the PII scan is not `PASS`, or candidate text still contains unmasked PII. `ai_draft_purpose=EVAL` and all AI draft text are never learning candidates, but an observed actual seller reply remains eligible even when a separate AI/EVAL draft exists. These arrays are review inputs only; they do not create a verified answer-library entry, write to a marketplace, or modify marketplace state.

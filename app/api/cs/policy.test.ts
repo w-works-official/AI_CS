@@ -16,12 +16,32 @@ test("development review request allows only bounded review fields", () => {
     draft_state: "APPROVED",
     review_note: "사람 검수 완료",
     human_revision: "확인 후 안내드리겠습니다.",
+    composition_source_type: "REPLY_TEMPLATE",
+    composition_source_id: "delivery-delay",
+    composition_source_version: "v3",
+    base_text_hash: "a".repeat(64),
+    final_text_hash: "b".repeat(64),
+    unresolved_variables: [],
+    source_content_hash: "c".repeat(64),
+    environment: "development",
+    auto_send: false,
+    marketplace_write_actions: 0,
   }), {
     action: "reviewDraft",
     draft_id: "DRAFT:test",
     draft_state: "APPROVED",
     review_note: "사람 검수 완료",
     human_revision: "확인 후 안내드리겠습니다.",
+    composition_source_type: "REPLY_TEMPLATE",
+    composition_source_id: "delivery-delay",
+    composition_source_version: "v3",
+    base_text_hash: "a".repeat(64),
+    final_text_hash: "b".repeat(64),
+    unresolved_variables: [],
+    source_content_hash: "c".repeat(64),
+    environment: "development",
+    auto_send: false,
+    marketplace_write_actions: 0,
   });
 });
 
@@ -29,6 +49,11 @@ test("review request rejects unsafe fields and unmasked PII", () => {
   assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "USED", human_revision: "ok" }), /INVALID_DRAFT_STATE/);
   assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "010-1234-5678" }), /UNMASKED_PHONE/);
   assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", api_key: "no" }), /REVIEW_PARAM_NOT_ALLOWED/);
+  assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", composition_source_type: "AI" }), /INVALID_COMPOSITION_SOURCE_TYPE/);
+  assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", composition_source_type: "REPLY_TEMPLATE" }), /COMPOSITION_SOURCE_REFERENCE_REQUIRED/);
+  assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", final_text_hash: "not-a-hash" }), /INVALID_FINAL_TEXT_HASH/);
+  assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", unresolved_variables: ["[order_no]"] }), /UNRESOLVED_TEMPLATE_VARIABLES/);
+  assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", environment: "production", auto_send: false, marketplace_write_actions: 0 }), /DEVELOPMENT_SAFETY_REQUIRED/);
 });
 
 const safeRecord = {

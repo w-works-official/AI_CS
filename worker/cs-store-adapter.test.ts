@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createCsApiHandler } from "./cs-api.ts";
 import { CsStoreAdapter } from "./cs-store-adapter.ts";
-import type { CaseDetailResult, CursorListInput, DraftInput, DraftReviewInput, SyncRunInput } from "./cs-data/types.ts";
+import type { AnswerLibraryEntryInput, CaseDetailResult, CursorListInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, ReplyTemplateInput, SyncRunInput } from "./cs-data/types.ts";
 
 const safety = { environment: "development", auto_send: false, marketplace_write_actions: 0 } as const;
 const now = "2026-09-01T04:00:00.000Z";
@@ -11,13 +11,21 @@ class FakeRepository {
   sync?: SyncRunInput;
   draft?: DraftInput;
   review?: DraftReviewInput;
+  template?: ReplyTemplateInput;
+  libraryEntry?: AnswerLibraryEntryInput;
+  libraryReview?: LibraryEntryReviewInput;
   detail: CaseDetailResult | null = null;
   async health() { return { ok: true as const, service: "ai-cs-d1-repository" as const, schema_version: "v1" as const, write_policy: "MASKED_DTO_ONLY" as const }; }
   async overview() { return { total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, closed: 0, by_market: { SMARTSTORE: 1 }, latest_sync: null }; }
   async listCases(input: CursorListInput) { void input; return { items: [], cursor: 0, next_cursor: null }; }
   async getCase(caseKey: string) { void caseKey; return this.detail; }
+  async listTemplates() { return []; }
+  async listLibraryEntries() { return []; }
   async syncRun(input: SyncRunInput) { this.sync = input; return { run_id: input.run_id, duplicate_run: false, inserted_cases: input.cases.length, updated_cases: 0, inserted_messages: input.messages.length, inserted_drafts: input.drafts.length }; }
   async upsertDraft(input: DraftInput) { this.draft = input; return { inserted: true }; }
+  async upsertTemplate(input: ReplyTemplateInput) { this.template = input; return { inserted: true }; }
+  async upsertLibraryEntry(input: AnswerLibraryEntryInput) { this.libraryEntry = input; return { inserted: true }; }
+  async reviewLibraryEntry(input: LibraryEntryReviewInput) { this.libraryReview = input; return { library_entry_id: input.library_entry_id, quality_state: input.quality_state, reviewed: true }; }
   async reviewReplyDraft(input: DraftReviewInput) {
     this.review = input;
     return { draft_id: input.draft_id, case_key: "smartstore:talktalk:12345678901234", draft_state: input.draft_state, reviewed_at: input.reviewed_at, reply_state_changed: false as const, human_revision_saved: Boolean(input.human_revision_masked) };
@@ -90,11 +98,56 @@ test("adapter rejects unsafe URL hosts and incomplete chat drafts", async () => 
   assert.equal((await api(jsonRequest("/api/cs/sync", { run_id: "SYNC:incomplete", report: incomplete, ...safety }))).status, 400);
 });
 
+test("sync maps masked summaries, actual-answer candidates, and no-reply patterns", async () => {
+  const repository = new FakeRepository();
+  const api = createCsApiHandler({ store: new CsStoreAdapter(repository, () => now), syncKey: "test-key" });
+  type KnowledgeRecord = Record<string, unknown> & { messages: Array<Record<string, unknown>> };
+  const knowledge = structuredClone(report()) as unknown as Record<string, unknown> & {
+    records: KnowledgeRecord[]; draft_decisions: unknown[]; case_summaries?: unknown[];
+    answer_library_candidates?: unknown[]; no_reply_pattern_candidates?: unknown[];
+  };
+  const answered = knowledge.records[0];
+  answered.source_key = "smartstore:comments:answered";
+  answered.channel = "comments";
+  answered.reply_state = "ANSWERED";
+  answered.content_hash = "b".repeat(64);
+  answered.messages.push({ source_message_id: "seller-1", sequence: 2, actor: "seller", at: now, text: "오늘 출고 예정입니다.", image_count: 0 });
+  delete answered.ai_draft; delete answered.ai_draft_origin; delete answered.ai_draft_purpose; delete answered.ai_draft_required_checks; delete answered.ai_draft_pii_scan;
+  const noReply = {
+    ...answered,
+    source_key: "smartstore:customer_qna:no-reply",
+    channel: "customer_qna",
+    reply_state: "NO_REPLY_REQUIRED",
+    content_hash: "c".repeat(64),
+    messages: [{ source_message_id: "customer-2", sequence: 1, actor: "customer", at: now, text: "감사합니다.", image_count: 0 }],
+  };
+  knowledge.records = [answered, noReply];
+  knowledge.draft_decisions = [];
+  knowledge.case_summaries = [answered, noReply].map((record) => ({
+    source_key: record.source_key, source_content_hash: record.content_hash, summary_text_masked: `문의 요약: ${String(record.messages[0].text ?? "")}`,
+    summary_version: "summary-v1", pii_scan: "PASS",
+  }));
+  knowledge.answer_library_candidates = [{
+    candidate_id: "ANSWER_candidate", candidate_state: "CANDIDATE", source_type: "ACTUAL_SELLER_REPLY",
+    source_case_key: answered.source_key, source_content_hash: answered.content_hash, seller_message_key: "seller-1",
+    seller_message_hash: "seller-hash", customer_question_masked: "언제 발송되나요", human_answer_masked: "오늘 출고 예정입니다.", category: "배송",
+  }];
+  knowledge.no_reply_pattern_candidates = [{
+    candidate_id: "NO_REPLY_candidate", candidate_state: "CANDIDATE", reply_state: "NO_REPLY_REQUIRED",
+    source_case_key: noReply.source_key, source_content_hash: noReply.content_hash, customer_question_masked: "감사합니다.",
+  }];
+  const response = await api(jsonRequest("/api/cs/sync", { run_id: "SYNC:knowledge", report: knowledge, ...safety }));
+  assert.equal(response.status, 200);
+  assert.equal(repository.sync?.case_summaries?.length, 2);
+  assert.equal(repository.sync?.answer_library_entries?.[0].source_type, "ACTUAL_SELLER_REPLY");
+  assert.equal(repository.sync?.no_reply_patterns?.[0].reason_code, "NO_REPLY_REQUIRED");
+});
+
 test("direct draft creation and human review remain local and REPLY-only", async () => {
   const repository = new FakeRepository();
   repository.detail = {
     case: { case_key: "smartstore:talktalk:12345678901234", content_hash: "a".repeat(64), reply_state: "NEEDS_REPLY", conversation_complete: 1, last_sync_run_id: "SYNC:20260901:001" },
-    messages: [{ message_key: "MSG:customer", actor: "CUSTOMER", sequence: 1 }], drafts: [], decisions: [], review_events: [],
+    messages: [{ message_key: "MSG:customer", actor: "CUSTOMER", sequence: 1, text_masked: "언제 발송되나요" }], drafts: [], decisions: [], review_events: [],
   };
   const api = createCsApiHandler({ store: new CsStoreAdapter(repository, () => now), syncKey: "test-key" });
   const draft = await api(jsonRequest("/api/cs/drafts", {
@@ -106,9 +159,14 @@ test("direct draft creation and human review remain local and REPLY-only", async
   assert.equal(repository.draft?.source_customer_message_key, "MSG:customer");
 
   const review = await api(jsonRequest(`/api/cs/drafts/${repository.draft?.draft_id}/review`, {
-    draft_state: "APPROVED", human_revision: "확인 후 안내드리겠습니다.", ...safety,
+    draft_state: "APPROVED", human_revision: "확인 후 안내드리겠습니다.",
+    composition_source_type: "AI_DRAFT", composition_source_id: repository.draft?.draft_id,
+    composition_source_version: "worker-v1", source_content_hash: "a".repeat(64), ...safety,
   }, "PATCH"));
   assert.equal(review.status, 200);
   assert.equal(repository.review?.draft_state, "APPROVED");
+  assert.equal(repository.review?.composition_source_type, "AI_DRAFT");
+  assert.equal(repository.libraryEntry?.source_type, "REVIEWED_AI_REVISION");
+  assert.equal(repository.libraryEntry?.quality_state, "CANDIDATE");
   assert.equal((await review.json() as Record<string, unknown>).marketplace_write_actions, 0);
 });

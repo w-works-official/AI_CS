@@ -6,7 +6,10 @@ import { fileURLToPath } from "node:url";
 
 const schemaPath = fileURLToPath(new URL("./migrations/0001_initial.sql", import.meta.url));
 const diagnosticsPath = fileURLToPath(new URL("./migrations/0002_draft_decision_diagnostics.sql", import.meta.url));
+const knowledgePath = fileURLToPath(new URL("./migrations/0003_review_composition_and_knowledge.sql", import.meta.url));
 const schema = (await readFile(schemaPath, "utf8")).replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
+const allMigrations = await Promise.all([schemaPath, diagnosticsPath, knowledgePath].map((path) => readFile(path, "utf8")));
+const allMigrationSql = allMigrations.join("\n").replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
 
 function createTable(name) {
   const match = schema.match(new RegExp(`CREATE TABLE ${name} \\((.*?)\\);`, "i"));
@@ -19,6 +22,33 @@ test("migration executes in the local SQLite engine used for D1-compatible check
   try {
     database.exec(await readFile(schemaPath, "utf8"));
     database.exec(await readFile(diagnosticsPath, "utf8"));
+    database.exec(await readFile(knowledgePath, "utf8"));
+  } finally {
+    database.close();
+  }
+});
+
+test("review composition and derived knowledge schema remain masked and review-only", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const path of [schemaPath, diagnosticsPath, knowledgePath]) database.exec(await readFile(path, "utf8"));
+    for (const table of ["case_summaries", "answer_library_entries", "no_reply_patterns", "reply_templates"]) {
+      assert.ok(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table), `missing ${table}`);
+    }
+    const reviewColumns = database.prepare("PRAGMA table_info(review_events)").all().map((column) => column.name);
+    for (const column of ["composition_source_type", "composition_source_id", "composition_source_version", "base_text_hash", "final_text_hash", "unresolved_variables_json", "source_content_hash"]) {
+      assert.ok(reviewColumns.includes(column), `missing review_events.${column}`);
+    }
+    const librarySql = String(database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'answer_library_entries'").get()?.sql ?? "");
+    assert.match(librarySql, /ACTUAL_SELLER_REPLY/);
+    assert.match(librarySql, /REVIEWED_AI_REVISION/);
+    assert.match(librarySql, /REVIEWED_TEMPLATE_REVISION/);
+    assert.match(librarySql, /MANUAL_REVIEW_REPLY/);
+    for (const table of ["case_summaries", "answer_library_entries", "no_reply_patterns", "reply_templates"]) {
+      const sql = String(database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql ?? "");
+      assert.match(sql, /pii_scan TEXT NOT NULL CHECK \(pii_scan = 'PASS'\)/i, `${table} must require PASS`);
+      if (table !== "case_summaries") assert.match(sql, /quality_state TEXT NOT NULL DEFAULT 'CANDIDATE' CHECK \(quality_state IN \('CANDIDATE', 'USE', 'EXCLUDE'\)\)/i, `${table} must constrain quality`);
+    }
   } finally {
     database.close();
   }
@@ -109,6 +139,6 @@ test("schema has no marketplace mutation or answer-transmission columns", () => 
   ];
 
   for (const column of forbiddenColumns) {
-    assert.doesNotMatch(schema, new RegExp(`\\b${column}\\b`, "i"), `forbidden column present: ${column}`);
+    assert.doesNotMatch(allMigrationSql, new RegExp(`\\b${column}\\b`, "i"), `forbidden column present: ${column}`);
   }
 });

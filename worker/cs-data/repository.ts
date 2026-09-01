@@ -1,11 +1,11 @@
-import type { CaseDetailResult, CaseFilters, CaseListItem, CsCaseInput, CsMessageInput, CursorListInput, CursorListResult, D1Database, D1PreparedStatement, DraftDecisionInput, DraftInput, DraftReviewInput, DraftReviewResult, HealthResult, OverviewResult, SyncRunInput, SyncRunResult } from "./types.ts";
+import type { AnswerLibraryEntryInput, CaseDetailResult, CaseFilters, CaseListItem, CaseSummaryInput, CsCaseInput, CsMessageInput, CursorListInput, CursorListResult, D1Database, D1PreparedStatement, DraftDecisionInput, DraftInput, DraftReviewInput, DraftReviewResult, HealthResult, LibraryEntryReviewInput, NoReplyPatternInput, OverviewResult, QualityState, ReplyTemplateInput, SyncRunInput, SyncRunResult } from "./types.ts";
 
 const MAX_LIST_LIMIT = 100;
 const SERVICE = "ai-cs-d1-repository" as const;
 type ExistingRow = { value: string };
 type CountRow = Record<string, number | string | null>;
 type MarketRow = { market: string; count: number | string };
-type ReviewDraftRow = { case_key: string };
+type ReviewDraftRow = { case_key: string; content_hash: string };
 const asNumber = (value: number | string | null | undefined): number => Number.isFinite(Number(value ?? 0)) ? Number(value ?? 0) : 0;
 const asBoolean = (value: boolean): number => value ? 1 : 0;
 
@@ -72,7 +72,8 @@ export class CsDataRepository {
   async getCase(caseKey: string): Promise<CaseDetailResult | null> {
     const item = await this.db.prepare("SELECT * FROM cs_cases WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>();
     if (!item) return null;
-    const [messages, drafts, decisions, reviewEvents] = await Promise.all([
+    const [summary, messages, drafts, decisions, reviewEvents] = await Promise.all([
+      this.db.prepare("SELECT * FROM case_summaries WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM cs_messages WHERE case_key = ? ORDER BY sequence ASC, message_key ASC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare(`SELECT d.*, seller.message_key AS comparison_seller_message_key, seller.text_masked AS comparison_seller_text_masked, seller.sent_at AS comparison_seller_sent_at
         FROM ai_drafts d LEFT JOIN cs_messages seller ON seller.message_key = d.source_seller_message_key
@@ -80,7 +81,21 @@ export class CsDataRepository {
       this.db.prepare("SELECT * FROM draft_decisions WHERE case_key = ? ORDER BY created_at DESC, decision_id DESC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM review_events WHERE case_key = ? ORDER BY created_at DESC, review_event_id DESC").bind(caseKey).all<Record<string, unknown>>(),
     ]);
-    return { case: item, messages: messages.results, drafts: drafts.results, decisions: decisions.results, review_events: reviewEvents.results };
+    return { case: item, summary, messages: messages.results, drafts: drafts.results, decisions: decisions.results, review_events: reviewEvents.results };
+  }
+
+  async listTemplates(qualityState?: QualityState): Promise<Record<string, unknown>[]> {
+    const query = qualityState
+      ? this.db.prepare("SELECT * FROM reply_templates WHERE quality_state = ? ORDER BY updated_at DESC, template_id DESC").bind(qualityState)
+      : this.db.prepare("SELECT * FROM reply_templates ORDER BY updated_at DESC, template_id DESC").bind();
+    return (await query.all<Record<string, unknown>>()).results;
+  }
+
+  async listLibraryEntries(qualityState?: QualityState): Promise<Record<string, unknown>[]> {
+    const query = qualityState
+      ? this.db.prepare("SELECT * FROM answer_library_entries WHERE quality_state = ? ORDER BY updated_at DESC, library_entry_id DESC").bind(qualityState)
+      : this.db.prepare("SELECT * FROM answer_library_entries ORDER BY updated_at DESC, library_entry_id DESC").bind();
+    return (await query.all<Record<string, unknown>>()).results;
   }
 
   async syncRun(input: SyncRunInput): Promise<SyncRunResult> {
@@ -106,6 +121,9 @@ export class CsDataRepository {
       if (!exists) insertedDrafts += 1;
     }
     if (input.decisions?.length) await this.db.batch(input.decisions.map((item) => this.insertDecision(item)));
+    for (const item of input.case_summaries ?? []) await this.upsertCaseSummary(item);
+    for (const item of input.answer_library_entries ?? []) await this.upsertLibraryEntry(item);
+    for (const item of input.no_reply_patterns ?? []) await this.upsertNoReplyPattern(item);
     await this.db.prepare(`UPDATE sync_runs SET finished_at = ?, new_count = ?, changed_count = ?, unchanged_count = ?, draft_created_count = ?, status = 'COMPLETED' WHERE run_id = ?`).bind(
       input.finished_at, input.cases.filter((item) => item.processing_state === "NEW").length, input.cases.filter((item) => item.processing_state === "CHANGED").length,
       input.cases.filter((item) => item.processing_state === "UNCHANGED").length, insertedDrafts, input.run_id,
@@ -119,14 +137,99 @@ export class CsDataRepository {
     return { inserted: !exists };
   }
 
+  async upsertCaseSummary(input: CaseSummaryInput): Promise<{ inserted: boolean }> {
+    const exists = await this.db.prepare("SELECT case_key AS value FROM case_summaries WHERE case_key = ?").bind(input.case_key).first<ExistingRow>();
+    await this.db.prepare(`INSERT INTO case_summaries
+      (case_key, summary_text_masked, summary_version, source_content_hash, pii_scan, created_run_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'PASS', ?, ?, ?)
+      ON CONFLICT(case_key) DO UPDATE SET summary_text_masked = excluded.summary_text_masked,
+        summary_version = excluded.summary_version, source_content_hash = excluded.source_content_hash,
+        created_run_id = excluded.created_run_id, updated_at = excluded.updated_at`).bind(
+      input.case_key, input.summary_text_masked, input.summary_version, input.source_content_hash,
+      input.created_run_id, input.created_at, input.created_at,
+    ).run();
+    return { inserted: !exists };
+  }
+
+  async upsertLibraryEntry(input: AnswerLibraryEntryInput): Promise<{ inserted: boolean }> {
+    const exists = await this.db.prepare("SELECT library_entry_id AS value FROM answer_library_entries WHERE library_entry_id = ?").bind(input.library_entry_id).first<ExistingRow>();
+    await this.db.prepare(`INSERT INTO answer_library_entries
+      (library_entry_id, case_key, source_type, source_id, source_version, question_text_masked, answer_text_masked,
+       market, channel, intent, quality_state, source_content_hash, pii_scan, created_run_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PASS', ?, ?, ?)
+      ON CONFLICT(library_entry_id) DO UPDATE SET question_text_masked = excluded.question_text_masked,
+        answer_text_masked = excluded.answer_text_masked, market = excluded.market, channel = excluded.channel,
+        intent = excluded.intent,
+        quality_state = CASE WHEN answer_library_entries.quality_state IN ('USE', 'EXCLUDE') THEN answer_library_entries.quality_state ELSE excluded.quality_state END,
+        source_content_hash = excluded.source_content_hash,
+        created_run_id = excluded.created_run_id, updated_at = excluded.updated_at`).bind(
+      input.library_entry_id, input.case_key, input.source_type, input.source_id, input.source_version,
+      input.question_text_masked, input.answer_text_masked, input.market, input.channel, input.intent,
+      input.quality_state ?? "CANDIDATE", input.source_content_hash, input.created_run_id, input.created_at, input.created_at,
+    ).run();
+    return { inserted: !exists };
+  }
+
+  async upsertNoReplyPattern(input: NoReplyPatternInput): Promise<{ inserted: boolean }> {
+    const exists = await this.db.prepare("SELECT pattern_id AS value FROM no_reply_patterns WHERE pattern_id = ?").bind(input.pattern_id).first<ExistingRow>();
+    await this.db.prepare(`INSERT INTO no_reply_patterns
+      (pattern_id, case_key, pattern_text_masked, reason_code, quality_state, source_content_hash, pii_scan, created_run_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'PASS', ?, ?, ?)
+      ON CONFLICT(pattern_id) DO UPDATE SET pattern_text_masked = excluded.pattern_text_masked,
+        reason_code = excluded.reason_code,
+        quality_state = CASE WHEN no_reply_patterns.quality_state IN ('USE', 'EXCLUDE') THEN no_reply_patterns.quality_state ELSE excluded.quality_state END,
+        source_content_hash = excluded.source_content_hash, created_run_id = excluded.created_run_id,
+        updated_at = excluded.updated_at`).bind(
+      input.pattern_id, input.case_key, input.pattern_text_masked, input.reason_code, input.quality_state ?? "CANDIDATE",
+      input.source_content_hash, input.created_run_id, input.created_at, input.created_at,
+    ).run();
+    return { inserted: !exists };
+  }
+
+  async upsertTemplate(input: ReplyTemplateInput): Promise<{ inserted: boolean }> {
+    const exists = await this.db.prepare("SELECT template_id AS value FROM reply_templates WHERE template_id = ?").bind(input.template_id).first<ExistingRow>();
+    await this.db.prepare(`INSERT INTO reply_templates
+      (template_id, template_key, template_version, template_name_masked, template_text_masked,
+       market, channel, intent, required_checks_json, quality_state, pii_scan, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PASS', ?, ?)
+      ON CONFLICT(template_id) DO UPDATE SET template_key = excluded.template_key, template_version = excluded.template_version,
+        template_name_masked = excluded.template_name_masked, template_text_masked = excluded.template_text_masked,
+        market = excluded.market, channel = excluded.channel, intent = excluded.intent,
+        required_checks_json = excluded.required_checks_json, quality_state = excluded.quality_state,
+        updated_at = excluded.updated_at`).bind(
+      input.template_id, input.template_key, input.template_version, input.template_name_masked, input.template_text_masked,
+      input.market ?? null, input.channel ?? null, input.intent ?? null, JSON.stringify(input.required_checks),
+      input.quality_state ?? "CANDIDATE", input.created_at, input.created_at,
+    ).run();
+    return { inserted: !exists };
+  }
+
+  async reviewLibraryEntry(input: LibraryEntryReviewInput): Promise<{ library_entry_id: string; quality_state: "USE" | "EXCLUDE"; reviewed: boolean }> {
+    const result = await this.db.prepare(`UPDATE answer_library_entries
+      SET quality_state = ?, review_note_masked = ?, reviewer_ref = ?, reviewed_at = ?, updated_at = ?
+      WHERE library_entry_id = ?`).bind(
+      input.quality_state, input.review_note_masked, input.reviewer_ref, input.reviewed_at, input.reviewed_at, input.library_entry_id,
+    ).run();
+    return { library_entry_id: input.library_entry_id, quality_state: input.quality_state, reviewed: asNumber(result.meta.changes) === 1 };
+  }
+
   async reviewReplyDraft(input: DraftReviewInput): Promise<DraftReviewResult> {
-    const draft = await this.db.prepare("SELECT case_key FROM ai_drafts WHERE draft_id = ? AND purpose = 'REPLY'").bind(input.draft_id).first<ReviewDraftRow>();
+    const draft = await this.db.prepare(`SELECT d.case_key, c.content_hash FROM ai_drafts d
+      JOIN cs_cases c ON c.case_key = d.case_key WHERE d.draft_id = ? AND d.purpose = 'REPLY'`).bind(input.draft_id).first<ReviewDraftRow>();
     if (!draft) throw new Error("REPLY_DRAFT_NOT_FOUND");
+    if (input.source_content_hash && input.source_content_hash !== draft.content_hash) throw new Error("SOURCE_CONTENT_HASH_STALE");
     await this.db.batch([
       this.db.prepare("UPDATE ai_drafts SET state = ?, updated_at = ? WHERE draft_id = ? AND purpose = 'REPLY'").bind(input.draft_state, input.reviewed_at, input.draft_id),
       this.db.prepare(`INSERT INTO review_events
-        (review_event_id, draft_id, case_key, reviewer_ref, review_state, review_note_masked, human_revision_masked, pii_scan, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'PASS', ?)`).bind(`REVIEW:${input.draft_id}:${input.reviewed_at}`, input.draft_id, draft.case_key, input.reviewer_ref, input.draft_state, input.review_note_masked, input.human_revision_masked, input.reviewed_at),
+        (review_event_id, draft_id, case_key, reviewer_ref, review_state, review_note_masked, human_revision_masked, pii_scan, created_at,
+         composition_source_type, composition_source_id, composition_source_version, base_text_hash, final_text_hash,
+         unresolved_variables_json, source_content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'PASS', ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+        `REVIEW:${input.draft_id}:${input.reviewed_at}`, input.draft_id, draft.case_key, input.reviewer_ref,
+        input.draft_state, input.review_note_masked, input.human_revision_masked, input.reviewed_at,
+        input.composition_source_type ?? null, input.composition_source_id ?? null, input.composition_source_version ?? null,
+        input.base_text_hash ?? null, input.final_text_hash ?? null, JSON.stringify(input.unresolved_variables ?? []), input.source_content_hash ?? null,
+      ),
     ]);
     return { draft_id: input.draft_id, case_key: draft.case_key, draft_state: input.draft_state, reviewed_at: input.reviewed_at, reply_state_changed: false, human_revision_saved: Boolean(input.human_revision_masked) };
   }

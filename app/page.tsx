@@ -14,6 +14,10 @@ type RawRow = Record<string, unknown>;
 type Message = { actor: 'customer' | 'seller'; time: string; text: string; image?: boolean };
 type SourceUrlKind = 'EXACT' | 'LIST' | 'UNAVAILABLE';
 type SourceGuide = { url: string; reference: string; product: string };
+type CompositionSourceType = 'AI_DRAFT' | 'REPLY_TEMPLATE' | 'ANSWER_LIBRARY_ENTRY' | 'MANUAL';
+type CompositionSource = { composition_source_type: CompositionSourceType; composition_source_id: string; composition_source_version: string };
+type CompositionOption = { id: string; title: string; text: string; version: string; variables: string[]; meta: string };
+type CaseSummary = { title: string; text: string; points: string[] };
 type CsCase = {
   id: string;
   channel: string;
@@ -41,13 +45,19 @@ type CsCase = {
   humanRevision?: { text: string; state: string; reviewedAt: string };
   actualReply?: { text: string; sentAt: string; verifiedAt: string };
   skipDecision?: { reason: string; reasonCode: string; checks: string[] };
+  conversationComplete: boolean;
+  conversationIncompleteReason: string;
+  sourceContentHash: string;
+  summary?: CaseSummary;
+  templates: CompositionOption[];
+  libraryExamples: CompositionOption[];
 };
 type Overview = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; closed: number };
 type LatestSync = { run_id: string; status: string; finished_at: string; collected_count: number; draft_created_count: number; error_count: number } | null;
 type EnvironmentName = 'development' | 'production' | 'unconfigured';
 type DashboardSnapshot = { savedAt: number; cases: CsCase[]; total: number; overview: Overview; environment: EnvironmentName; latestSync?: LatestSync };
 type DetailSnapshot = { savedAt: number; item: CsCase };
-type DetailPayload = { case?: RawRow; messages?: RawRow[]; drafts?: RawRow[]; decisions?: RawRow[] };
+type DetailPayload = { case?: RawRow; messages?: RawRow[]; drafts?: RawRow[]; decisions?: RawRow[]; summary?: unknown; templates?: unknown; library_examples?: unknown };
 type DataFreshness = 'fresh' | 'refreshing' | 'stale';
 
 const EMPTY_OVERVIEW: Overview = { total_live: 0, needs_reply: 0, answered: 0, review: 0, no_reply_required: 0, ai_ready: 0, closed: 0 };
@@ -123,6 +133,45 @@ function jsonStringList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((item) => text(item)).filter(Boolean);
   try { const parsed = JSON.parse(text(value, '[]')); return Array.isArray(parsed) ? parsed.map((item) => text(item)).filter(Boolean) : []; } catch { return []; }
 }
+function compositionVariables(value: unknown, sourceText = ''): string[] {
+  const explicit = jsonStringList(value);
+  const discovered = Array.from(sourceText.matchAll(/\[([^\]\n]{1,80})\]/g), (match) => match[1].trim()).filter(Boolean);
+  return Array.from(new Set([...explicit, ...discovered]));
+}
+function normalizeSummary(value: unknown): CaseSummary | undefined {
+  if (typeof value === 'string' && text(value)) return { title: '문의 요약', text: text(value), points: [] };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as RawRow;
+  const body = text(raw.summary_text_masked ?? raw.summary ?? raw.text ?? raw.content ?? raw.overview ?? raw.customer_intent);
+  const points = compositionVariables(raw.points ?? raw.key_points ?? raw.bullets ?? raw.required_checks);
+  if (!body && !points.length) return undefined;
+  return { title: text(raw.title ?? raw.label, '문의 요약'), text: body, points };
+}
+function normalizeCompositionOptions(value: unknown, fallbackTitle: string): CompositionOption[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index): CompositionOption | null => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const raw = entry as RawRow;
+    const body = text(raw.text ?? raw.content ?? raw.body ?? raw.template_text_masked ?? raw.template_text ?? raw.answer_text_masked ?? raw.answer ?? raw.reply_text);
+    if (!body) return null;
+    return {
+      id: text(raw.id ?? raw.template_id ?? raw.example_id ?? raw.key, `${fallbackTitle}:${index + 1}`),
+      title: text(raw.title ?? raw.template_name_masked ?? raw.name ?? raw.label, `${fallbackTitle} ${index + 1}`),
+      text: body,
+      version: text(raw.version ?? raw.template_version ?? raw.revision, 'v1'),
+      variables: compositionVariables(raw.variables ?? raw.variable_names ?? raw.placeholders, body),
+      meta: text(raw.category ?? raw.intent ?? raw.used_at ?? raw.created_at),
+    };
+  }).filter((entry): entry is CompositionOption => entry !== null);
+}
+function sourceLabel(type: CompositionSourceType) {
+  return ({ AI_DRAFT: 'AI 초안', REPLY_TEMPLATE: '템플릿', ANSWER_LIBRARY_ENTRY: '과거 답변', MANUAL: '직접 작성' } as const)[type];
+}
+
+async function textHash(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 function draftReason(value: unknown) {
   const raw = text(value, '추천 근거가 별도로 기록되지 않았습니다.');
   try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed.join(' · ') : raw; } catch { return raw; }
@@ -148,10 +197,11 @@ function baseCase(row: RawRow): CsCase {
     productThumbnailUrl: safeExternalUrl(row.product_thumbnail_url), imageCount: Math.max(0, Number(row.image_count ?? 0) || 0), bodyCollected: Boolean(rawPreview),
     alert: status === 'review' ? '수집 상태 또는 답변 여부 확인 필요' : (scan.includes('WARN') || scan.includes('FAIL') ? `개인정보 검사 ${text(row.pii_scan)}` : undefined),
     postTitle: text(row.subject ?? row.subject_masked, text(row.category ?? row.category_masked, '문의 내용')), messages: [],
+    conversationComplete: row.conversation_complete === undefined ? true : bool(row.conversation_complete), conversationIncompleteReason: text(row.conversation_incomplete_reason), sourceContentHash: text(row.content_hash).toLowerCase(), templates: [], libraryExamples: [],
     actualReply: bool(row.human_reply_exists) ? { text: text(row.latest_human_reply_preview, '답변 존재 · 본문 미수집'), sentAt: formatDate(row.human_reply_at), verifiedAt: formatDate(row.last_seen_at) } : undefined,
   };
 }
-function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[], decisionRows: RawRow[] = []): CsCase {
+function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[], decisionRows: RawRow[] = [], summary?: unknown, templates?: unknown, libraryExamples?: unknown): CsCase {
   const item = baseCase(row);
   item.messages = messageRows.map((message): Message | null => {
     const body = text(message.message_text_masked ?? message.text_masked); if (!body) return null;
@@ -178,11 +228,14 @@ function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[], de
   }
   const reviewedDraft = draftRows.find((row) => text(row.human_revision));
   if (reviewedDraft) item.humanRevision = { text: text(reviewedDraft.human_revision), state: text(reviewedDraft.draft_state, '검토됨'), reviewedAt: formatDate(reviewedDraft.reviewed_at) };
+  item.summary = normalizeSummary(summary);
+  item.templates = normalizeCompositionOptions(templates, '템플릿');
+  item.libraryExamples = normalizeCompositionOptions(libraryExamples, '과거 답변').slice(0, 3);
   return item;
 }
 function hydrateDetailPayload(payload: DetailPayload): CsCase | null {
   if (!payload?.case) return null;
-  return hydrateCase(payload.case, payload.messages ?? [], payload.drafts ?? [], payload.decisions ?? []);
+  return hydrateCase(payload.case, payload.messages ?? [], payload.drafts ?? [], payload.decisions ?? [], payload.summary, payload.templates, payload.library_examples);
 }
 function statusQuery(filter: 'all' | CaseStatus) {
   if (filter === 'all') return '';
@@ -253,7 +306,15 @@ function nativeDetail(payload: RawRow): DetailPayload {
       pii_scan: draft.pii_scan ?? 'PASS',
     };
   });
-  return { case: payload.case as RawRow | undefined, messages: payload.messages as RawRow[] | undefined, drafts, decisions: payload.decisions as RawRow[] | undefined };
+  return {
+    case: payload.case as RawRow | undefined,
+    messages: payload.messages as RawRow[] | undefined,
+    drafts,
+    decisions: payload.decisions as RawRow[] | undefined,
+    summary: payload.summary,
+    templates: payload.templates,
+    library_examples: payload.library_examples,
+  };
 }
 function clearSessionCachePrefix(prefix: string) {
   try {
@@ -264,6 +325,44 @@ function clearSessionCachePrefix(prefix: string) {
   } catch { /* Cache cleanup must not block the review desk. */ }
 }
 
+function CompositionWorkbench({
+  item, source, locked, lockReason, templateSearch, templateMatches, selectedTemplate, unresolvedVariables, onSearch, onSelectSource, onApply,
+}: {
+  item: CsCase;
+  source: CompositionSource;
+  locked: boolean;
+  lockReason: string;
+  templateSearch: string;
+  templateMatches: CompositionOption[];
+  selectedTemplate: CompositionOption | null;
+  unresolvedVariables: string[];
+  onSearch: (value: string) => void;
+  onSelectSource: (source: CompositionSource) => void;
+  onApply: (source: CompositionSource, value: string) => void;
+}) {
+  const sourceButton = (type: CompositionSourceType, label: string, disabled = false) => <button type="button" className={`composition-source ${source.composition_source_type === type ? 'active' : ''}`} disabled={locked || disabled} onClick={() => onSelectSource({ composition_source_type: type, composition_source_id: type === 'MANUAL' ? 'MANUAL' : '', composition_source_version: type === 'MANUAL' ? 'v1' : '' })}>{label}</button>;
+  return <>
+    {item.summary && <section className="reply-section inquiry-summary"><div className="section-title"><div><span className="section-kicker summary">요약</span><h3>{item.summary.title}</h3></div></div>{item.summary.text && <p>{item.summary.text}</p>}{item.summary.points.length > 0 && <ul>{item.summary.points.map((point) => <li key={point}>{point}</li>)}</ul>}</section>}
+    <section className="reply-section composition-section" aria-label="답변 작성 방식">
+      <div className="section-title"><div><span className="section-kicker compose">작성</span><h3>답변 작성 방식</h3></div><span className="source-badge">출처 · {sourceLabel(source.composition_source_type)}{source.composition_source_version ? ` ${source.composition_source_version}` : ''}</span></div>
+      {locked ? <div className="composition-locked" role="note">{lockReason}</div> : <><div className="composition-source-row">
+        {sourceButton('AI_DRAFT', 'AI', !item.ai || item.ai.mode === 'eval')}
+        {sourceButton('REPLY_TEMPLATE', '템플릿', !item.templates.length)}
+        {sourceButton('ANSWER_LIBRARY_ENTRY', '과거 답변', !item.libraryExamples.length)}
+        {sourceButton('MANUAL', '직접 작성')}
+      </div>
+      {item.ai && item.ai.mode !== 'eval' && <div className="composition-quick"><span>AI 초안</span><button type="button" className="text-button" onClick={() => onApply({ composition_source_type: 'AI_DRAFT', composition_source_id: item.draftId ?? 'AI_DRAFT', composition_source_version: item.ai!.generatedAt }, item.ai!.text)}>수정란에 적용</button></div>}
+      <div className="template-browser"><label htmlFor="template-search">템플릿 검색</label><input id="template-search" value={templateSearch} onChange={(event) => onSearch(event.target.value)} placeholder="이름, 분류, 변수로 검색" />
+        {templateMatches.length ? <div className="composition-option-list">{templateMatches.slice(0, 12).map((template) => <button type="button" key={template.id} className={`composition-option ${selectedTemplate?.id === template.id ? 'active' : ''}`} onClick={() => onApply({ composition_source_type: 'REPLY_TEMPLATE', composition_source_id: template.id, composition_source_version: template.version }, template.text)}><span><strong>{template.title}</strong>{template.meta && <small>{template.meta}</small>}</span><em>{template.version}</em></button>)}</div> : <p className="composition-empty">검색 조건에 맞는 템플릿이 없습니다.</p>}
+        {selectedTemplate && <div className="composition-preview"><div><strong>템플릿 미리보기</strong><span>{selectedTemplate.version}</span></div><p>{selectedTemplate.text}</p>{selectedTemplate.variables.length > 0 && <div className="variable-list">{selectedTemplate.variables.map((variable) => <code key={variable}>[{variable.replace(/^\[|\]$/g, '')}]</code>)}</div>}</div>}
+      </div>
+      {item.libraryExamples.length > 0 && <div className="library-examples"><strong>과거 답변</strong>{item.libraryExamples.map((example) => <article key={example.id}><div><span>{example.title}</span><small>{example.version}{example.meta ? ` · ${example.meta}` : ''}</small></div><p>{example.text}</p><button type="button" className="text-button" onClick={() => onApply({ composition_source_type: 'ANSWER_LIBRARY_ENTRY', composition_source_id: example.id, composition_source_version: example.version }, example.text)}>수정란에 적용</button></article>)}</div>}
+      </>}
+      {unresolvedVariables.length > 0 && <div className="variable-warning" role="alert"><strong>미해결 변수</strong><span>{unresolvedVariables.join(' · ')}</span><small>대괄호 변수를 실제 확인값으로 바꾼 뒤 검수 저장할 수 있습니다.</small></div>}
+    </section>
+  </>;
+}
+
 export default function Home() {
   const [activeFilter, setActiveFilter] = useState<'all' | CaseStatus>('all');
   const [cases, setCases] = useState<CsCase[]>([]); const [selectedId, setSelectedId] = useState('');
@@ -271,6 +370,8 @@ export default function Home() {
   const [environment, setEnvironment] = useState<EnvironmentName>('unconfigured');
   const [latestSync, setLatestSync] = useState<LatestSync>(null);
   const [search, setSearch] = useState(''); const [editor, setEditor] = useState(''); const [toast, setToast] = useState('');
+  const [compositionSource, setCompositionSource] = useState<CompositionSource>({ composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1' });
+  const [templateSearch, setTemplateSearch] = useState('');
   const [sourceGuide, setSourceGuide] = useState<SourceGuide | null>(null);
   const [reviewSaving, setReviewSaving] = useState(false);
   const [loading, setLoading] = useState(true); const [loadingMore, setLoadingMore] = useState(false); const [detailLoading, setDetailLoading] = useState(false); const [error, setError] = useState(''); const [detailError, setDetailError] = useState('');
@@ -309,7 +410,7 @@ export default function Home() {
     try {
       const next = await fetchDashboard(activeFilter);
       if (requestId !== listRequestId.current) return;
-      setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setLatestSync(next.latestSync); setEditor('');
+      setCases(next.items); setTotalCases(next.total); setOverview(next.overview); setEnvironment(next.environment); setLatestSync(next.latestSync); setEditor(''); setCompositionSource({ composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1' }); setTemplateSearch('');
       setFreshness('fresh');
       setSelectedId((current) => next.items.some((item) => item.id === current) ? current : (next.items[0]?.id ?? ''));
       detailCache.current.clear(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX); setSelectedDetail(null); setDetailEpoch((value) => value + 1);
@@ -404,6 +505,22 @@ export default function Home() {
   const selected = selectedDetail?.id === selectedId ? selectedDetail : cases.find((item) => item.id === selectedId) ?? null;
   const customerMessages = selected?.messages.filter((message) => message.actor === 'customer') ?? [];
   const sellerMessages = selected?.messages.filter((message) => message.actor === 'seller') ?? [];
+  const compositionLocked = Boolean(selected && (selected.ai?.mode === 'eval' || selected.status === 'no-reply' || !selected.conversationComplete));
+  const compositionLockReason = selected?.ai?.mode === 'eval' ? 'EVAL 초안은 실제 답변과 비교만 하며 작성 출처를 바꿀 수 없습니다.'
+    : selected?.status === 'no-reply' ? '답변 불필요 문의에는 답변 작성과 저장을 사용할 수 없습니다.'
+      : selected && !selected.conversationComplete ? `대화 이력이 불완전합니다${selected.conversationIncompleteReason ? ` · ${selected.conversationIncompleteReason}` : ''}. 작성과 저장을 차단합니다.` : '';
+  const templateMatches = useMemo(() => {
+    const keyword = templateSearch.trim().toLowerCase();
+    return (selected?.templates ?? []).filter((item) => !keyword || [item.title, item.text, item.meta, ...item.variables].join(' ').toLowerCase().includes(keyword));
+  }, [selected?.templates, templateSearch]);
+  const selectedTemplate = compositionSource.composition_source_type === 'REPLY_TEMPLATE'
+    ? (selected?.templates ?? []).find((item) => item.id === compositionSource.composition_source_id) ?? null : null;
+  const selectedLibraryExample = (selected?.libraryExamples ?? []).find((item) => item.id === compositionSource.composition_source_id) ?? null;
+  const compositionBaseText = compositionSource.composition_source_type === 'AI_DRAFT' ? selected?.ai?.text ?? ''
+    : compositionSource.composition_source_type === 'REPLY_TEMPLATE' ? selectedTemplate?.text ?? ''
+      : compositionSource.composition_source_type === 'ANSWER_LIBRARY_ENTRY' ? selectedLibraryExample?.text ?? ''
+        : selected?.humanRevision?.text ?? '';
+  const unresolvedVariables = useMemo(() => Array.from(new Set(Array.from(editor.matchAll(/\[[^\]\n]{1,80}\]/g), (match) => match[0]))), [editor]);
   const syncAt = cases.map((item) => item.updatedRaw).filter(Boolean).sort().at(-1);
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 2200); };
   const copyText = async (value: string) => { try { await navigator.clipboard.writeText(value); notify('클립보드에 복사했습니다.'); } catch { notify('브라우저에서 복사를 허용해 주세요.'); } };
@@ -423,19 +540,38 @@ export default function Home() {
   }, [sourceGuide]);
   const selectFilter = (filter: 'all' | CaseStatus) => {
     if (filter === activeFilter) return;
-    listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setDetailError(''); setFreshness('refreshing'); setCases([]); setTotalCases(0); setSelectedId(''); setSelectedDetail(null); setActiveFilter(filter);
+    listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setDetailError(''); setFreshness('refreshing'); setCases([]); setTotalCases(0); setSelectedId(''); setSelectedDetail(null); setCompositionSource({ composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1' }); setTemplateSearch(''); setActiveFilter(filter);
   };
-  const selectCase = (id: string) => { if (id === selectedId) return; detailRequestId.current += 1; setEditor(''); setDetailError(''); setDetailLoading(true); setSelectedId(id); };
+  const selectCase = (id: string) => { if (id === selectedId) return; detailRequestId.current += 1; setEditor(''); setCompositionSource({ composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1' }); setTemplateSearch(''); setDetailError(''); setDetailLoading(true); setSelectedId(id); };
   const countFor = (status: CaseStatus) => ({ unanswered: overview.needs_reply, 'ai-ready': overview.ai_ready, review: overview.review, 'no-reply': overview.no_reply_required, replied: overview.answered, closed: overview.closed })[status];
   const localReviewEnabled = typeof window !== 'undefined' && !text(window.__CS_API_BASE_URL__) && window.__CS_REVIEW_ENABLED__ !== false && environment === 'development';
+  const applyComposition = (source: CompositionSource, value: string) => {
+    if (compositionLocked) return;
+    setCompositionSource(source); setEditor(value);
+  };
   const saveReview = async (draftState: 'APPROVED' | 'REJECTED') => {
-    if (!selected?.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || reviewSaving) return;
+    if (!selected?.draftId || compositionLocked || unresolvedVariables.length || !localReviewEnabled || reviewSaving) return;
     setReviewSaving(true); setError('');
     try {
       const revision = draftState === 'APPROVED' ? editor.trim() : '';
-      await postJson('/api/cs', { draft_id: selected.draftId, draft_state: draftState, review_note: draftState === 'APPROVED' ? '개발 프론트에서 사람 검수 완료' : '개발 프론트에서 AI 초안 거절', human_revision: revision });
+      const [baseTextHash, finalTextHash] = await Promise.all([textHash(compositionBaseText), textHash(revision)]);
+      const reviewPayload = {
+        draft_id: selected.draftId,
+        draft_state: draftState,
+        review_note: draftState === 'APPROVED' ? '개발 프론트에서 사람 검수 완료' : '개발 프론트에서 AI 초안 거절',
+        human_revision: revision,
+        ...compositionSource,
+        base_text_hash: baseTextHash,
+        final_text_hash: finalTextHash,
+        unresolved_variables: unresolvedVariables,
+        source_content_hash: selected.sourceContentHash,
+        environment: 'development' as const,
+        auto_send: false as const,
+        marketplace_write_actions: 0 as const,
+      };
+      await postJson('/api/cs', reviewPayload);
       setSelectedDetail({ ...selected, humanRevision: revision ? { text: revision, state: draftState, reviewedAt: formatDate(new Date().toISOString()) } : selected.humanRevision });
-      notify(draftState === 'APPROVED' ? '사람 수정본을 개발 Sheet에 저장했습니다.' : 'AI 초안을 거절로 기록했습니다.');
+      notify(draftState === 'APPROVED' ? '사람 수정본을 개발 검수 저장소에 저장했습니다.' : 'AI 초안을 거절로 기록했습니다.');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'REVIEW_SAVE_FAILED');
     } finally {
@@ -461,8 +597,9 @@ export default function Home() {
           <footer className="source-footer"><span>🔒 고객정보 마스킹됨</span><span>{selected.surface === 'chat' ? '채팅형' : '게시글형'} · 읽기 전용 수집 기록</span><span>원본 확인 {selected.updatedAt}</span></footer></>}
         </section>
         <aside className="reply-column" aria-label="답변 검수">{!selected ? <div className="panel-empty"><strong>문의를 선택해 주세요.</strong></div> : <><div className="reply-scroll">
-          <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>{selected.ai?.mode === 'eval' ? 'AI 검증 초안' : 'AI 추천답변'}</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">{selected.ai?.mode === 'eval' ? '답변 완료 후 생성된 학습·검증용 초안 · 실제 사람 답변과 비교' : '사람 답변과 구분 · 자동 전송되지 않은 참고 문장'}</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>{selected.ai.mode === 'eval' ? '검증 조건' : '필수 확인사항'}</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · {selected.ai.mode === 'eval' ? 'EVAL 섀도 초안' : '저장된 AI 초안'}</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button>{selected.ai.mode !== 'eval' && <button className="purple-button" onClick={() => setEditor(selected.ai!.text)}>수정란에 적용</button>}</div></> : selected.skipDecision ? <div className="empty-draft decision-empty"><span>✓</span><strong>{selected.status === 'no-reply' ? '답변 불필요로 분류했습니다.' : '이번 수집에서는 AI 초안을 만들지 않았습니다.'}</strong><p>{selected.skipDecision.reason}</p>{selected.skipDecision.checks.length > 0 && <small>확인사항 · {selected.skipDecision.checks.join(' · ')}</small>}<code>{selected.skipDecision.reasonCode}</code></div> : <div className="empty-draft"><span>✦</span><strong>AI 처리 결과를 기다리고 있습니다.</strong><p>다음 수집에서 생성 여부와 제외 사유가 함께 표시됩니다.</p></div>}</section>
-          <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>{selected.ai?.mode === 'eval' ? '검증 메모' : '사람 수정본'}</h3></div><span className="draft-status">{selected.ai?.mode === 'eval' ? 'EVAL · 실제 답변과 비교' : (selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력')}</span></div><label className="editor-label" htmlFor="human-draft">{selected.ai?.mode === 'eval' ? '학습·검증용 초안은 실제 답변과 비교만 합니다.' : '쇼핑몰에 복사할 최종 문장을 확인하세요.'}</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} disabled={selected.ai?.mode === 'eval'} placeholder={selected.ai?.mode === 'eval' ? '아래 실제 사람 답변과 AI 검증 초안을 비교해 주세요.' : 'AI 추천을 적용하거나 직접 답변을 작성하세요.'}/><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" disabled={!selected.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || reviewSaving} onClick={() => saveReview('REJECTED')}>초안 거절</button><button className="primary-button" disabled={!selected.draftId || selected.ai?.mode === 'eval' || !localReviewEnabled || !editor.trim() || reviewSaving} onClick={() => saveReview('APPROVED')}>{reviewSaving ? '저장 중' : '검수 저장'}</button><button className="secondary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">{selected.ai?.mode === 'eval' ? '학습·검증용 섀도 초안입니다. 운영 상태와 쇼핑몰 답변에는 영향을 주지 않습니다.' : (localReviewEnabled ? '개발 Sheet에 사람 검수본만 저장합니다. 쇼핑몰로는 전송하지 않습니다.' : '검수 저장은 로컬 development 화면에서만 사용할 수 있습니다. 쇼핑몰로는 전송하지 않습니다.')}</p></section>
+          <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>{selected.ai?.mode === 'eval' ? 'AI 검증 초안' : 'AI 추천답변'}</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">{selected.ai?.mode === 'eval' ? '답변 완료 후 생성된 학습·검증용 초안 · 실제 사람 답변과 비교' : '사람 답변과 구분 · 자동 전송되지 않은 참고 문장'}</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>{selected.ai.mode === 'eval' ? '검증 조건' : '필수 확인사항'}</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · {selected.ai.mode === 'eval' ? 'EVAL 섀도 초안' : '저장된 AI 초안'}</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button>{selected.ai.mode !== 'eval' && <button className="purple-button" onClick={() => applyComposition({ composition_source_type: 'AI_DRAFT', composition_source_id: selected.draftId ?? 'AI_DRAFT', composition_source_version: selected.ai!.generatedAt }, selected.ai!.text)}>수정란에 적용</button>}</div></> : selected.skipDecision ? <div className="empty-draft decision-empty"><span>✓</span><strong>{selected.status === 'no-reply' ? '답변 불필요로 분류했습니다.' : '이번 수집에서는 AI 초안을 만들지 않았습니다.'}</strong><p>{selected.skipDecision.reason}</p>{selected.skipDecision.checks.length > 0 && <small>확인사항 · {selected.skipDecision.checks.join(' · ')}</small>}<code>{selected.skipDecision.reasonCode}</code></div> : <div className="empty-draft"><span>✦</span><strong>AI 처리 결과를 기다리고 있습니다.</strong><p>다음 수집에서 생성 여부와 제외 사유가 함께 표시됩니다.</p></div>}</section>
+          <CompositionWorkbench item={selected} source={compositionSource} locked={compositionLocked} lockReason={compositionLockReason} templateSearch={templateSearch} templateMatches={templateMatches} selectedTemplate={selectedTemplate} unresolvedVariables={unresolvedVariables} onSearch={setTemplateSearch} onSelectSource={setCompositionSource} onApply={applyComposition} />
+          <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>{selected.ai?.mode === 'eval' ? '검증 메모' : '사람 수정본'}</h3></div><span className="draft-status">{selected.ai?.mode === 'eval' ? 'EVAL · 실제 답변과 비교' : (selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력')}</span></div><label className="editor-label" htmlFor="human-draft">{selected.ai?.mode === 'eval' ? '학습·검증용 초안은 실제 답변과 비교만 합니다.' : '쇼핑몰에 복사할 최종 문장을 확인하세요.'}</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} disabled={compositionLocked} placeholder={selected.ai?.mode === 'eval' ? '아래 실제 사람 답변과 AI 검증 초안을 비교해 주세요.' : 'AI 추천을 적용하거나 직접 답변을 작성하세요.'}/><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" disabled={!selected.draftId || compositionLocked || !localReviewEnabled || reviewSaving} onClick={() => saveReview('REJECTED')}>초안 거절</button><button className="primary-button" disabled={!selected.draftId || compositionLocked || unresolvedVariables.length > 0 || !localReviewEnabled || !editor.trim() || reviewSaving} onClick={() => saveReview('APPROVED')}>{reviewSaving ? '저장 중' : '검수 저장'}</button><button className="secondary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">{selected.ai?.mode === 'eval' ? '학습·검증용 섀도 초안입니다. 운영 상태와 쇼핑몰 답변에는 영향을 주지 않습니다.' : (localReviewEnabled ? '개발 검수 저장소에 사람 검수본만 저장합니다. 쇼핑몰로는 전송하지 않습니다.' : '검수 저장은 로컬 development 화면에서만 사용할 수 있습니다. 쇼핑몰로는 전송하지 않습니다.')}</p></section>
           <section className={`reply-section actual-section ${selected.actualReply ? 'verified' : ''}`}><div className="section-title"><div><span className="section-kicker actual">실제</span><h3>쇼핑몰 실제 답변</h3></div>{selected.actualReply ? <span className="verified-label">✓ 확인 완료</span> : <span className="unverified-label">미확인</span>}</div>{selected.actualReply ? <><div className="draft-card actual-draft">{selected.actualReply.text}</div><div className="verification-meta"><span>답변 시각 {selected.actualReply.sentAt}</span><span>최근 수집 확인 {selected.actualReply.verifiedAt}</span></div></> : <div className="verification-empty"><span className="scan-icon">⌁</span><div><strong>판매자 답변이 아직 확인되지 않았습니다.</strong><p>다음 수집에서 쇼핑몰 메시지와 답변 상태를 다시 확인합니다.</p></div></div>}</section>
         </div><div className="reply-bottom-bar"><div><span className="reply-state-dot" style={{ background: statusMeta[selected.status].dot }}/><strong>{statusMeta[selected.status].label}</strong></div><button onClick={() => notify('이 버튼은 아직 수집 매크로를 실행하지 않습니다.')}>답변 재확인 준비중</button></div></>}</aside>
       </div>

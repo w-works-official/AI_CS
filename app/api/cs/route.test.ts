@@ -85,26 +85,83 @@ test('POST retains the existing server-side Apps Script review path', async () =
   const previousEnvironment = process.env.AI_CS_WEB_ENVIRONMENT;
   const previousUrl = process.env.AI_CS_DEV_APPS_SCRIPT_URL;
   const previousKey = process.env.AI_CS_DEV_APPS_SCRIPT_KEY;
+  const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
+  const previousMarketplaceSyncKey = process.env.MARKETPLACE_CS_SYNC_KEY;
   const captured: { upstream?: string; body?: string } = {};
   process.env.AI_CS_WEB_ENVIRONMENT = 'development';
   process.env.AI_CS_DEV_APPS_SCRIPT_URL = 'https://script.example/exec';
   process.env.AI_CS_DEV_APPS_SCRIPT_KEY = 'apps-script-only-test-key';
+  delete process.env.AI_CS_DEV_D1_SYNC_KEY;
+  delete process.env.MARKETPLACE_CS_SYNC_KEY;
   globalThis.fetch = async (input, init) => {
     captured.upstream = new URL(input instanceof Request ? input.url : String(input)).href;
     captured.body = String(init?.body);
     return new Response(JSON.stringify({ ok: true, ...safety }), { headers: { 'Content-Type': 'application/json' } });
   };
   try {
-    const response = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ draft_id: 'DRAFT:test', draft_state: 'REJECTED', review_note: '', human_revision: '' }) }));
+    const response = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      draft_id: 'DRAFT:test', draft_state: 'REJECTED', review_note: '', human_revision: '',
+      composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1',
+      base_text_hash: 'a'.repeat(64), final_text_hash: 'b'.repeat(64), unresolved_variables: [], source_content_hash: 'c'.repeat(64),
+      ...safety,
+    }) }));
     assert.equal(response.status, 200);
     const written = JSON.parse(captured.body ?? '') as Record<string, unknown>;
     assert.equal(captured.upstream, 'https://script.example/exec');
     assert.equal(written.api_key, 'apps-script-only-test-key');
     assert.equal(written.action, 'reviewDraft');
+    assert.equal(written.composition_source_type, undefined);
+    assert.equal(written.final_text_hash, undefined);
+    assert.equal(written.environment, 'development');
+    assert.equal(written.auto_send, undefined);
+    assert.equal(written.marketplace_write_actions, undefined);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousEnvironment === undefined) delete process.env.AI_CS_WEB_ENVIRONMENT; else process.env.AI_CS_WEB_ENVIRONMENT = previousEnvironment;
     if (previousUrl === undefined) delete process.env.AI_CS_DEV_APPS_SCRIPT_URL; else process.env.AI_CS_DEV_APPS_SCRIPT_URL = previousUrl;
     if (previousKey === undefined) delete process.env.AI_CS_DEV_APPS_SCRIPT_KEY; else process.env.AI_CS_DEV_APPS_SCRIPT_KEY = previousKey;
+    if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
+    if (previousMarketplaceSyncKey === undefined) delete process.env.MARKETPLACE_CS_SYNC_KEY; else process.env.MARKETPLACE_CS_SYNC_KEY = previousMarketplaceSyncKey;
+  }
+});
+
+test('POST uses the development Worker PATCH review route with the existing hidden development sync key', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
+  const previousMarketplaceSyncKey = process.env.MARKETPLACE_CS_SYNC_KEY;
+  const previousD1Url = process.env.AI_CS_D1_API_URL;
+  const captured: { url?: string; method?: string; syncKey?: string | null; body?: Record<string, unknown> } = {};
+  delete process.env.AI_CS_DEV_D1_SYNC_KEY;
+  process.env.MARKETPLACE_CS_SYNC_KEY = 'worker-test-sync-key';
+  process.env.AI_CS_D1_API_URL = 'https://worker.example/api/cs';
+  globalThis.fetch = async (input, init) => {
+    captured.url = new URL(input instanceof Request ? input.url : String(input)).href;
+    captured.method = init?.method;
+    captured.syncKey = new Headers(init?.headers).get('X-CS-Sync-Key');
+    captured.body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ ok: true, draft_id: 'DRAFT:worker', ...safety }), { headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const response = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      draft_id: 'DRAFT:worker', draft_state: 'APPROVED', review_note: 'checked', human_revision: 'masked revision',
+      composition_source_type: 'AI_DRAFT', composition_source_id: 'DRAFT:worker', composition_source_version: 'v1',
+      base_text_hash: 'a'.repeat(64), final_text_hash: 'b'.repeat(64), unresolved_variables: [], source_content_hash: 'c'.repeat(64),
+      ...safety,
+    }) }));
+    assert.equal(response.status, 200);
+    assert.equal(captured.url, 'https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs/drafts/DRAFT%3Aworker/review');
+    assert.equal(captured.method, 'PATCH');
+    assert.equal(captured.syncKey, 'worker-test-sync-key');
+    assert.deepEqual(captured.body, {
+      draft_id: 'DRAFT:worker', draft_state: 'APPROVED', review_note: 'checked', human_revision: 'masked revision',
+      composition_source_type: 'AI_DRAFT', composition_source_id: 'DRAFT:worker', composition_source_version: 'v1',
+      base_text_hash: 'a'.repeat(64), final_text_hash: 'b'.repeat(64), unresolved_variables: [], source_content_hash: 'c'.repeat(64),
+      ...safety,
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
+    if (previousMarketplaceSyncKey === undefined) delete process.env.MARKETPLACE_CS_SYNC_KEY; else process.env.MARKETPLACE_CS_SYNC_KEY = previousMarketplaceSyncKey;
+    if (previousD1Url === undefined) delete process.env.AI_CS_D1_API_URL; else process.env.AI_CS_D1_API_URL = previousD1Url;
   }
 });

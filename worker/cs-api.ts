@@ -54,9 +54,28 @@ export type ReviewDraftInput = {
    * draft and reject an EVAL draft with EVAL_REVIEW_FORBIDDEN.
    */
   purpose?: "REPLY";
+  composition_source_type?: "AI_DRAFT" | "REPLY_TEMPLATE" | "ANSWER_LIBRARY_ENTRY" | "MANUAL";
+  composition_source_id?: string;
+  composition_source_version?: string;
+  base_text_hash?: string;
+  final_text_hash?: string;
+  unresolved_variables?: string[];
+  source_content_hash?: string;
   environment: "development";
   auto_send: false;
   marketplace_write_actions: 0;
+};
+
+export type UpsertTemplateInput = {
+  template_key: string; template_version: string; template_name: string; template_text: string;
+  market?: string; channel?: string; intent?: string; required_checks?: string[];
+  quality_state?: "CANDIDATE" | "USE" | "EXCLUDE";
+  environment: "development"; auto_send: false; marketplace_write_actions: 0;
+};
+
+export type ReviewLibraryInput = {
+  quality_state: "USE" | "EXCLUDE"; review_note?: string;
+  environment: "development"; auto_send: false; marketplace_write_actions: 0;
 };
 
 export interface CsStore {
@@ -64,8 +83,12 @@ export interface CsStore {
   overview(): Promise<CsStoreResult>;
   listCases(query: CaseListQuery): Promise<CsStoreResult>;
   getCase(caseKey: string): Promise<CsStoreResult | null>;
+  listTemplates(qualityState?: "CANDIDATE" | "USE" | "EXCLUDE"): Promise<CsStoreResult>;
+  listLibraryEntries(qualityState?: "CANDIDATE" | "USE" | "EXCLUDE"): Promise<CsStoreResult>;
   syncRun(input: SyncRunInput): Promise<CsStoreResult>;
   upsertDraft(input: UpsertDraftInput): Promise<CsStoreResult>;
+  upsertTemplate(input: UpsertTemplateInput): Promise<CsStoreResult>;
+  reviewLibraryEntry(entryId: string, input: ReviewLibraryInput): Promise<CsStoreResult>;
   /** Implementations must reject persisted EVAL drafts with EVAL_REVIEW_FORBIDDEN. */
   reviewReplyDraft(draftId: string, input: ReviewDraftInput): Promise<CsStoreResult>;
 }
@@ -93,7 +116,9 @@ const safeMethods = new Set(["GET", "POST", "PATCH", "OPTIONS"]);
 const rootFields = {
   sync: new Set(["run_id", "report", "model", "prompt_version", "environment", "auto_send", "marketplace_write_actions"]),
   draft: new Set(["case_key", "purpose", "draft_text", "intent", "reference_ids", "required_checks", "generation_version", "source_content_hash", "environment", "auto_send", "marketplace_write_actions"]),
-  review: new Set(["draft_state", "review_note", "human_revision", "purpose", "environment", "auto_send", "marketplace_write_actions"]),
+  review: new Set(["draft_state", "review_note", "human_revision", "purpose", "composition_source_type", "composition_source_id", "composition_source_version", "base_text_hash", "final_text_hash", "unresolved_variables", "source_content_hash", "environment", "auto_send", "marketplace_write_actions"]),
+  template: new Set(["template_key", "template_version", "template_name", "template_text", "market", "channel", "intent", "required_checks", "quality_state", "environment", "auto_send", "marketplace_write_actions"]),
+  libraryReview: new Set(["quality_state", "review_note", "environment", "auto_send", "marketplace_write_actions"]),
 };
 const forbiddenMutationFields = new Set([
   "action", "marketplace_action", "marketplace_reply", "reply_action", "send", "send_reply", "send_message",
@@ -217,14 +242,68 @@ function parseReview(body: JsonObject): ReviewDraftInput {
   const state = body.draft_state;
   if (state !== "APPROVED" && state !== "REJECTED") throw new CsApiError("INVALID_DRAFT_STATE", 400);
   if (state === "APPROVED" && !body.human_revision) throw new CsApiError("HUMAN_REVISION_REQUIRED", 400);
+  const sourceType = body.composition_source_type;
+  if (sourceType !== undefined && !["AI_DRAFT", "REPLY_TEMPLATE", "ANSWER_LIBRARY_ENTRY", "MANUAL"].includes(String(sourceType))) {
+    throw new CsApiError("INVALID_COMPOSITION_SOURCE_TYPE", 400);
+  }
+  const unresolved = body.unresolved_variables;
+  if (unresolved !== undefined && (!Array.isArray(unresolved) || unresolved.length > 20 || unresolved.some((item) => typeof item !== "string" || item.length > 100))) {
+    throw new CsApiError("INVALID_UNRESOLVED_VARIABLES", 400);
+  }
+  if (state === "APPROVED" && Array.isArray(unresolved) && unresolved.length > 0) throw new CsApiError("UNRESOLVED_TEMPLATE_VARIABLES", 409);
   return {
     draft_state: state,
     review_note: requireOptionalString(body.review_note, "INVALID_REVIEW_NOTE", 1_000),
     human_revision: requireOptionalString(body.human_revision, "INVALID_HUMAN_REVISION", 20_000),
     purpose: body.purpose as "REPLY" | undefined,
+    composition_source_type: sourceType as ReviewDraftInput["composition_source_type"],
+    composition_source_id: requireOptionalString(body.composition_source_id, "INVALID_COMPOSITION_SOURCE_ID", 300),
+    composition_source_version: requireOptionalString(body.composition_source_version, "INVALID_COMPOSITION_SOURCE_VERSION", 100),
+    base_text_hash: requireOptionalString(body.base_text_hash, "INVALID_BASE_TEXT_HASH", 128),
+    final_text_hash: requireOptionalString(body.final_text_hash, "INVALID_FINAL_TEXT_HASH", 128),
+    unresolved_variables: unresolved as string[] | undefined,
+    source_content_hash: requireOptionalString(body.source_content_hash, "INVALID_SOURCE_CONTENT_HASH", 128),
     environment: "development",
     auto_send: parseBooleanFalse(body.auto_send),
     marketplace_write_actions: parseZero(body.marketplace_write_actions),
+  };
+}
+
+function parseQualityState(value: unknown, allowCandidate = true): "CANDIDATE" | "USE" | "EXCLUDE" {
+  const state = String(value ?? (allowCandidate ? "CANDIDATE" : "")).toUpperCase();
+  const allowed = allowCandidate ? ["CANDIDATE", "USE", "EXCLUDE"] : ["USE", "EXCLUDE"];
+  if (!allowed.includes(state)) throw new CsApiError("INVALID_QUALITY_STATE", 400);
+  return state as "CANDIDATE" | "USE" | "EXCLUDE";
+}
+
+function parseTemplate(body: JsonObject): UpsertTemplateInput {
+  rejectUnknownFields(body, rootFields.template);
+  requireDevelopmentSafety(body);
+  const checks = body.required_checks;
+  if (checks !== undefined && (!Array.isArray(checks) || checks.length > 20 || checks.some((item) => typeof item !== "string" || item.length > 500))) {
+    throw new CsApiError("INVALID_REQUIRED_CHECKS", 400);
+  }
+  return {
+    template_key: requireString(body.template_key, "INVALID_TEMPLATE_KEY", 200),
+    template_version: requireString(body.template_version, "INVALID_TEMPLATE_VERSION", 100),
+    template_name: requireString(body.template_name, "INVALID_TEMPLATE_NAME", 500),
+    template_text: requireString(body.template_text, "INVALID_TEMPLATE_TEXT", 20_000),
+    market: requireOptionalString(body.market, "INVALID_MARKET", 50),
+    channel: requireOptionalString(body.channel, "INVALID_CHANNEL", 100),
+    intent: requireOptionalString(body.intent, "INVALID_INTENT", 100),
+    required_checks: (checks as string[] | undefined) ?? [],
+    quality_state: parseQualityState(body.quality_state),
+    environment: "development", auto_send: false, marketplace_write_actions: 0,
+  };
+}
+
+function parseLibraryReview(body: JsonObject): ReviewLibraryInput {
+  rejectUnknownFields(body, rootFields.libraryReview);
+  requireDevelopmentSafety(body);
+  return {
+    quality_state: parseQualityState(body.quality_state, false) as "USE" | "EXCLUDE",
+    review_note: requireOptionalString(body.review_note, "INVALID_REVIEW_NOTE", 1_000),
+    environment: "development", auto_send: false, marketplace_write_actions: 0,
   };
 }
 
@@ -354,6 +433,22 @@ function draftIdFromPath(pathname: string): string | null {
   return id;
 }
 
+function libraryEntryIdFromPath(pathname: string): string | null {
+  const match = /^\/api\/cs\/library\/([^/]+)$/.exec(pathname);
+  if (!match) return null;
+  let id: string;
+  try { id = decodeURIComponent(match[1]); } catch { throw new CsApiError("INVALID_LIBRARY_ENTRY_ID", 400); }
+  if (!/^[A-Za-z0-9:_-]{1,300}$/.test(id)) throw new CsApiError("INVALID_LIBRARY_ENTRY_ID", 400);
+  return id;
+}
+
+function optionalQualityState(url: URL): "CANDIDATE" | "USE" | "EXCLUDE" | undefined {
+  for (const [key] of url.searchParams) if (key !== "quality_state") throw new CsApiError("UNKNOWN_QUERY_PARAMETER", 400);
+  if (url.searchParams.getAll("quality_state").length > 1) throw new CsApiError("DUPLICATE_QUERY_PARAMETER", 400);
+  const raw = url.searchParams.get("quality_state");
+  return raw === null ? undefined : parseQualityState(raw);
+}
+
 export function createCsApiHandler(options: CsApiOptions): (request: Request) => Promise<Response> {
   const allowedOrigins = new Set(options.allowedOrigins ?? []);
   const maxJsonBytes = options.maxJsonBytes ?? DEFAULT_MAX_JSON_BYTES;
@@ -379,6 +474,24 @@ export function createCsApiHandler(options: CsApiOptions): (request: Request) =>
       if (url.pathname === "/api/cs/cases") {
         if (request.method !== "GET") return methodNotAllowed(request, allowedOrigins, ["GET"]);
         return response(request, allowedOrigins, assertSafeStoreResult(await options.store.listCases(parseListQuery(url))));
+      }
+      if (url.pathname === "/api/cs/templates") {
+        if (request.method === "GET") {
+          return response(request, allowedOrigins, assertSafeStoreResult(await options.store.listTemplates(optionalQualityState(url))));
+        }
+        if (request.method !== "POST") return methodNotAllowed(request, allowedOrigins, ["GET", "POST"]);
+        requireSyncKey(request, options.syncKey);
+        return response(request, allowedOrigins, assertSafeStoreResult(await options.store.upsertTemplate(parseTemplate(await parseJson(request, maxJsonBytes)))), 201);
+      }
+      if (url.pathname === "/api/cs/library") {
+        if (request.method !== "GET") return methodNotAllowed(request, allowedOrigins, ["GET"]);
+        return response(request, allowedOrigins, assertSafeStoreResult(await options.store.listLibraryEntries(optionalQualityState(url))));
+      }
+      const libraryEntryId = libraryEntryIdFromPath(url.pathname);
+      if (libraryEntryId !== null) {
+        if (request.method !== "PATCH") return methodNotAllowed(request, allowedOrigins, ["PATCH"]);
+        requireSyncKey(request, options.syncKey);
+        return response(request, allowedOrigins, assertSafeStoreResult(await options.store.reviewLibraryEntry(libraryEntryId, parseLibraryReview(await parseJson(request, maxJsonBytes)))));
       }
       const caseKey = caseKeyFromPath(url.pathname);
       if (caseKey !== null) {

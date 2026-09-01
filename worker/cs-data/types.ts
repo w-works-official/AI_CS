@@ -20,6 +20,9 @@ export type ProcessingState = "NEW" | "CHANGED" | "UNCHANGED" | "REVIEW";
 export type DraftPurpose = "REPLY" | "EVAL";
 export type DraftDecisionPurpose = DraftPurpose;
 export type DraftState = "READY" | "APPROVED" | "REJECTED" | "REVISED" | "USED" | "SUPERSEDED" | "FAILED";
+export type QualityState = "CANDIDATE" | "USE" | "EXCLUDE";
+export type AnswerLibrarySourceType = "ACTUAL_SELLER_REPLY" | "REVIEWED_AI_REVISION" | "REVIEWED_TEMPLATE_REVISION" | "MANUAL_REVIEW_REPLY";
+export type CompositionSourceType = "AI_DRAFT" | "REPLY_TEMPLATE" | "ANSWER_LIBRARY_ENTRY" | "MANUAL";
 
 /** These fields map one-to-one to cs_cases in 0001_initial.sql. */
 export type CsCaseInput = {
@@ -46,10 +49,33 @@ export type DraftDecisionInput = { decision_id: string; run_id: string; case_key
 export type SyncRunInput = {
   run_id: string; environment?: "local" | "development"; mode?: "READ_ONLY"; started_at: string; finished_at: string | null;
   pii_rejected_count?: number; error_count?: number; cases: CsCaseInput[]; messages: CsMessageInput[]; drafts: DraftInput[]; decisions?: DraftDecisionInput[];
+  case_summaries?: CaseSummaryInput[]; answer_library_entries?: AnswerLibraryEntryInput[]; no_reply_patterns?: NoReplyPatternInput[];
 };
 export type CaseFilters = Partial<Pick<CsCaseInput, "market" | "channel" | "ui_type" | "reply_state">> & { ai_draft_state?: DraftState | "NONE" };
 export type CursorListInput = { limit?: number; cursor?: number; filters?: CaseFilters };
-export type DraftReviewInput = { draft_id: string; draft_state: "APPROVED" | "REJECTED" | "REVISED"; review_note_masked: string; human_revision_masked: string; reviewed_at: string; reviewer_ref: string };
+export type DraftReviewInput = {
+  draft_id: string; draft_state: "APPROVED" | "REJECTED" | "REVISED"; review_note_masked: string; human_revision_masked: string; reviewed_at: string; reviewer_ref: string;
+  composition_source_type?: CompositionSourceType | null; composition_source_id?: string | null; composition_source_version?: string | null;
+  base_text_hash?: string | null; final_text_hash?: string | null; unresolved_variables?: string[]; source_content_hash?: string | null;
+};
+export type CaseSummaryInput = {
+  case_key: string; summary_text_masked: string; summary_version: string; source_content_hash: string;
+  created_run_id: string; created_at: string;
+};
+export type AnswerLibraryEntryInput = {
+  library_entry_id: string; case_key: string; source_type: AnswerLibrarySourceType; source_id: string; source_version: string;
+  question_text_masked: string; answer_text_masked: string; market: string; channel: string; intent: string;
+  quality_state?: QualityState; source_content_hash: string; created_run_id: string; created_at: string;
+};
+export type NoReplyPatternInput = {
+  pattern_id: string; case_key: string; pattern_text_masked: string; reason_code: string; quality_state?: QualityState;
+  source_content_hash: string; created_run_id: string; created_at: string;
+};
+export type ReplyTemplateInput = {
+  template_id: string; template_key: string; template_version: string; template_name_masked: string; template_text_masked: string;
+  market?: string | null; channel?: string | null; intent?: string | null; required_checks: string[]; quality_state?: QualityState; created_at: string;
+};
+export type LibraryEntryReviewInput = { library_entry_id: string; quality_state: "USE" | "EXCLUDE"; review_note_masked: string; reviewer_ref: string; reviewed_at: string };
 export type HealthResult = { ok: true; service: "ai-cs-d1-repository"; schema_version: "v1"; write_policy: "MASKED_DTO_ONLY" };
 export type LatestSyncResult = { run_id: string; status: string; started_at: string; finished_at: string | null; collected_count: number; new_count: number; changed_count: number; unchanged_count: number; draft_created_count: number; pii_rejected_count: number; error_count: number } | null;
 export type OverviewResult = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; closed: number; by_market: Record<string, number>; latest_sync: LatestSyncResult };
@@ -61,6 +87,6 @@ export type CaseListItem = {
   reply_state: ReplyState; ai_draft_state: string; last_seen_at: string;
 };
 export type CursorListResult = { items: CaseListItem[]; cursor: number; next_cursor: number | null };
-export type CaseDetailResult = { case: Record<string, unknown>; messages: Record<string, unknown>[]; drafts: Record<string, unknown>[]; decisions: Record<string, unknown>[]; review_events: Record<string, unknown>[] };
+export type CaseDetailResult = { case: Record<string, unknown>; summary?: Record<string, unknown> | null; messages: Record<string, unknown>[]; drafts: Record<string, unknown>[]; decisions: Record<string, unknown>[]; review_events: Record<string, unknown>[] };
 export type SyncRunResult = { run_id: string; duplicate_run: boolean; inserted_cases: number; updated_cases: number; inserted_messages: number; inserted_drafts: number };
 export type DraftReviewResult = { draft_id: string; case_key: string; draft_state: "APPROVED" | "REJECTED" | "REVISED"; reviewed_at: string; reply_state_changed: false; human_revision_saved: boolean };
