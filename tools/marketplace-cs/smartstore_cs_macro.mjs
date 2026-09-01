@@ -8,7 +8,14 @@ import {
   inspectGoogleChromeSession,
   resolveBrowserSession,
 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/browser-session-core.mjs";
-import { detectAuthChallengeState, filterChatMessages, parseTalktalkTotalText } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/collector-ui-core.mjs";
+import {
+  detectAuthChallengeState,
+  filterChatMessages,
+  isDateInRange,
+  isVerifiedEmptyGridState,
+  normalizeFlexibleDate,
+  parseTalktalkTotalText,
+} from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/collector-ui-core.mjs";
 
 const OUTPUT_DIR = new URL("../../output/", import.meta.url);
 const STORE_ORIGIN = "https://sell.smartstore.naver.com";
@@ -147,20 +154,6 @@ function normalizeDateLabel(label, endDate) {
   }
   const match = text.match(/^(\d{1,2})월\s*(\d{1,2})일$/);
   return match ? `${endDate.slice(0, 4)}-${match[1].padStart(2, "0")}-${match[2].padStart(2, "0")}` : "";
-}
-
-function normalizeFlexibleDate(label, endDate) {
-  const text = compact(label);
-  const iso = text.match(/(20\d{2})[-./](\d{1,2})[-./](\d{1,2})/);
-  if (iso) return `${iso[1]}-${iso[2].padStart(2, "0")}-${iso[3].padStart(2, "0")}`;
-  if (/\uC624\uB298|\uBC29\uAE08|\d+\s*(?:\uBD84|\uC2DC\uAC04)\s*\uC804|\uC624\uC804|\uC624\uD6C4|^\d{1,2}:\d{2}/.test(text)) return endDate;
-  if (/\uC5B4\uC81C/.test(text)) {
-    const date = new Date(`${endDate}T00:00:00+09:00`);
-    date.setDate(date.getDate() - 1);
-    return kstDate(date);
-  }
-  const md = text.match(/(?:^|\s)(\d{1,2})\s*(?:[./]|\uC6D4)\s*(\d{1,2})(?:\s*\uC77C)?/);
-  return md ? `${endDate.slice(0, 4)}-${md[1].padStart(2, "0")}-${md[2].padStart(2, "0")}` : "";
 }
 
 async function requireLoggedIn(page) {
@@ -331,12 +324,20 @@ async function collectCustomerQna(context, range) {
       break;
     }
     await next.click({ force: true });
-    await page.waitForTimeout(600);
+    let nextPage = activePage;
+    for (let waitGuard = 0; waitGuard < 20 && nextPage === activePage; waitGuard += 1) {
+      await page.waitForTimeout(250);
+      nextPage = Number(await frame.locator(".paginate strong").textContent().catch(() => String(activePage))) || activePage;
+    }
+    if (nextPage === activePage) {
+      paginationComplete = true;
+      break;
+    }
   }
   await page.close();
   return {
     visibleTotal: records.length,
-    records: records.filter((record) => record.received_at.slice(0, 10) >= range.start),
+    records: records.filter((record) => isDateInRange(record.received_at, range)),
     openQueueRecords: records.filter((record) => isOpenReplyStatus(record.status)),
     // The page currently exposes no independently verified unanswered total.
     // Keep reconciliation disabled even when pagination itself completed.
@@ -348,25 +349,68 @@ async function collectCustomerQna(context, range) {
   };
 }
 
-async function collectCustomerCenter(context) {
+async function collectCustomerCenter(context, range) {
   const page = await context.newPage();
-  await page.goto(ROUTES.customerCenter, { waitUntil: "domcontentloaded" });
-  const frame = page.frameLocator("iframe");
-  await frame.getByRole("button", { name: "1개월", exact: true }).click({ force: true });
-  await frame.getByRole("button", { name: "검색", exact: true }).click({ force: true });
-  await page.waitForTimeout(700);
-  const rows = frame.getByRole("grid").locator("tbody tr");
-  const records = [];
-  for (let index = 0; index < await rows.count(); index += 1) {
-    const cells = await rows.nth(index).locator("td").allTextContents();
-    if (cells.length >= 8) records.push({
-      inquiry_id: compact(cells[0]), product_order_no: compact(cells[1]), product_id: compact(cells[2]),
-      subject: compact(cells[3]), updated_at: compact(cells[4]), status: compact(cells[5]),
-      last_replied_at: compact(cells[6]), last_replier: compact(cells[7]),
+  try {
+    await page.goto(ROUTES.customerCenter, { waitUntil: "domcontentloaded" });
+    await assertNoAuthChallenge(page, "SMARTSTORE_CUSTOMER_CENTER");
+    const frame = page.frameLocator("iframe");
+    await frame.getByRole("button", { name: "1개월", exact: true }).click({ force: true });
+    await frame.getByRole("button", { name: "검색", exact: true }).click({ force: true });
+    const grid = frame.getByRole("grid");
+    await grid.waitFor({ state: "visible", timeout: 10_000 });
+    const rows = grid.locator("tbody tr");
+    let previousCount = -1;
+    let stablePasses = 0;
+    for (let guard = 0; guard < 20 && stablePasses < 3; guard += 1) {
+      const count = await rows.count();
+      stablePasses = count === previousCount ? stablePasses + 1 : 0;
+      previousCount = count;
+      if (stablePasses < 3) await page.waitForTimeout(250);
+    }
+
+    const headerCount = Math.max(
+      await grid.locator("thead th").count(),
+      await grid.locator('[role="columnheader"]').count(),
+    );
+    const loadingVisible = await frame.locator('[aria-busy="true"]:visible, [class*="loading"]:visible, [class*="spinner"]:visible').count() > 0;
+    const rowCount = await rows.count();
+    const verifiedZero = isVerifiedEmptyGridState({
+      gridVisible: await grid.isVisible().catch(() => false),
+      headerCount,
+      rowCount,
+      loadingVisible,
     });
+    if (rowCount === 0) {
+      return {
+        visibleTotal: 0,
+        records: [],
+        verifiedZero,
+        error: verifiedZero ? "" : "CUSTOMER_CENTER_ZERO_STATE_UNVERIFIED",
+      };
+    }
+    if (headerCount < 8) {
+      return { visibleTotal: rowCount, records: [], verifiedZero: false, error: "CUSTOMER_CENTER_GRID_STRUCTURE_UNRECOGNIZED" };
+    }
+
+    const records = [];
+    for (let index = 0; index < rowCount; index += 1) {
+      const cells = await rows.nth(index).locator("td").allTextContents();
+      if (cells.length >= 8) records.push({
+        inquiry_id: compact(cells[0]), product_order_no: compact(cells[1]), product_id: compact(cells[2]),
+        subject: compact(cells[3]), updated_at: compact(cells[4]), status: compact(cells[5]),
+        last_replied_at: compact(cells[6]), last_replier: compact(cells[7]),
+      });
+    }
+    return {
+      visibleTotal: rowCount,
+      records: records.filter((record) => isDateInRange(record.updated_at, range)),
+      verifiedZero: false,
+      error: records.length === rowCount ? "" : "CUSTOMER_CENTER_ROW_STRUCTURE_MISMATCH",
+    };
+  } finally {
+    await page.close().catch(() => {});
   }
-  await page.close();
-  return records;
 }
 
 async function dismissTalktalkNotice(frame) {
@@ -855,7 +899,7 @@ const collectedAt = new Date().toISOString();
 const [comments, customerQna, customerCenter, talktalk, zigzagOrder, zigzagItem, ably] = await Promise.all([
   requestedChannels.has("comments") ? collectComments(context, range) : Promise.resolve({ visibleTotal: 0, records: [], openQueueRecords: [], openQueueComplete: false }),
   requestedChannels.has("customer_qna") ? collectCustomerQna(context, range) : Promise.resolve({ visibleTotal: 0, records: [], openQueueRecords: [], openQueueComplete: false }),
-  requestedChannels.has("customer_center") ? collectCustomerCenter(context) : Promise.resolve([]),
+  requestedChannels.has("customer_center") ? collectCustomerCenter(context, range) : Promise.resolve({ visibleTotal: 0, records: [], verifiedZero: false, error: "" }),
   requestedChannels.has("talktalk") ? collectTalktalk(context, range) : Promise.resolve([]),
   requestedChannels.has("zigzag_order_inquiry") ? collectZigzagTable(context, range, "order_inquiry") : Promise.resolve({ visibleTotal: 0, records: [], openQueueRecords: [], openQueueComplete: false }),
   requestedChannels.has("zigzag_item_question") ? collectZigzagTable(context, range, "item_question") : Promise.resolve({ visibleTotal: 0, records: [], openQueueRecords: [], openQueueComplete: false }),
@@ -884,7 +928,11 @@ const rawCollection = {
       open_queue_complete: requestedChannels.has("customer_qna") && customerQna.openQueueComplete,
       open_queue_error: customerQna.openQueueError || "",
     },
-    smartstore_customer_center: { market: "smartstore", channel: "customer_center", attempted: requestedChannels.has("customer_center"), visible_total: customerCenter.length, records: customerCenter },
+    smartstore_customer_center: {
+      market: "smartstore", channel: "customer_center", attempted: requestedChannels.has("customer_center"),
+      visible_total: customerCenter.visibleTotal, records: customerCenter.records,
+      error: customerCenter.error || "",
+    },
     smartstore_talktalk: {
       market: "smartstore",
       channel: "talktalk",
