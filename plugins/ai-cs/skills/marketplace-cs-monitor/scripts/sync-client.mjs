@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 export const DEFAULT_SYNC_CONFIG = fileURLToPath(
   new URL("../config/sheet-target.json", import.meta.url),
 );
+export const DEVELOPMENT_D1_API_URL = "https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs";
 
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
 const READ_ACTIONS = new Set(["health", "overview", "cases", "case", "caseBatch", "caseIndex", "answerLibrary"]);
@@ -76,13 +77,63 @@ export async function loadSyncConfig({
   }
   const syncUrl = env.MARKETPLACE_CS_SYNC_URL;
   const syncKey = env.MARKETPLACE_CS_SYNC_KEY;
+  const d1Url = env.MARKETPLACE_CS_D1_URL;
+  const d1Key = env.MARKETPLACE_CS_D1_SYNC_KEY;
   const environment = env.MARKETPLACE_CS_SYNC_ENVIRONMENT;
   return {
     ...file,
     web_app_url: syncUrl || file.web_app_url || "",
     api_key: syncKey || "",
+    d1_api_url: d1Url || file.d1_api_url || "",
+    d1_sync_key: d1Key || "",
     environment: environment || file.environment || "",
   };
+}
+
+function developmentD1SyncUrl(value) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error("MARKETPLACE_CS_D1_URL_INVALID"); }
+  const expected = new URL(DEVELOPMENT_D1_API_URL);
+  const path = url.pathname.replace(/\/$/, "");
+  if (url.protocol !== "https:" || url.username || url.password || url.origin !== expected.origin || (path !== expected.pathname && path !== `${expected.pathname}/sync`)) {
+    throw new Error("MARKETPLACE_CS_D1_URL_INVALID");
+  }
+  url.pathname = `${expected.pathname}/sync`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+export async function syncReportToD1(report, config, { fetchImpl = globalThis.fetch, ...options } = {}) {
+  if (config?.environment !== "development") throw new Error("DEVELOPMENT_D1_SYNC_REQUIRED");
+  if (!config?.d1_api_url) throw new Error("MARKETPLACE_CS_D1_URL_NOT_CONFIGURED");
+  if (!config?.d1_sync_key) throw new Error("MARKETPLACE_CS_D1_SYNC_KEY_NOT_CONFIGURED");
+  if (typeof fetchImpl !== "function") throw new Error("FETCH_NOT_AVAILABLE");
+  validateSyncReport(report);
+  const payload = {
+    run_id: options.runId ?? makeRunId(report),
+    report,
+    environment: "development",
+    auto_send: false,
+    marketplace_write_actions: 0,
+  };
+  const response = await fetchImpl(developmentD1SyncUrl(config.d1_api_url), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-CS-Sync-Key": config.d1_sync_key,
+    },
+    body: JSON.stringify(payload),
+    redirect: "error",
+  });
+  const raw = await response.text();
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { throw new Error(`D1_SYNC_RESPONSE_NOT_JSON:${response.status}`); }
+  if (!response.ok || !parsed.ok) throw new Error(`D1_SYNC_FAILED:${parsed.error || response.status}`);
+  if (parsed.environment !== "development" || parsed.auto_send !== false || Number(parsed.marketplace_write_actions ?? 0) !== 0) {
+    throw new Error("UNSAFE_D1_SYNC_RESPONSE");
+  }
+  return parsed;
 }
 
 export async function syncReport(report, config, { fetchImpl = globalThis.fetch, ...options } = {}) {

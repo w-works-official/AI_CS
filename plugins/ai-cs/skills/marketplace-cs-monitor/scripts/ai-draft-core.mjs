@@ -3,10 +3,84 @@ import { inspectUnmaskedPii, maskSensitiveText } from "./report-core.mjs";
 
 const compact = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
 const ACTIVE_DRAFT_STATES = new Set(["READY", "APPROVED", "USED"]);
+const CHAT_CHANNELS = new Set(["talktalk", "chat", "inquiry"]);
+
+function skip(sourceKey, reason, {
+  purpose = "",
+  required_checks = [],
+  change_state = "",
+  reply_state = "",
+} = {}) {
+  return {
+    source_key: compact(sourceKey),
+    reason,
+    // Keep `reason` for existing callers and expose a stable machine-readable name
+    // for the review UI and run report.
+    reason_code: reason,
+    purpose: compact(purpose),
+    required_checks: [...new Set((required_checks ?? []).map(compact).filter(Boolean))],
+    change_state: compact(change_state),
+    reply_state: compact(reply_state),
+  };
+}
+
+function isExplicitFalse(value) {
+  return value === false || ["false", "0", "incomplete", "partial"].includes(compact(value).toLowerCase());
+}
+
+function isChatRecord(record) {
+  const channel = compact(record?.channel).toLowerCase();
+  const uiType = compact(record?.ui_type ?? record?.conversation_type).toUpperCase();
+  return CHAT_CHANNELS.has(channel) || uiType === "CHAT";
+}
+
+function conversationIsIncomplete(record) {
+  return [
+    record?.conversation_complete,
+    record?.messages_complete,
+    record?.detail_complete,
+  ].some(isExplicitFalse);
+}
+
+function conversationIncompleteChecks(record) {
+  const detailReason = Array.isArray(record?.conversation_incomplete_reason)
+    ? record.conversation_incomplete_reason
+    : [record?.conversation_incomplete_reason];
+  return ["전체 대화 수집 후 재확인", ...detailReason.map(compact).filter(Boolean)];
+}
 const UI_CONTROL_TEXT = /^(?:문의\s*종료하기|답변\s*등록|상담\s*완료|처리\s*완료)$/;
 
 function messageActor(message) {
   return compact(message?.direction ?? message?.actor).toLowerCase();
+}
+
+function hasActualSellerAnswer(record) {
+  const messages = Array.isArray(record?.messages) ? record.messages : [];
+  const replies = Array.isArray(record?.seller_replies) ? record.seller_replies : [];
+  return replies.some((reply) => compact(reply?.text ?? reply?.body))
+    || messages.some((message) => messageActor(message) === "seller" && compact(message?.text) && !UI_CONTROL_TEXT.test(compact(message.text)));
+}
+
+function chatActorCheck(record, purpose) {
+  const messages = Array.isArray(record?.messages) ? record.messages : [];
+  const meaningfulMessages = messages.filter((message) => !["automatic", "system"].includes(messageActor(message)));
+  const lastMeaningful = meaningfulMessages.at(-1);
+  const inferredLastActor = messageActor(lastMeaningful);
+  const declaredLastActor = compact(record?.last_actor).toLowerCase();
+
+  if (!lastMeaningful || !["customer", "seller"].includes(inferredLastActor)) {
+    return { ok: false, reason: "ACTOR_UNCERTAIN", required_checks: ["대화 발신자 방향 확인"] };
+  }
+  if (["customer", "seller"].includes(declaredLastActor) && declaredLastActor !== inferredLastActor) {
+    return { ok: false, reason: "ACTOR_UNCERTAIN", required_checks: ["대화 발신자 방향 불일치 확인"] };
+  }
+  if (purpose === "REPLY" && inferredLastActor !== "customer") {
+    return { ok: false, reason: "ACTOR_UNCERTAIN", required_checks: ["마지막 고객 메시지와 답변 상태 확인"] };
+  }
+  if (purpose === "EVAL" && inferredLastActor !== "seller") {
+    return { ok: false, reason: "ACTOR_UNCERTAIN", required_checks: ["실제 판매자 답변과 마지막 메시지 방향 확인"] };
+  }
+  return { ok: true };
 }
 
 export function extractLastCustomerTurn(record, { allowPostFallback = true } = {}) {
@@ -27,7 +101,7 @@ export function extractLastCustomerTurn(record, { allowPostFallback = true } = {
       };
     }
     if (Number(message?.image_count) > 0) {
-      return { ok: false, skip_reason: "IMAGE_ONLY_CUSTOMER_TURN", required_checks: ["첨부 이미지 원문 확인"] };
+      return { ok: false, skip_reason: "IMAGE_REVIEW_REQUIRED", required_checks: ["첨부 이미지 원문 확인"] };
     }
   }
 
@@ -57,31 +131,84 @@ export function selectDraftCandidates(report, existingCasesByKey = new Map(), {
   let evalCount = 0;
   for (const record of report?.records ?? []) {
     const changeState = compact(record?.change_state).toUpperCase();
+    const replyState = compact(record?.reply_state).toUpperCase();
     if (onlyNewOrChanged && !["NEW", "CHANGED"].includes(changeState)) {
-      skipped.push({ source_key: record?.source_key, reason: "UNCHANGED" });
+      skipped.push(skip(record?.source_key, "UNCHANGED", { change_state: changeState, reply_state: replyState }));
       continue;
     }
-    const replyState = compact(record?.reply_state).toUpperCase();
+    if (isChatRecord(record) && conversationIsIncomplete(record)) {
+      skipped.push(skip(record?.source_key, "CONVERSATION_INCOMPLETE", {
+        change_state: changeState,
+        reply_state: replyState,
+        required_checks: conversationIncompleteChecks(record),
+      }));
+      continue;
+    }
+    if (isChatRecord(record)) {
+      const actorCheck = chatActorCheck(record, "");
+      if (!actorCheck.ok) {
+        skipped.push(skip(record?.source_key, actorCheck.reason, {
+          change_state: changeState,
+          reply_state: replyState,
+          required_checks: actorCheck.required_checks,
+        }));
+        continue;
+      }
+    }
     let purpose = "";
     if (replyState === "NEEDS_REPLY") purpose = "REPLY";
-    else if (includeAnsweredForEval && replyState === "ANSWERED" && evalCount < Math.max(0, Number(evalLimit) || 0)) {
+    else if (replyState === "ANSWERED") {
+      if (!includeAnsweredForEval) {
+        skipped.push(skip(record?.source_key, "EVAL_DISABLED", { purpose: "EVAL", change_state: changeState, reply_state: replyState }));
+        continue;
+      }
+      if (evalCount >= Math.max(0, Number(evalLimit) || 0)) {
+        skipped.push(skip(record?.source_key, "EVAL_LIMIT_REACHED", { purpose: "EVAL", change_state: changeState, reply_state: replyState }));
+        continue;
+      }
       purpose = "EVAL";
     }
     if (!purpose) {
-      skipped.push({ source_key: record?.source_key, reason: "DRAFT_NOT_REQUIRED" });
+      skipped.push(skip(record?.source_key, "NO_REPLY_REQUIRED", { change_state: changeState, reply_state: replyState }));
       continue;
     }
     const existing = existingCasesByKey instanceof Map
       ? existingCasesByKey.get(record?.source_key)
       : existingCasesByKey?.[record?.source_key];
     if (changeState !== "CHANGED" && ACTIVE_DRAFT_STATES.has(compact(existing?.ai_draft_state).toUpperCase())) {
-      skipped.push({ source_key: record?.source_key, reason: "ACTIVE_DRAFT_EXISTS" });
+      skipped.push(skip(record?.source_key, "ACTIVE_DRAFT_EXISTS", { purpose, change_state: changeState, reply_state: replyState }));
       continue;
     }
     const turn = extractLastCustomerTurn(record);
     if (!turn.ok) {
-      skipped.push({ source_key: record?.source_key, reason: turn.skip_reason, required_checks: turn.required_checks });
+      skipped.push(skip(record?.source_key, turn.skip_reason, {
+        purpose,
+        change_state: changeState,
+        reply_state: replyState,
+        required_checks: turn.required_checks,
+      }));
       continue;
+    }
+    if (purpose === "EVAL" && !hasActualSellerAnswer(record)) {
+      skipped.push(skip(record?.source_key, "SELLER_ANSWER_NOT_FOUND", {
+        purpose,
+        change_state: changeState,
+        reply_state: replyState,
+        required_checks: ["실제 판매자 답변 원문 확인"],
+      }));
+      continue;
+    }
+    if (isChatRecord(record)) {
+      const actorCheck = chatActorCheck(record, purpose);
+      if (!actorCheck.ok) {
+        skipped.push(skip(record?.source_key, actorCheck.reason, {
+          purpose,
+          change_state: changeState,
+          reply_state: replyState,
+          required_checks: actorCheck.required_checks,
+        }));
+        continue;
+      }
     }
     const intent = classifyIntent(`${turn.text} ${record?.subject ?? ""} ${record?.product_name ?? ""}`, record?.category);
     candidates.push({

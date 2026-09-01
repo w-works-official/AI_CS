@@ -1,5 +1,5 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeReviewRequest, normalizeSyncRequest } from './policy';
+import { NextRequest, NextResponse } from 'next/server.js';
+import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeReviewRequest, normalizeSyncRequest } from './policy.ts';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,8 +11,11 @@ const cacheScope = globalThis as typeof globalThis & { __pinkRocketCsCache?: Map
 const responseCache = cacheScope.__pinkRocketCsCache ?? new Map<string, CacheEntry>();
 cacheScope.__pinkRocketCsCache = responseCache;
 type WebEnvironment = 'development' | 'production';
+type D1Payload = Record<string, unknown>;
+const DEFAULT_D1_API_URL = 'https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs';
 
-function webTarget() {
+/** Existing Apps Script target remains POST-only until the shadow-write cutover. */
+function appsScriptTarget() {
   const environment = process.env.AI_CS_WEB_ENVIRONMENT as WebEnvironment | undefined;
   if (!environment) {
     const endpoint = process.env.MARKETPLACE_CS_SYNC_URL;
@@ -29,6 +32,10 @@ function webTarget() {
   return { environment, endpoint, apiKey };
 }
 
+function d1Target() {
+  return { endpoint: new URL(DEFAULT_D1_API_URL), environment: 'development' as const };
+}
+
 function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
   return NextResponse.json(body, {
     status,
@@ -39,14 +46,121 @@ function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
   });
 }
 
-export async function GET(request: NextRequest) {
-  let target: ReturnType<typeof webTarget>;
-  try {
-    target = webTarget();
-  } catch (error) {
-    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_DATA_CONNECTION_NOT_CONFIGURED', environment: 'unconfigured', auto_send: false }, 503);
-  }
+class D1ReadError extends Error {
+  readonly code: string;
+  readonly status: number;
+  constructor(code: string, status: number) { super(code); this.code = code; this.status = status; }
+}
 
+function d1Safety(payload: unknown): D1Payload {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new D1ReadError('CS_D1_RESPONSE_INVALID', 502);
+  const value = payload as D1Payload;
+  if (value.ok === false) throw new D1ReadError(String(value.error ?? 'CS_D1_REJECTED'), 502);
+  if (value.environment !== 'development' || value.auto_send !== false || Number(value.marketplace_write_actions) !== 0) {
+    throw new D1ReadError('UNSAFE_OR_MISMATCHED_D1', 502);
+  }
+  return { ...value, environment: 'development', auto_send: false, marketplace_write_actions: 0 };
+}
+
+async function readD1(base: URL, path: string, params?: URLSearchParams): Promise<D1Payload> {
+  const upstream = new URL(base);
+  upstream.pathname = `${base.pathname.replace(/\/$/, '')}${path}`;
+  if (params) upstream.search = params.toString();
+  let response: Response;
+  try {
+    response = await fetch(upstream, { cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' } });
+  } catch { throw new D1ReadError('CS_D1_CONNECTION_FAILED', 502); }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const code = payload && typeof payload === 'object' && !Array.isArray(payload) ? String((payload as D1Payload).error ?? `D1_HTTP_${response.status}`) : `D1_HTTP_${response.status}`;
+    throw new D1ReadError(code, response.status >= 400 && response.status < 500 ? response.status : 502);
+  }
+  return d1Safety(payload);
+}
+
+function numberValue(value: unknown): number { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0; }
+
+function legacyTotal(overview: D1Payload, query: URLSearchParams): number {
+  const draftState = query.get('ai_draft_state');
+  const replyState = query.get('reply_state');
+  if (draftState === 'READY') return numberValue(overview.ai_ready);
+  if (replyState === 'NEEDS_REPLY') return numberValue(overview.needs_reply);
+  if (replyState === 'ANSWERED') return numberValue(overview.answered);
+  if (replyState === 'REVIEW') return numberValue(overview.review);
+  if (replyState === 'NO_REPLY_REQUIRED') return numberValue(overview.no_reply_required);
+  if (replyState === 'CLOSED') return 0;
+  return numberValue(overview.total_live);
+}
+
+function legacyCaseList(cases: D1Payload, overview: D1Payload, query: URLSearchParams): D1Payload {
+  const items = Array.isArray(cases.items) ? cases.items.map(legacyCaseFields) : [];
+  return {
+    ...cases,
+    items,
+    total: legacyTotal(overview, query),
+  };
+}
+
+function legacyCaseFields(value: unknown): D1Payload {
+  const item = value && typeof value === 'object' && !Array.isArray(value) ? value as D1Payload : {};
+  return {
+    ...item,
+    category: item.category ?? item.category_masked ?? '',
+    subject: item.subject ?? item.subject_masked ?? '',
+    preview: item.preview ?? item.preview_masked ?? '',
+    product_name: item.product_name ?? item.product_name_masked ?? '',
+    source_reference: item.source_reference ?? item.source_reference_masked ?? '',
+  };
+}
+
+function legacyDetail(payload: D1Payload): D1Payload {
+  const rawCase = legacyCaseFields(payload.case);
+  const messages = Array.isArray(payload.messages) ? payload.messages.map((item) => {
+    const message = item && typeof item === 'object' && !Array.isArray(item) ? item as D1Payload : {};
+    return {
+      ...message,
+      actor_type: message.actor_type ?? message.actor ?? 'UNKNOWN',
+      message_at: message.message_at ?? message.sent_at ?? '',
+      message_text_masked: message.message_text_masked ?? message.text_masked ?? '',
+    };
+  }) : [];
+  const sellerMessages = messages.filter((item) => String(item.actor_type).toUpperCase() === 'SELLER');
+  const reviewByDraft = new Map<string, D1Payload>();
+  if (Array.isArray(payload.review_events)) {
+    for (const item of payload.review_events) {
+      const review = item && typeof item === 'object' && !Array.isArray(item) ? item as D1Payload : null;
+      const draftId = String(review?.draft_id ?? '');
+      if (review && draftId && !reviewByDraft.has(draftId)) reviewByDraft.set(draftId, review);
+    }
+  }
+  const drafts = Array.isArray(payload.drafts) ? payload.drafts.map((item) => {
+    const draft = item && typeof item === 'object' && !Array.isArray(item) ? item as D1Payload : {};
+    const review = reviewByDraft.get(String(draft.draft_id ?? ''));
+    return {
+      ...draft,
+      draft_text: draft.draft_text ?? draft.draft_text_masked ?? '',
+      draft_state: review?.review_state ?? draft.draft_state ?? draft.state ?? '',
+      generated_at: draft.generated_at ?? draft.created_at ?? '',
+      pii_scan: draft.pii_scan ?? 'PASS',
+      human_revision: review?.human_revision_masked ?? draft.human_revision ?? '',
+      reviewed_at: review?.created_at ?? draft.reviewed_at ?? '',
+    };
+  }) : [];
+  const latestSeller = sellerMessages.at(-1);
+  return {
+    ...payload,
+    case: {
+      ...rawCase,
+      human_reply_exists: rawCase.human_reply_exists ?? Boolean(latestSeller),
+      latest_human_reply_preview: rawCase.latest_human_reply_preview ?? latestSeller?.message_text_masked ?? '',
+      human_reply_at: rawCase.human_reply_at ?? latestSeller?.message_at ?? '',
+    },
+    messages,
+    drafts,
+  };
+}
+
+export async function GET(request: NextRequest) {
   const action = request.nextUrl.searchParams.get('action') ?? 'overview';
   if (!ALLOWED_ACTIONS.has(action)) return privateJson({ ok: false, error: 'UNKNOWN_ACTION' }, 400);
   try { assertSingletonReadParams(request.nextUrl.searchParams); } catch (error) {
@@ -73,49 +187,46 @@ export async function GET(request: NextRequest) {
   const isDetailAction = action === 'case' || action === 'caseBatch';
   if (!fresh && cached && cached.expiresAt > Date.now()) return privateJson(cached.payload, 200, isDetailAction ? 60 : 30);
 
-  const upstream = new URL(target.endpoint);
-  request.nextUrl.searchParams.forEach((value, key) => {
-    if (ALLOWED_PARAMS.has(key)) upstream.searchParams.set(key, value);
-  });
-  upstream.searchParams.set('action', action);
-  upstream.searchParams.set('api_key', target.apiKey);
-  upstream.searchParams.set('environment', target.environment);
-
   try {
-    const response = await fetch(upstream, {
-      cache: 'no-store',
-      redirect: 'follow',
-      headers: { Accept: 'application/json' },
-    });
-    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
-    if (!response.ok || !payload || payload.ok === false) {
-      return privateJson({ ok: false, error: payload?.error ?? `UPSTREAM_HTTP_${response.status}` }, response.status >= 400 ? response.status : 502);
+    const target = d1Target();
+    const query = new URLSearchParams();
+    for (const key of ['market', 'channel', 'ui_type', 'reply_state', 'ai_draft_state', 'limit', 'cursor'] as const) {
+      const value = request.nextUrl.searchParams.get(key);
+      if (value !== null) query.set(key, value);
     }
-    if (
-      (payload.environment && payload.environment !== target.environment)
-      || (payload.auto_send !== undefined && payload.auto_send !== false)
-    ) {
-      return privateJson({ ok: false, error: 'UNSAFE_OR_MISMATCHED_UPSTREAM', environment: target.environment, auto_send: false }, 502);
+    const call = (path: string, params?: URLSearchParams) => readD1(target.endpoint, path, params);
+    let safePayload: D1Payload;
+    if (action === 'health') safePayload = await call('/health');
+    else if (action === 'overview') safePayload = await call('/overview');
+    else if (action === 'cases') {
+      const [cases, overview] = await Promise.all([call('/cases', query), call('/overview')]);
+      safePayload = legacyCaseList(cases, overview, query);
+    } else if (action === 'dashboard') {
+      const [cases, overview] = await Promise.all([call('/cases', query), call('/overview')]);
+      safePayload = { ok: true, overview, ...legacyCaseList(cases, overview, query) };
+    } else if (action === 'case') {
+      safePayload = legacyDetail(await call(`/cases/${encodeURIComponent(request.nextUrl.searchParams.get('case_key') ?? '')}`));
+    } else {
+      const caseKeys = normalizeCaseBatchKeys(request.nextUrl.searchParams.get('case_keys') ?? '');
+      const items = await Promise.all(caseKeys.map((caseKey) => call(`/cases/${encodeURIComponent(caseKey)}`).then(legacyDetail)));
+      safePayload = { ok: true, items };
     }
-    const safePayload = {
-      ...payload,
-      environment: payload.environment ?? target.environment,
-      auto_send: false,
-    };
+    safePayload = { ...safePayload, environment: 'development', auto_send: false, marketplace_write_actions: 0 };
     responseCache.set(cacheKey, {
       payload: safePayload,
       expiresAt: Date.now() + (isDetailAction ? 120_000 : 60_000),
     });
     return privateJson(safePayload, 200, isDetailAction ? 60 : 30);
-  } catch {
-    return privateJson({ ok: false, error: 'CS_DATA_CONNECTION_FAILED' }, 502);
+  } catch (error) {
+    if (error instanceof D1ReadError) return privateJson({ ok: false, error: error.code, environment: 'development', auto_send: false, marketplace_write_actions: 0 }, error.status);
+    return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_DATA_CONNECTION_FAILED', environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 502);
   }
 }
 
 export async function POST(request: NextRequest) {
-  let target: ReturnType<typeof webTarget>;
+  let target: ReturnType<typeof appsScriptTarget>;
   try {
-    target = webTarget();
+    target = appsScriptTarget();
     if (target.environment !== 'development') throw new Error('DEVELOPMENT_WRITE_ONLY');
   } catch (error) {
     return privateJson({ ok: false, error: error instanceof Error ? error.message : 'CS_REVIEW_NOT_CONFIGURED', environment: 'unconfigured', auto_send: false }, 403);

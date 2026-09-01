@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { applyAiDrafts, buildReport, normalizeMarketplaceUrl } from "./report-core.mjs";
+import { selectDraftCandidates } from "./ai-draft-core.mjs";
 
 const base = {
   mode: "changes_today",
@@ -67,6 +68,7 @@ linkedTalktalkInput.channels.smartstore_talktalk.records = [{
   source_reference_masked: "TT-0b6d54a12345",
   messages: [{ direction: "customer", text: "사진을 확인해 주세요", image_count: 1 }],
   last_actor: "customer",
+  conversation_complete: true,
 }];
 const linkedTalktalk = buildReport(linkedTalktalkInput, []);
 const linkedRecord = linkedTalktalk.records.find((row) => row.channel === "talktalk");
@@ -75,6 +77,56 @@ assert.match(linkedRecord.source_url, /^https:\/\/talk\.naver\.com\/ct\/thread-1
 assert.equal(linkedRecord.source_reference, "TT-0b6d54a12345");
 assert.equal(linkedRecord.product_name, "샘플 피어싱");
 assert.equal(linkedRecord.messages[0].image_count, 1);
+assert.equal(linkedRecord.conversation_complete, true);
+const legacyCompletenessInput = structuredClone(linkedTalktalkInput);
+delete legacyCompletenessInput.channels.smartstore_talktalk.records[0].conversation_complete;
+const legacyCompletenessRecord = buildReport(legacyCompletenessInput, []).records.find((row) => row.channel === "talktalk");
+assert.equal(linkedRecord.content_hash, legacyCompletenessRecord.content_hash);
+
+const incompleteTalktalkInput = structuredClone(linkedTalktalkInput);
+incompleteTalktalkInput.channels.smartstore_talktalk.records[0].conversation_complete = false;
+incompleteTalktalkInput.channels.smartstore_talktalk.records[0].conversation_incomplete_reason = "history_scroll_unstable";
+const incompleteTalktalk = buildReport(incompleteTalktalkInput, []);
+const incompleteTalktalkRecord = incompleteTalktalk.records.find((row) => row.channel === "talktalk");
+assert.equal(incompleteTalktalkRecord.reply_state, "REVIEW");
+assert.equal(incompleteTalktalkRecord.conversation_complete, false);
+assert.equal(incompleteTalktalkRecord.conversation_incomplete_reason, "HISTORY_SCROLL_UNSTABLE");
+assert.notEqual(incompleteTalktalkRecord.content_hash, linkedRecord.content_hash);
+
+const systemTailInput = structuredClone(linkedTalktalkInput);
+systemTailInput.channels.smartstore_talktalk.records[0].last_actor = "system";
+systemTailInput.channels.smartstore_talktalk.records[0].messages = [
+  { actor: "CUSTOMER", text: "언제 출고되나요?", sequence: 0, direction_confidence: "CLASS_VERIFIED" },
+  { actor: "SYSTEM", text: "상담 안내" },
+];
+const systemTail = buildReport(systemTailInput, []);
+const systemTailRecord = systemTail.records.find((row) => row.channel === "talktalk");
+assert.equal(systemTailRecord.last_actor, "customer");
+assert.equal(systemTailRecord.reply_state, "NEEDS_REPLY");
+assert.equal(systemTailRecord.messages[0].sequence, 0);
+assert.equal(systemTailRecord.messages[0].actor, "CUSTOMER");
+assert.equal(systemTailRecord.last_actor_confidence, "CLASS_VERIFIED");
+const systemTailCandidates = selectDraftCandidates({ records: [systemTailRecord] });
+assert.equal(systemTailCandidates.candidates.length, 1);
+assert.equal(systemTailCandidates.candidates[0].purpose, "REPLY");
+
+const sellerTailInput = structuredClone(linkedTalktalkInput);
+sellerTailInput.channels.smartstore_talktalk.records[0].last_actor = "system";
+sellerTailInput.channels.smartstore_talktalk.records[0].messages = [
+  { direction: "customer", text: "언제 출고되나요?", sequence: 0 },
+  { direction: "seller", text: "실제 주문 상태 확인 후 안내드리겠습니다.", sequence: 1 },
+  { direction: "system", text: "상담 안내", sequence: 2 },
+];
+const sellerTailRecord = buildReport(sellerTailInput, []).records.find((row) => row.channel === "talktalk");
+assert.equal(sellerTailRecord.reply_state, "ANSWERED");
+const sellerTailCandidates = selectDraftCandidates({ records: [sellerTailRecord] }, new Map(), { includeAnsweredForEval: true });
+assert.equal(sellerTailCandidates.candidates.length, 1);
+assert.equal(sellerTailCandidates.candidates[0].purpose, "EVAL");
+assert.equal(JSON.stringify(sellerTailCandidates.candidates[0]).includes("실제 주문 상태"), false);
+
+const incompleteTalktalkCandidates = selectDraftCandidates({ records: [incompleteTalktalkRecord] });
+assert.equal(incompleteTalktalkCandidates.candidates.length, 0);
+assert.equal(incompleteTalktalkCandidates.skipped[0].reason, "CONVERSATION_INCOMPLETE");
 const linkOnlyChange = structuredClone(linkedTalktalkInput);
 linkOnlyChange.channels.smartstore_talktalk.records[0].source_url = "https://talk.naver.com/ct/thread-123?filter.read=all";
 const linkOnlyReport = buildReport(linkOnlyChange, [{ source_key: linkedRecord.source_key, content_hash: linkedRecord.content_hash }]);

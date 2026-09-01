@@ -24,11 +24,20 @@ const replyRecord = {
 };
 
 assert.equal(extractLastCustomerTurn(replyRecord).text, "오늘 출고 가능한가요?");
-assert.equal(extractLastCustomerTurn({ ...replyRecord, messages: [{ direction: "customer", text: "", image_count: 1 }] }).skip_reason, "IMAGE_ONLY_CUSTOMER_TURN");
+assert.equal(extractLastCustomerTurn({ ...replyRecord, messages: [{ direction: "customer", text: "", image_count: 1 }] }).skip_reason, "IMAGE_REVIEW_REQUIRED");
 assert.equal(extractLastCustomerTurn({ ...replyRecord, channel: "comments", messages: [], preview: "상품 길이가 궁금합니다." }).source, "POST_FALLBACK");
 assert.equal(extractLastCustomerTurn({ ...replyRecord, messages: [] }).ok, false);
 
-const answeredRecord = { ...replyRecord, source_key: "zigzag:item:test", channel: "item_question", reply_state: "ANSWERED" };
+const answeredRecord = {
+  ...replyRecord,
+  source_key: "zigzag:item:test",
+  channel: "item_question",
+  reply_state: "ANSWERED",
+  messages: [
+    { direction: "customer", text: "교환 가능한가요?", at: "오전 10:00" },
+    { direction: "seller", text: "SELLER_SECRET_ANSWER_SHOULD_NOT_LEAK", at: "오전 10:01" },
+  ],
+};
 const selected = selectDraftCandidates({ records: [replyRecord, answeredRecord] }, new Map(), { includeAnsweredForEval: true, evalLimit: 1 });
 assert.equal(selected.candidates.length, 2);
 assert.equal(selected.candidates[0].purpose, "REPLY");
@@ -59,6 +68,9 @@ const job = buildAiDraftJob(selected.candidates[0], library);
 assert.equal(job.references.length, 3);
 assert.equal(job.reference_ids.length, 3);
 assert.equal(JSON.stringify(job).includes("seller_replies"), false);
+const evalJob = buildAiDraftJob(selected.candidates[1], library);
+assert.equal(evalJob.purpose, "EVAL");
+assert.equal(JSON.stringify(evalJob).includes("SELLER_SECRET_ANSWER_SHOULD_NOT_LEAK"), false);
 const apiShapeJob = buildAiDraftJob(selected.candidates[0], library.map((entry) => {
   const copy = { ...entry };
   delete copy.enabled;
@@ -74,6 +86,53 @@ const evalAfterSkipped = selectDraftCandidates({ records: [
 ] }, new Map(), { includeAnsweredForEval: true, evalLimit: 1 });
 assert.equal(evalAfterSkipped.candidates.length, 1);
 assert.equal(evalAfterSkipped.candidates[0].source_key, "eval:usable");
+
+const chatSkipCases = selectDraftCandidates({ records: [
+  { ...replyRecord, source_key: "chat:unchanged", change_state: "UNCHANGED" },
+  { ...replyRecord, source_key: "chat:incomplete", conversation_complete: false, conversation_incomplete_reason: "스크롤 범위 미확인" },
+  { ...replyRecord, source_key: "chat:image-only", messages: [{ direction: "customer", text: "", image_count: 1 }] },
+  { ...replyRecord, source_key: "chat:no-customer", reply_state: "ANSWERED", messages: [{ direction: "seller", text: "confirmed" }] },
+  { ...replyRecord, source_key: "chat:actor-uncertain", last_actor: "seller" },
+] }, new Map(), { includeAnsweredForEval: true });
+const activeSkipped = selectDraftCandidates({ records: [{ ...replyRecord, source_key: "chat:active" }] }, new Map([
+  ["chat:active", { ai_draft_state: "READY" }],
+]));
+assert.deepEqual(
+  chatSkipCases.skipped.map((entry) => entry.reason),
+  ["UNCHANGED", "CONVERSATION_INCOMPLETE", "IMAGE_REVIEW_REQUIRED", "CUSTOMER_TURN_NOT_FOUND", "ACTOR_UNCERTAIN"],
+);
+assert.equal(activeSkipped.skipped[0].reason, "ACTIVE_DRAFT_EXISTS");
+assert.ok(chatSkipCases.skipped.find((entry) => entry.source_key === "chat:incomplete").required_checks.includes("스크롤 범위 미확인"));
+for (const entry of [...chatSkipCases.skipped, ...activeSkipped.skipped]) {
+  assert.equal(entry.reason_code, entry.reason);
+  assert.equal(typeof entry.source_key, "string");
+  assert.ok(Array.isArray(entry.required_checks));
+}
+
+const evalDisabled = selectDraftCandidates({ records: [answeredRecord] });
+assert.equal(evalDisabled.skipped[0].reason, "EVAL_DISABLED");
+const evalWithoutSellerAnswer = selectDraftCandidates({ records: [{
+  ...answeredRecord,
+  source_key: "zigzag:item:no-seller-answer",
+  messages: [{ direction: "customer", text: "교환 가능한가요?" }],
+  seller_replies: [],
+}] }, new Map(), { includeAnsweredForEval: true });
+assert.equal(evalWithoutSellerAnswer.skipped[0].reason, "SELLER_ANSWER_NOT_FOUND");
+const evalLimit = selectDraftCandidates({ records: [answeredRecord, { ...answeredRecord, source_key: "zigzag:item:second" }] }, new Map(), {
+  includeAnsweredForEval: true,
+  evalLimit: 1,
+});
+assert.equal(evalLimit.candidates.length, 1);
+assert.equal(evalLimit.skipped[0].reason, "EVAL_LIMIT_REACHED");
+
+const talkTalkEval = selectDraftCandidates({ records: [{
+  ...answeredRecord,
+  source_key: "smartstore:talktalk:answered",
+  channel: "talktalk",
+}] }, new Map(), { includeAnsweredForEval: true });
+assert.equal(talkTalkEval.candidates.length, 1);
+assert.equal(talkTalkEval.candidates[0].purpose, "EVAL");
+assert.equal(JSON.stringify(buildAiDraftJob(talkTalkEval.candidates[0], [])).includes("SELLER_SECRET_ANSWER_SHOULD_NOT_LEAK"), false);
 
 const safe = validateGeneratedDraft(job, { text: "안녕하세요. 실제 출고 상태를 확인한 뒤 안내드리겠습니다." });
 assert.equal(safe.ok, true);

@@ -38,7 +38,13 @@ Required fields:
 - `product_url`, `product_thumbnail_url`: optional allowlisted HTTPS marketplace URLs
 - `order_no_masked`, `product_order_no_masked`
 - `messages[]`, `seller_replies[]`
+- `messages[].actor`: normalized `CUSTOMER`, `SELLER`, `AUTOMATIC`, `SYSTEM`, or `UNKNOWN`; keep lowercase `direction` for compatibility
+- `messages[].sequence`: stable observed conversation order within the collected detail
 - `last_actor`: `customer`, `seller`, `automatic`, or `unknown`
+- `last_actor_confidence`: collector evidence such as `CLASS_VERIFIED` when available
+- `conversation_complete`: explicit Boolean for chat collectors, or `null` for legacy/post records without a history-loading step
+- `conversation_incomplete_reason`: why a chat history or actor direction could not be trusted
+- `conversation_order`: observed ordering contract, for example `DOM_OBSERVED`; do not claim chronological verification without channel evidence
 - `reply_state`: `NEEDS_REPLY`, `ANSWERED`, `NO_REPLY`, or `REVIEW`
 - `ai_draft`: empty unless an AI draft was explicitly generated
 - `ai_draft_origin`: `AI` when populated
@@ -48,6 +54,7 @@ Required fields:
 - `pii_scan`: `PASS` or `REVIEW`
 
 `source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time, run duration, link fields, and all AI-draft fields. Draft generation or review must never create a false inquiry-content change.
+Chat completeness failure and conversational message direction are inquiry-content evidence. Collector-only metadata such as redundant actor labels, sequence numbers, confidence labels, and a verified-complete marker do not churn legacy hashes. An incomplete record includes the failure in `content_hash`, so a later complete collection is still detected as a change. A chat with `conversation_complete=false` is `REVIEW` and cannot receive a draft.
 Link fields are excluded from `content_hash`, so a harmless route or filter change does not turn an otherwise unchanged inquiry into `CHANGED`. Reject non-HTTPS URLs, non-marketplace hosts, embedded credentials, authentication-like query keys or fragments, and query values containing an unmasked phone or email before writing the masked report.
 
 ## Channel report

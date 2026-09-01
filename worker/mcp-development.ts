@@ -1,17 +1,23 @@
 import { createAuthenticatedMcpHandler } from "../mcp-server/handler.ts";
 import { loadServerConfig, type ServerConfig } from "../mcp-server/config.ts";
+import { createCsApiHandler } from "./cs-api.ts";
+import { CsDataRepository } from "./cs-data/repository.ts";
+import type { D1Database as CsD1Database } from "./cs-data/types.ts";
+import { CsStoreAdapter } from "./cs-store-adapter.ts";
 
 export type WorkerBindings = {
   AI_CS_DEV_ALLOWED_SUBJECTS?: string;
   AI_CS_DEV_APPS_SCRIPT_URL?: string;
   AI_CS_DEV_APPS_SCRIPT_KEY?: string;
-  [name: string]: string | undefined;
+  AI_CS_DB?: CsD1Database;
+  [name: string]: string | CsD1Database | undefined;
 };
 
 type Runtime = {
   config: ServerConfig;
   upstreamConfigured: boolean;
   mcp: (request: Request) => Promise<Response>;
+  csApi: ((request: Request) => Promise<Response>) | null;
 };
 
 const runtimeCache = new WeakMap<object, Runtime>();
@@ -20,6 +26,7 @@ const publicOrigin = "https://ai-cs-mcp-development.kimhyein0214.workers.dev";
 const resourceUrl = `${publicOrigin}/mcp`;
 const oauthIssuer = "https://dev-blxg5bl1665a4fn8.us.auth0.com/";
 const oauthJwksUrl = `${oauthIssuer}.well-known/jwks.json`;
+const reviewOrigin = "https://pinkrocket-cs-review-mockup.kimhyein0214.chatgpt.site";
 
 function developmentConfig(env: WorkerBindings): { config: ServerConfig; upstreamConfigured: boolean } {
   if (Object.keys(env).some((name) => name.startsWith("AI_CS_PROD"))) {
@@ -85,6 +92,11 @@ function runtimeFor(env: WorkerBindings): Runtime {
     config,
     upstreamConfigured,
     mcp: createAuthenticatedMcpHandler({ config }),
+    csApi: env.AI_CS_DB ? createCsApiHandler({
+      store: new CsStoreAdapter(new CsDataRepository(env.AI_CS_DB)),
+      syncKey: String(env.AI_CS_DEV_APPS_SCRIPT_KEY ?? ""),
+      allowedOrigins: [reviewOrigin, "http://localhost:3000", "http://127.0.0.1:3000"],
+    }) : null,
   };
   runtimeCache.set(cacheKey, runtime);
   return runtime;
@@ -164,6 +176,19 @@ async function fetchWorker(request: Request, env: WorkerBindings): Promise<Respo
       return methodNotAllowed(["GET", "POST", "DELETE"]);
     }
     return runtime.mcp(request);
+  }
+
+  if (url.pathname === "/api/cs" || url.pathname.startsWith("/api/cs/")) {
+    if (!runtime.csApi) {
+      return json({
+        ok: false,
+        error: "D1_NOT_CONFIGURED",
+        environment: "development",
+        auto_send: false,
+        marketplace_write_actions: 0,
+      }, 503);
+    }
+    return runtime.csApi(request);
   }
 
   return json({ ok: false, error: "NOT_FOUND" }, 404);

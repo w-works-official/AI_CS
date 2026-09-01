@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import worker, { type WorkerBindings } from "./mcp-development.ts";
+import type { D1Database, D1PreparedStatement, D1Result } from "./cs-data/types.ts";
 
 function bindings(overrides: Partial<WorkerBindings> = {}): WorkerBindings {
   return {
@@ -76,4 +77,40 @@ test("the Worker rejects the wrong host, methods, and unknown routes", async () 
 
   const missing = await worker.fetch(request("/not-a-route"), bindings());
   assert.equal(missing.status, 404);
+});
+
+test("the CS API remains unavailable until an explicit development D1 binding exists", async () => {
+  const response = await worker.fetch(request("/api/cs/health"), bindings());
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    error: "D1_NOT_CONFIGURED",
+    environment: "development",
+    auto_send: false,
+    marketplace_write_actions: 0,
+  });
+});
+
+test("a bound development D1 exposes only the local CS health route", async () => {
+  const statement: D1PreparedStatement = {
+    bind() { return this; },
+    async first<T>() { return { ok: 1 } as T; },
+    async all<T>() { return { results: [] as T[], success: true, meta: {} }; },
+    async run() { return { results: [], success: true, meta: {} }; },
+  };
+  const database: D1Database = {
+    prepare() { return statement; },
+    async batch<T>() { return [] as D1Result<T>[]; },
+  };
+  const response = await worker.fetch(request("/api/cs/health"), bindings({ AI_CS_DB: database }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    service: "ai-cs-d1-repository",
+    schema_version: "v1",
+    write_policy: "MASKED_DTO_ONLY",
+    environment: "development",
+    auto_send: false,
+    marketplace_write_actions: 0,
+  });
 });

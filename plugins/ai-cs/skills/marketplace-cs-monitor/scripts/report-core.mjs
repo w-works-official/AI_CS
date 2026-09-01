@@ -70,6 +70,19 @@ function normalizeSourceUrlKind(value, sourceUrl) {
 
 function contentHashForRecord(record) {
   const material = { ...record };
+  material.messages = (material.messages ?? []).map((message) => {
+    const normalized = { ...message };
+    // Array order and lowercase direction already carry the inquiry content.
+    // Collector evidence must not churn every legacy content hash.
+    delete normalized.actor;
+    delete normalized.sequence;
+    delete normalized.direction_confidence;
+    return normalized;
+  });
+  if (material.conversation_complete !== false) delete material.conversation_complete;
+  if (!material.conversation_incomplete_reason) delete material.conversation_incomplete_reason;
+  delete material.conversation_order;
+  delete material.last_actor_confidence;
   for (const field of [
     "content_hash",
     "change_state",
@@ -180,12 +193,31 @@ function inferReplyState(status, lastActor, lastMessage) {
 }
 
 function normalizeMessage(message) {
+  const actor = compact(message?.direction ?? message?.actor).toLowerCase();
   return {
     source_message_id: compact(message?.source_message_id),
-    direction: ["customer", "seller", "automatic", "system"].includes(message?.direction) ? message.direction : "unknown",
+    sequence: Number.isFinite(Number(message?.sequence)) ? Number(message.sequence) : null,
+    actor: ["customer", "seller", "automatic", "system"].includes(actor) ? actor.toUpperCase() : "UNKNOWN",
+    direction: ["customer", "seller", "automatic", "system"].includes(actor) ? actor : "unknown",
+    direction_confidence: compact(message?.direction_confidence).toUpperCase(),
     at: compact(message?.at ?? message?.time),
     text: maskSensitiveText(message?.text),
     image_count: Number(message?.image_count ?? 0) || 0,
+  };
+}
+
+function normalizeConversationState(raw, messages) {
+  const explicit = typeof raw?.conversation_complete === "boolean" ? raw.conversation_complete : null;
+  const issue = compact(raw?.conversation_incomplete_reason ?? raw?.conversation_issue).toUpperCase();
+  const lastConversationalMessage = [...messages]
+    .reverse()
+    .find((message) => message.direction === "customer" || message.direction === "seller");
+  return {
+    complete: explicit,
+    incomplete_reason: explicit === false ? (issue || "CONVERSATION_INCOMPLETE") : issue,
+    last_actor: lastConversationalMessage?.direction ?? "unknown",
+    last_actor_confidence: compact(raw?.last_actor_confidence ?? lastConversationalMessage?.direction_confidence).toUpperCase(),
+    last_message: lastConversationalMessage ?? null,
   };
 }
 
@@ -204,12 +236,17 @@ function normalizeRecord(market, channel, raw) {
   const sellerReplies = (raw.seller_replies ?? raw.replies ?? []).map(normalizeReply);
   if (raw.seller_reply) sellerReplies.push({ at: compact(raw.processed_at), text: maskSensitiveText(raw.seller_reply) });
 
-  const lastMessage = messages.at(-1) ?? null;
-  const lastActor = raw.last_actor ?? lastMessage?.direction ?? (sellerReplies.length ? "seller" : "unknown");
+  const conversation = normalizeConversationState(raw, messages);
+  const lastMessage = conversation.last_message;
+  const requestedLastActor = compact(raw.last_actor).toLowerCase();
+  const lastActor = ["customer", "seller"].includes(requestedLastActor)
+    ? requestedLastActor
+    : (conversation.last_actor !== "unknown" ? conversation.last_actor : (sellerReplies.length ? "seller" : "unknown"));
   const customer = raw.customer_name ?? raw.customer ?? raw.customer_id ?? raw.customer_id_masked ?? "";
-  const replyState = market === "ably" && /완료|종료/.test(compact(raw.status))
+  const inferredReplyState = market === "ably" && /완료|종료/.test(compact(raw.status))
     ? (lastActor === "seller" ? "ANSWERED" : "NO_REPLY")
     : inferReplyState(raw.status, lastActor, lastMessage?.text ?? raw.last_message ?? "");
+  const replyState = conversation.complete === false ? "REVIEW" : inferredReplyState;
   const aiDraft = maskSensitiveText(raw.ai_draft);
   const requestedDraftPurpose = compact(raw.ai_draft_purpose).toUpperCase();
   const aiDraftPurpose = aiDraft
@@ -248,6 +285,10 @@ function normalizeRecord(market, channel, raw) {
     messages,
     seller_replies: sellerReplies,
     last_actor: ["customer", "seller", "automatic", "system"].includes(lastActor) ? lastActor : "unknown",
+    last_actor_confidence: conversation.last_actor_confidence,
+    conversation_complete: conversation.complete,
+    conversation_incomplete_reason: conversation.incomplete_reason,
+    conversation_order: compact(raw.conversation_order).toUpperCase(),
     reply_state: replyState,
     ai_draft: draftAllowed ? aiDraft : "",
     ai_draft_origin: draftAllowed && aiDraft ? "AI" : "",

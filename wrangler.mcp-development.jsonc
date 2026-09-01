@@ -6,6 +6,14 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "preview_urls": false,
+  "d1_databases": [
+    {
+      "binding": "AI_CS_DB",
+      "database_name": "ai-cs-development",
+      "database_id": "0b1abc81-1592-4192-ad27-3ebedaceba4d",
+      "migrations_dir": "worker/cs-data/migrations"
+    }
+  ],
   "observability": {
     "enabled": false
   }

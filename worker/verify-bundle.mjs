@@ -29,7 +29,15 @@ assert.equal(config.observability?.enabled, false);
 assert.equal(Object.hasOwn(config, "vars"), false);
 assert.equal(Object.hasOwn(config, "secrets"), false);
 
-for (const forbiddenBinding of ["ai", "analytics_engine_datasets", "browser", "d1_databases", "durable_objects", "hyperdrive", "kv_namespaces", "queues", "r2_buckets", "services", "tail_consumers", "triggers", "vectorize", "workflows"] ) {
+const d1Bindings = config.d1_databases ?? [];
+assert.deepEqual(d1Bindings, [{
+  binding: "AI_CS_DB",
+  database_name: "ai-cs-development",
+  database_id: "0b1abc81-1592-4192-ad27-3ebedaceba4d",
+  migrations_dir: "worker/cs-data/migrations",
+}]);
+
+for (const forbiddenBinding of ["ai", "analytics_engine_datasets", "browser", "durable_objects", "hyperdrive", "kv_namespaces", "queues", "r2_buckets", "services", "tail_consumers", "triggers", "vectorize", "workflows"] ) {
   assert.equal(Object.hasOwn(config, forbiddenBinding), false, `Forbidden Cloudflare binding found: ${forbiddenBinding}`);
 }
 
@@ -39,6 +47,7 @@ console.log(JSON.stringify({
   bytes: bundleStat.size,
   free_worker_limit_bytes: maxFreeWorkerBytes,
   frontend_markers: 0,
+  d1_bindings: d1Bindings.length,
   paid_bindings: 0,
   plain_text_vars: 0,
   secrets: 0,

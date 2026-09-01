@@ -2,17 +2,19 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { chromium } from "playwright";
 import { buildReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.mjs";
-import { loadSyncConfig, readCaseIndex, readCsData, syncReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.mjs";
+import { loadSyncConfig, readCaseIndex, readCsData, syncReport, syncReportToD1 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.mjs";
 import {
   acquireCollectorLock,
   inspectGoogleChromeSession,
   resolveBrowserSession,
 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/browser-session-core.mjs";
 import {
+  assessChatHistoryLoad,
   detectAuthChallengeState,
   filterChatMessages,
   isDateInRange,
   isVerifiedEmptyGridState,
+  normalizeChatConversation,
   normalizeFlexibleDate,
   parseTalktalkTotalText,
 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/collector-ui-core.mjs";
@@ -440,32 +442,57 @@ async function loadTalktalkHistory(frame, page) {
   let previousCount = -1;
   let previousHeight = -1;
   let stablePasses = 0;
+  let attempts = 0;
+  let lastState = { count: 0, height: 0, reachedBoundary: false, loading: false, hasMoreControl: false };
 
   for (let guard = 0; guard < 30 && stablePasses < 3; guard += 1) {
+    attempts = guard + 1;
     const state = await scroller.evaluate((element) => {
       element.scrollTop = -element.scrollHeight;
       element.dispatchEvent(new Event("scroll", { bubbles: true }));
       return {
         count: element.querySelectorAll(".balloon_item._message").length,
         height: element.scrollHeight,
+        reachedBoundary: Math.abs(element.scrollTop) >= Math.max(0, element.scrollHeight - element.clientHeight - 2),
       };
     });
     await page.waitForTimeout(400);
-    const next = await scroller.evaluate((element) => ({
-      count: element.querySelectorAll(".balloon_item._message").length,
-      height: element.scrollHeight,
-    }));
+    const next = await scroller.evaluate((element) => {
+      const loading = [...element.querySelectorAll('[aria-busy="true"], .loading, .spinner')]
+        .some((node) => node.getClientRects().length > 0);
+      const hasMoreControl = [...element.querySelectorAll('button, a, [role="button"]')]
+        .some((node) => /이전\s*(?:대화|메시지)|더\s*보기/.test((node.textContent ?? "").replace(/\s+/g, " ").trim()) && node.getClientRects().length > 0);
+      return {
+        count: element.querySelectorAll(".balloon_item._message").length,
+        height: element.scrollHeight,
+        reachedBoundary: Math.abs(element.scrollTop) >= Math.max(0, element.scrollHeight - element.clientHeight - 2),
+        loading,
+        hasMoreControl,
+      };
+    });
     stablePasses = next.count === previousCount && next.height === previousHeight
       && state.count === next.count && state.height === next.height
+      && next.reachedBoundary && !next.loading && !next.hasMoreControl
       ? stablePasses + 1
       : 0;
     previousCount = next.count;
     previousHeight = next.height;
+    lastState = next;
   }
+  const result = assessChatHistoryLoad({
+    attempts,
+    max_attempts: 30,
+    stable_passes: stablePasses,
+    reached_boundary: lastState.reachedBoundary,
+    loading: lastState.loading,
+    has_more_control: lastState.hasMoreControl,
+    message_count: lastState.count,
+  });
+  return { ...result, scroll_attempts: result.attempts };
 }
 
 async function extractTalktalkMessages(frame) {
-  const messages = await frame.locator(".balloon_item._message").evaluateAll((items) => items.map((item) => {
+  const messages = await frame.locator(".balloon_item._message").evaluateAll((items) => items.map((item, index) => {
     const area = item.querySelector(".balloon_area") ?? item;
     const styleNode = area.matches("[data-balloon-style]") ? area : area.querySelector("[data-balloon-style]");
     const text = (
@@ -479,7 +506,9 @@ async function extractTalktalkMessages(frame) {
     const sourceMessageId = [...item.classList].find((className) => /^_msgId\d+$/.test(className)) ?? "";
     return {
       source_message_id: sourceMessageId,
+      sequence: index,
       direction: item.classList.contains("my_msg") ? "seller" : item.classList.contains("other_msg") ? "customer" : "system",
+      direction_confidence: item.classList.contains("my_msg") || item.classList.contains("other_msg") ? "CLASS_VERIFIED" : "SYSTEM_OR_UNKNOWN",
       type: styleNode?.getAttribute("data-balloon-style") ?? "",
       text: text || (imageCount ? "첨부 이미지" : ""),
       time: item.querySelector(".status_time")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
@@ -588,9 +617,16 @@ async function collectTalktalk(context, range) {
   for (const meta of listRows.filter((row) => normalizeDateLabel(row.time_label, range.end) >= range.start)) {
     await frame.locator(`a[href="${meta.href}"]`).click({ force: true });
     await waitForTalktalkDetail(frame, page, meta.thread_id);
-    await loadTalktalkHistory(frame, page);
-    const messages = await extractTalktalkMessages(frame);
-    if (!messages.length) throw new Error(`TALKTALK_EMPTY_CONVERSATION:${meta.thread_id}`);
+    const history = await loadTalktalkHistory(frame, page);
+    const conversation = normalizeChatConversation(await extractTalktalkMessages(frame), {
+      conversation_complete: history.complete,
+      conversation_incomplete_reason: history.stop_reason,
+      has_more_history: history.has_more_history,
+    });
+    if (!conversation.messages.length) throw new Error(`TALKTALK_EMPTY_CONVERSATION:${meta.thread_id}`);
+    const lastConversationalMessage = [...conversation.messages]
+      .reverse()
+      .find((message) => message.direction === "customer" || message.direction === "seller");
     const productDetail = await extractTalktalkProduct(frame, meta.product);
     records.push({
       ...meta,
@@ -600,8 +636,12 @@ async function collectTalktalk(context, range) {
       product: meta.product || productDetail.text,
       product_url: meta.product_url || productDetail.href,
       message_date: normalizeDateLabel(meta.time_label, range.end),
-      messages,
-      last_actor: messages.at(-1)?.direction ?? "unknown",
+      messages: conversation.messages,
+      last_actor: lastConversationalMessage?.direction ?? "unknown",
+      conversation_complete: conversation.conversation_complete,
+      conversation_incomplete_reason: conversation.conversation_incomplete_reason,
+      conversation_order: "DOM_OBSERVED",
+      history_scroll_attempts: history.scroll_attempts,
     });
   }
   await page.close();
@@ -986,6 +1026,7 @@ try {
 const report = buildReport(rawCollection, previousRecords);
 report.summary.case_index_status = caseIndexStatus;
 let syncResult = { skipped: true, reason: "PREPARE_ONLY" };
+let d1SyncResult = { skipped: true, reason: "PREPARE_ONLY" };
 if (syncMode === "sync") {
   syncConfig = syncConfig || await loadSyncConfig();
   if (syncConfig.environment !== "development") throw new Error("DEVELOPMENT_SYNC_REQUIRED");
@@ -997,6 +1038,11 @@ if (syncMode === "sync") {
     model: process.env.CS_AI_MODEL || "Codex",
     promptVersion: process.env.CS_PROMPT_VERSION || "marketplace-cs-monitor-v1",
   });
+  if (syncConfig.d1_api_url && syncConfig.d1_sync_key) {
+    d1SyncResult = await syncReportToD1(report, syncConfig, { runId: syncResult.run_id || undefined });
+  } else {
+    d1SyncResult = { skipped: true, reason: "D1_SHADOW_SYNC_NOT_CONFIGURED" };
+  }
 }
 
 let maskedOutput = "";
@@ -1007,7 +1053,7 @@ if (process.env.CS_KEEP_MASKED_OUTPUT === "1" || syncMode === "prepare") {
   await writeFile(outputUrl, JSON.stringify(report, null, 2), "utf8");
   maskedOutput = decodeURIComponent(outputUrl.pathname).replace(/^\/(?:([A-Za-z]:))/, "$1");
 }
-console.log(JSON.stringify({ browser_session: { source: browserSession.source, label: browserSession.session_label }, range, channels: [...requestedChannels], summary: report.summary, masked_output: maskedOutput, sync: syncResult }, null, 2));
+console.log(JSON.stringify({ browser_session: { source: browserSession.source, label: browserSession.session_label }, range, channels: [...requestedChannels], summary: report.summary, masked_output: maskedOutput, sync: syncResult, d1_sync: d1SyncResult }, null, 2));
 } finally {
   await releaseCollectorLock();
 }
