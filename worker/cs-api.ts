@@ -140,6 +140,7 @@ const piiPatterns: Array<[string, RegExp]> = [
   ["RAW_ACCOUNT", /(?:계좌|은행|bank\s*account|account\s*(?:no|number))\s*[:：#-]?\s*[0-9][0-9 -]{5,}/i],
   ["RAW_ACCOUNT", /\b(?!\d{4}-\d{2}-\d{2}\b)\d{2,6}-\d{2,6}-\d{2,8}\b/],
   ["RAW_ADDRESS", /(?:주소|배송지|수령지|우편번호|address)\s*[:：#-]?\s*[^\n]{2,}/i],
+  ["RAW_ADDRESS", /(?:[가-힣]{2,}(?:특별시|광역시|특별자치시|도|시)\s+)?[가-힣]{1,}(?:시|군|구)\s+[가-힣0-9·.-]{1,}(?:대로|로|길)\s*\d+(?:-\d+)?/],
 ];
 const marketplaceUrlSuffixes = ["naver.com", "kakaostyle.com", "a-bly.com", "zigzag.kr"];
 
@@ -355,8 +356,23 @@ function corsHeaders(request: Request, allowedOrigins: Set<string>): Headers {
   return headers;
 }
 
+function maskPublicText(value: string): string {
+  return value
+    .replace(/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/g, "010-****-****")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "**@***")
+    .replace(/(?:주소|배송지|수령지|우편번호|address)\s*[:：#-]?\s*[^\n,;]{2,}/gi, "[주소 마스킹]")
+    .replace(/(?:[가-힣]{2,}(?:특별시|광역시|특별자치시|도|시)\s+)?[가-힣]{1,}(?:시|군|구)\s+[가-힣0-9·.-]{1,}(?:대로|로|길)\s*\d+(?:-\d+)?(?:\s+[가-힣A-Za-z0-9·()_-]{1,40})?/g, "[주소 마스킹]");
+}
+
+function maskPublicPayload(value: unknown): unknown {
+  if (typeof value === "string") return maskPublicText(value);
+  if (Array.isArray(value)) return value.map(maskPublicPayload);
+  if (!isObject(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskPublicPayload(item)]));
+}
+
 function response(request: Request, allowedOrigins: Set<string>, body: JsonObject, status = 200): Response {
-  return Response.json(body, { status, headers: corsHeaders(request, allowedOrigins) });
+  return Response.json(maskPublicPayload(body), { status, headers: corsHeaders(request, allowedOrigins) });
 }
 
 function methodNotAllowed(request: Request, allowedOrigins: Set<string>, allowed: string[]): Response {

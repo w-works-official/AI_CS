@@ -173,7 +173,8 @@ function maskSensitiveText(value) {
     .replace(/((?:상품\s*)?주문번호\s*[:：]?\s*)\d{6,}/gi, "$1[마스킹]")
     .replace(/((?:계좌|은행|국민|신한|우리|하나|농협|기업|카카오뱅크|토스뱅크|SC|씨티)\s*[:：]?\s*)\d{2,6}(?:[- ]\d{2,8}){2}/gi, "$1[계좌 마스킹]")
     .replace(/\b\d{12,}\b/g, (number) => maskLongNumber(number))
-    .replace(/(주소\s*[:：]?)[^,;]+/gi, "$1 [주소 마스킹]");
+    .replace(/(주소\s*[:：]?)[^,;]+/gi, "$1 [주소 마스킹]")
+    .replace(/(?:[가-힣]{2,}(?:특별시|광역시|특별자치시|도|시)\s+)?[가-힣]{1,}(?:시|군|구)\s+[가-힣0-9·.-]{1,}(?:대로|로|길)\s*\d+(?:-\d+)?(?:\s+[가-힣A-Za-z0-9·()_-]{1,40})?/g, "[주소 마스킹]");
 }
 
 export function inspectUnmaskedPii(value) {
@@ -185,6 +186,7 @@ export function inspectUnmaskedPii(value) {
   if (/(?:계좌|은행|국민|신한|우리|하나|농협|기업|카카오뱅크|토스뱅크|SC|씨티)\s*[:：]?\s*\d{2,6}(?:[- ]\d{2,8}){2}/i.test(text)) issues.push("ACCOUNT");
   if (/(?:상품\s*)?(?:주문번호|송장번호|운송장)\s*[:：]?\s*\d{6,}/i.test(text)) issues.push("ORDER_OR_TRACKING");
   if (/(?:주소|배송지)\s*[:：]\s*[^,;]{5,}/i.test(text)) issues.push("ADDRESS");
+  if (/(?:[가-힣]{2,}(?:특별시|광역시|특별자치시|도|시)\s+)?[가-힣]{1,}(?:시|군|구)\s+[가-힣0-9·.-]{1,}(?:대로|로|길)\s*\d+(?:-\d+)?/.test(text)) issues.push("ADDRESS");
   return [...new Set(issues)];
 }
 

@@ -93,6 +93,7 @@ test("write payloads reject PII, marketplace mutations, unknown fields, and larg
   assert.equal((await api(request("/api/cs/drafts", json({ ...draft, draft_text: "연락처 010-1234-5678" })))).status, 400);
   assert.equal((await api(request("/api/cs/drafts", json({ ...draft, customer_email: "a@example.com" })))).status, 400);
   assert.equal((await api(request("/api/cs/drafts", json({ ...draft, draft_text: "주소: 서울시 중구 세종대로 1" })))).status, 400);
+  assert.equal((await api(request("/api/cs/drafts", json({ ...draft, draft_text: "부산시 동구 중앙대로197 부산역온누리약국" })))).status, 400);
   assert.equal((await api(request("/api/cs/drafts", json({ ...draft, draft_text: "계좌 110-123-456789" })))).status, 400);
   assert.equal((await api(request("/api/cs/drafts", json({ ...draft, complete_case: true })))).status, 400);
   assert.equal((await api(request("/api/cs/drafts", json({ ...draft, arbitrary: true })))).status, 400);
@@ -100,6 +101,26 @@ test("write payloads reject PII, marketplace mutations, unknown fields, and larg
   const limited = createCsApiHandler({ store: new FakeStore(), syncKey, maxJsonBytes: 1024 });
   const large = JSON.stringify({ ...draft, draft_text: "x".repeat(2_000) });
   assert.equal((await limited(request("/api/cs/drafts", { method: "POST", headers: { "Content-Type": "application/json", "X-CS-Sync-Key": syncKey }, body: large }))).status, 413);
+});
+
+test("legacy read output masks contact details and bare Korean road addresses", async () => {
+  class LegacyPiiStore extends FakeStore {
+    override async getCase(caseKey: string) {
+      return {
+        ok: true,
+        case_key: caseKey,
+        messages: [{ text_masked: "부산시 동구 중앙대로197 부산역온누리약국" }],
+        note_masked: "연락처 010-1234-5678 / test@example.com",
+      };
+    }
+  }
+  const { api } = makeApi(new LegacyPiiStore());
+  const result = await api(request("/api/cs/cases/smartstore%3Atalktalk%3Alegacy"));
+  const body = await result.json() as { case_key: string; messages: Array<{ text_masked: string }>; note_masked: string };
+  assert.equal(result.status, 200);
+  assert.equal(body.case_key, "smartstore:talktalk:legacy");
+  assert.equal(body.messages[0].text_masked, "[주소 마스킹]");
+  assert.equal(body.note_masked, "연락처 010-****-**** / **@***");
 });
 
 test("EVAL reviews are rejected by API input and by the store contract", async () => {

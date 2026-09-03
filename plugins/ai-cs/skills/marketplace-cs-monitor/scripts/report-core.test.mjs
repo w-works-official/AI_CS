@@ -42,6 +42,8 @@ assert.match(first.records[0].preview, /010-\*\*\*\*-\*\*\*\*/);
 assert.match(maskSensitiveText("우리 1002-123-456789 입금"), /우리 \[계좌 마스킹\] 입금/);
 assert.deepEqual(inspectUnmaskedPii("우리 1002-123-456789 입금"), ["ACCOUNT"]);
 assert.deepEqual(inspectUnmaskedPii(maskSensitiveText("우리 1002-123-456789 입금")), []);
+assert.equal(maskSensitiveText("부산시 동구 중앙대로197 부산역온누리약국"), "[주소 마스킹]");
+assert.deepEqual(inspectUnmaskedPii("부산시 동구 중앙대로197 부산역온누리약국"), ["ADDRESS"]);
 assert.equal(first.records.find((row) => row.market === "ably").reply_state, "NO_REPLY");
 assert.equal(first.records.find((row) => row.market === "zigzag").reply_state, "NEEDS_REPLY");
 assert.equal(first.summary.reconciled_channel_count, 1);
