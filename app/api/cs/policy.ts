@@ -16,6 +16,7 @@ const ALLOWED_RECORD_KEYS = new Set([
   "market", "channel", "source_key", "occurred_at", "status", "category", "customer_masked",
   "subject", "preview", "product_id", "product_name", "order_no_masked", "product_order_no_masked",
   "source_url", "source_url_kind", "source_reference", "product_url", "product_thumbnail_url",
+  "source_snapshot",
   "messages", "seller_replies", "last_actor", "reply_state", "ai_draft", "ai_draft_origin",
   "ai_draft_purpose", "ai_draft_required_checks", "ai_draft_pii_scan", "pii_scan", "content_hash", "change_state",
 ]);
@@ -24,6 +25,21 @@ const ALLOWED_IMAGE_KEYS = new Set(["ordinal", "url", "src", "thumbnail_url", "t
 
 function safeText(value: unknown, maxLength: number): string {
   return String(value ?? "").trim().slice(0, maxLength);
+}
+
+function normalizedSourceSnapshot(value: unknown) {
+  if (value === undefined || value === null) return null;
+  const raw = plainObject(value, "INVALID_SOURCE_SNAPSHOT");
+  const mimeType = safeText(raw.mime_type, 50);
+  const dataBase64 = safeText(raw.data_base64, 500_000);
+  const width = Number(raw.width);
+  const height = Number(raw.height);
+  const redactionState = safeText(raw.redaction_state, 30).toUpperCase();
+  const capturedAt = safeText(raw.captured_at, 50);
+  if (mimeType !== "image/jpeg" || redactionState !== "MASKED_DOM" || !capturedAt) throw new Error("INVALID_SOURCE_SNAPSHOT");
+  if (!dataBase64 || dataBase64.length > 450_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(dataBase64)) throw new Error("INVALID_SOURCE_SNAPSHOT");
+  if (!Number.isInteger(width) || width < 1 || width > 2400 || !Number.isInteger(height) || height < 1 || height > 12000) throw new Error("INVALID_SOURCE_SNAPSHOT");
+  return { mime_type: mimeType, data_base64: dataBase64, width, height, redaction_state: redactionState, captured_at: capturedAt };
 }
 
 const ALLOWED_MARKETPLACE_SUFFIXES = ["naver.com", "kakaostyle.com", "a-bly.com"];
@@ -299,6 +315,7 @@ function normalizedRecord(value: unknown): Record<string, unknown> {
     product_id: safeText(raw.product_id, 300), product_name: safeText(raw.product_name, 2000),
     source_url: sourceUrl, source_url_kind: sourceUrlKind, source_reference: sourceReference,
     product_url: safeMarketplaceUrl(raw.product_url), product_thumbnail_url: safeMarketplaceUrl(raw.product_thumbnail_url),
+    source_snapshot: normalizedSourceSnapshot(raw.source_snapshot),
     order_no_masked: safeText(raw.order_no_masked, 300), product_order_no_masked: safeText(raw.product_order_no_masked, 300),
     messages, seller_replies: sellerReplies, last_actor: safeText(raw.last_actor, 20), reply_state: replyState,
     ai_draft: draftText, ai_draft_origin: safeText(raw.ai_draft_origin, 20).toUpperCase(), ai_draft_purpose: draftPurpose,

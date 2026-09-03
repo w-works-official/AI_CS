@@ -36,6 +36,7 @@ Required fields:
 - `source_url`, `source_url_kind`: an allowlisted HTTPS marketplace URL and `EXACT`, `LIST`, or `UNAVAILABLE`
 - `source_reference`: a masked or hashed lookup label only; never a raw token, cookie, or credential
 - `product_url`, `product_thumbnail_url`: optional allowlisted HTTPS marketplace URLs
+- `source_snapshot`: optional inquiry-region evidence with `mime_type=image/jpeg`, bounded base64 `data_base64`, `width`, `height`, `redaction_state=MASKED_DOM`, and `captured_at`. The macro must clone the inquiry DOM and mask known identity/contact/order/address text before screenshotting it. Browser chrome, cookies, tokens, raw customer-upload bytes, and unmasked screenshots are forbidden.
 - `order_no_masked`, `product_order_no_masked`
 - `messages[]`, `seller_replies[]`
 - `messages[].actor`: normalized `CUSTOMER`, `SELLER`, `AUTOMATIC`, `SYSTEM`, or `UNKNOWN`; keep lowercase `direction` for compatibility
@@ -57,7 +58,7 @@ Required fields:
 
 When a collector exposes a separate raw `customer_name`, treat that value as known PII evidence. Remove an exact leading TalkTalk list label before normalization, mask exact occurrences in every persisted text field, and reject the normalized record if the unmasked value remains anywhere. Do not use a broad Korean-name regex because ordinary inquiry words can resemble names.
 
-`source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time, run duration, link fields, all AI-draft fields, and decision diagnostics. Draft generation, skip classification, or review must never create a false inquiry-content change.
+`source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time, run duration, link fields, `source_snapshot`, all AI-draft fields, and decision diagnostics. A refreshed visual capture alone must not create a false inquiry-content change; draft generation, skip classification, or review must not either.
 Chat completeness failure and conversational message direction are inquiry-content evidence. Collector-only metadata such as redundant actor labels, sequence numbers, confidence labels, and a verified-complete marker do not churn legacy hashes. An incomplete record includes the failure in `content_hash`, so a later complete collection is still detected as a change. A chat with `conversation_complete=false` is `REVIEW` and cannot receive a draft.
 Link fields are excluded from `content_hash`, so a harmless route or filter change does not turn an otherwise unchanged inquiry into `CHANGED`. Reject non-HTTPS URLs, non-marketplace hosts, embedded credentials, authentication-like query keys or fragments, and query values containing an unmasked phone or email before writing the masked report.
 Image URLs are also excluded from `content_hash` because CDN resize and expiry parameters can change independently of the inquiry. `image_count` remains material, so adding or removing an attachment is still detected.
@@ -76,8 +77,11 @@ Each channel returns:
 - `needs_reply_count`
 - `read_state_transition_count`
 - `error`
+- `history_scan_complete`, `history_window_start`, `history_expected_total`, `history_observed_total`, `history_error`
 
 The top-level report also includes total duration, prepared count, duplicate count, missing-key/hash counts, `talktalk_read_state_transitions`, and `marketplace_write_actions: 0`. The write-action field covers prohibited operational actions; an authorized TalkTalk read marker is an explicitly reported observational side effect, not a reply or operational status action.
+
+`collection_profile` is `operational` or `backfill`. An operational candidate scan uses `history_scan_complete=false` and `history_error=CANDIDATE_DETAIL_SCAN` when completed unchanged details were intentionally skipped. This is a warning, not permission to infer completion from absence.
 
 For deterministic stale-case reconciliation, each channel may also include only masked/hashed snapshot evidence:
 
@@ -87,6 +91,8 @@ For deterministic stale-case reconciliation, each channel may also include only 
 - `open_queue_source_keys[]`: hashed source keys only, never raw marketplace IDs.
 
 An incomplete, unpaginated, or mismatched snapshot cannot change a stored case. If a marketplace does not expose an independently verifiable unanswered total, set `open_queue_complete=false` and record a non-sensitive `open_queue_error`. On the sync target, one consecutive absence becomes `REVIEW`, two becomes `CLOSED`, and a later reappearance becomes `NEEDS_REPLY`. `CLOSED` is a local review state only; it never closes anything in a marketplace and the original masked case/messages remain stored.
+
+The top-level `operational_refresh` assessment is separate from unanswered-queue reconciliation. For a channel that proves a complete rolling-history scan, its expected and observed counts must match and every existing D1 case inside the same date window must reappear. Otherwise `ready=false` and synchronization is rejected. A channel with unproven pagination is recorded as a warning; it may upsert observed records but may not infer anything from an absent record.
 
 ## Comparison boundary
 

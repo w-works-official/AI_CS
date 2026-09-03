@@ -19,12 +19,11 @@ Do not bind the session to a person's name or an ordinary Chrome window title. S
 
 ## Safe vertical-slice invocation
 
-The launcher-managed session requires no persistent profile name or CDP environment variable. Set only non-secret run controls directly:
+The launcher-managed session requires no persistent profile name or CDP environment variable. Set only non-secret run controls directly. Omit explicit dates for the normal operational candidate refresh:
 
 ```powershell
-$env:CS_START_DATE = (Get-Date).ToString('yyyy-MM-dd')
-$env:CS_END_DATE = $env:CS_START_DATE
 $env:CS_CHANNELS = 'comments'
+$env:CS_COLLECTION_PROFILE = 'operational'
 $env:CS_RUN_MODE = 'collect_and_reconcile'
 $env:CS_SYNC_MODE = 'prepare'
 $env:CS_KEEP_MASKED_OUTPUT = '1'
@@ -35,7 +34,7 @@ For an explicitly selected remote-debuggable Google Chrome on the same PC, `SMAR
 
 `prepare` is the default and performs no D1 write. It may use the read-only development D1 case index to classify records. The masked report is written below the macro project's `output/` directory and its path is returned as `masked_output`.
 
-`collect_and_reconcile` is the normal collection mode. It still collects only the requested date range for ordinary detail work, but it also carries hashed source keys from a count-matched current unanswered view when the marketplace exposes one. It never changes marketplace state.
+`collect_and_reconcile` with `CS_COLLECTION_PROFILE=operational` is the normal mode. With no date variables it checks the latest 7 days, reads the D1 case index before collection, and opens chat details only for new, unread, changed-preview, `NEEDS_REPLY`, or `REVIEW` candidates. There is no whole-run elapsed-time limit. Playwright navigation, detail-load, and selector waits remain individually bounded. The skill runs this command once per channel and completes AI generation plus D1 sync before advancing. Candidate scans deliberately declare `history_scan_complete=false`; an omitted completed room is not treated as missing or closed. Use `CS_COLLECTION_PROFILE=backfill` for a separately requested historical batch; the default is 30 days and `CS_LOOKBACK_DAYS` accepts 1–90. Explicit `CS_START_DATE`/`CS_END_DATE` remain bounded diagnostics. The macro carries hashed source keys only from complete unanswered views when a marketplace proves that view. It never changes marketplace state.
 
 ## Supported channel controls
 
@@ -43,7 +42,7 @@ For an explicitly selected remote-debuggable Google Chrome on the same PC, `SMAR
 
 ## Masked report contract
 
-The output file is schema version 1 with `range`, `collected_at`, `duration_ms`, `summary`, `channels`, and masked `records`. Every record contains `source_key`, `content_hash`, reply state, PII scan, masked customer/order fields, messages, seller replies, and optional AI draft fields. Raw records are not written.
+The output file is schema version 1 with `range`, `collected_at`, `duration_ms`, `summary`, `channels`, and masked `records`. Every record contains `source_key`, `content_hash`, reply state, PII scan, masked customer/order fields, messages, seller replies, and optional AI draft fields. When an inquiry region can be isolated, the record also contains a bounded JPEG `source_snapshot` captured only after the cloned DOM text and sensitive attributes are masked. Raw records and raw screenshots are not written.
 
 Standard output contains only the range, selected channel names, masked summary, masked output path, and sync status. Do not enable full raw logging.
 
@@ -55,4 +54,4 @@ The collector does not need a write secret in `prepare` mode. Before later synch
 - `MARKETPLACE_CS_D1_SYNC_KEY`
 - `MARKETPLACE_CS_SYNC_ENVIRONMENT=development`
 
-The URL and key must be the existing development D1 Worker target. Apps Script URL/key variables are ignored by the collector. Never create or rotate secrets during a collection run. D1 health must pass before the single `syncReport()` call.
+The URL and key must be the existing development D1 Worker target. Apps Script URL/key variables are ignored by the collector. Never create or rotate secrets during a collection run. D1 health must pass before the single per-channel `syncReport()` call. Screenshot-heavy reports are split internally into bounded idempotent requests; this is transport batching, not a second collection or duplicate logical sync.

@@ -22,7 +22,7 @@ class FakeRepository {
   async getCase(caseKey: string) { void caseKey; return this.detail; }
   async listTemplates() { return []; }
   async listLibraryEntries() { return []; }
-  async syncRun(input: SyncRunInput) { this.sync = input; return { run_id: input.run_id, duplicate_run: false, inserted_cases: input.cases.length, updated_cases: 0, inserted_messages: input.messages.length, inserted_attachments: input.attachments?.length ?? 0, inserted_drafts: input.drafts.length }; }
+  async syncRun(input: SyncRunInput) { this.sync = input; return { run_id: input.run_id, duplicate_run: false, inserted_cases: input.cases.length, updated_cases: 0, inserted_messages: input.messages.length, inserted_attachments: input.attachments?.length ?? 0, inserted_snapshots: input.snapshots?.length ?? 0, inserted_drafts: input.drafts.length }; }
   async upsertDraft(input: DraftInput) { this.draft = input; return { inserted: true }; }
   async upsertTemplate(input: ReplyTemplateInput) { this.template = input; return { inserted: true }; }
   async setTemplateState(input: TemplateStateInput) { this.templateState = input; return { template_id: input.template_id, quality_state: input.quality_state, updated: true }; }
@@ -82,7 +82,7 @@ test("HTTP sync maps a masked collector report into stable D1 DTOs", async () =>
   assert.match(repository.sync?.messages[0].message_key ?? "", /^MSG:[a-f0-9]{16}:[a-f0-9]{16}$/);
   assert.deepEqual(await response.json(), {
     ok: true, run_id: "SYNC:20260901:001", duplicate_run: false, inserted_cases: 1, updated_cases: 0,
-    inserted_messages: 1, inserted_attachments: 0, inserted_drafts: 1, ...safety,
+    inserted_messages: 1, inserted_attachments: 0, inserted_snapshots: 0, inserted_drafts: 1, ...safety,
   });
 });
 
@@ -103,6 +103,27 @@ test("HTTP sync maps safe image metadata without storing image bytes or session 
   assert.equal(repository.sync?.attachments?.[1].access_state, "SESSION_REQUIRED");
   assert.equal(repository.sync?.attachments?.[0].asset_url.includes("12345678901234.jpg"), true);
   assert.equal((await response.json() as Record<string, unknown>).inserted_attachments, 2);
+});
+
+test("HTTP sync accepts only a bounded MASKED_DOM inquiry screenshot", async () => {
+  const repository = new FakeRepository();
+  const api = createCsApiHandler({ store: new CsStoreAdapter(repository, () => now), syncKey: "test-key" });
+  const snapshotReport = report();
+  (snapshotReport.records[0] as Record<string, unknown>).source_snapshot = {
+    mime_type: "image/jpeg", data_base64: Buffer.from("masked-inquiry-screen").toString("base64"),
+    width: 900, height: 600, redaction_state: "MASKED_DOM", captured_at: now,
+  };
+  const response = await api(jsonRequest("/api/cs/sync", { run_id: "SYNC:snapshot", report: snapshotReport, ...safety }));
+  assert.equal(response.status, 200);
+  assert.equal(repository.sync?.snapshots?.length, 1);
+  assert.equal(repository.sync?.snapshots?.[0].redaction_state, "MASKED_DOM");
+
+  const unsafeReport = report();
+  (unsafeReport.records[0] as Record<string, unknown>).source_snapshot = {
+    mime_type: "image/png", data_base64: Buffer.from("raw-screen").toString("base64"),
+    width: 900, height: 600, redaction_state: "RAW", captured_at: now,
+  };
+  assert.equal((await api(jsonRequest("/api/cs/sync", { run_id: "SYNC:unsafe-snapshot", report: unsafeReport, ...safety }))).status, 400);
 });
 
 test("post EVAL drafts link to synthesized customer preview and observed seller reply", async () => {

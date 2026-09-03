@@ -1,6 +1,6 @@
 import { CsApiError, type CaseListQuery, type CsStore, type JsonObject, type ReviewDraftInput, type ReviewLibraryInput, type SyncRunInput as ApiSyncRunInput, type UpdateTemplateStateInput, type UpsertDraftInput, type UpsertTemplateInput } from "./cs-api.ts";
 import type { CsDataRepository } from "./cs-data/repository.ts";
-import type { Actor, AnswerLibraryEntryInput, AnswerLibrarySourceType, CaseSummaryInput, CsAttachmentInput, CsCaseInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, NoReplyPatternInput, ReplyState, ReplyTemplateInput, SyncRunInput, TemplateStateInput } from "./cs-data/types.ts";
+import type { Actor, AnswerLibraryEntryInput, AnswerLibrarySourceType, CaseSummaryInput, CsAttachmentInput, CsCaseInput, CsCaseSnapshotInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, NoReplyPatternInput, ReplyState, ReplyTemplateInput, SyncRunInput, TemplateStateInput } from "./cs-data/types.ts";
 
 type RepositoryPort = Pick<CsDataRepository, "health" | "overview" | "listCases" | "getCase" | "listTemplates" | "listLibraryEntries" | "syncRun" | "upsertDraft" | "upsertTemplate" | "upsertLibraryEntry" | "reviewLibraryEntry" | "setTemplateState" | "reviewReplyDraft">;
 
@@ -77,6 +77,23 @@ function safeUrl(value: unknown): string {
 
 function safeAssetUrl(value: unknown): string {
   try { return safeUrl(value); } catch { return ""; }
+}
+
+function snapshotFromRecord(record: JsonObject, caseKey: string): CsCaseSnapshotInput | null {
+  if (record.source_snapshot === undefined || record.source_snapshot === null) return null;
+  const snapshot = object(record.source_snapshot, "INVALID_SOURCE_SNAPSHOT");
+  const mimeType = text(snapshot.mime_type, 50);
+  const dataBase64 = text(snapshot.data_base64, 500_000);
+  const width = Number(snapshot.width);
+  const height = Number(snapshot.height);
+  const redactionState = text(snapshot.redaction_state, 30).toUpperCase();
+  const capturedAt = text(snapshot.captured_at, 50);
+  if (mimeType !== "image/jpeg") throw new CsApiError("SOURCE_SNAPSHOT_MIME_INVALID", 400);
+  if (!dataBase64 || dataBase64.length > 450_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(dataBase64)) throw new CsApiError("SOURCE_SNAPSHOT_DATA_INVALID", 400);
+  if (!Number.isInteger(width) || width < 1 || width > 2400 || !Number.isInteger(height) || height < 1 || height > 12000) throw new CsApiError("SOURCE_SNAPSHOT_DIMENSIONS_INVALID", 400);
+  if (redactionState !== "MASKED_DOM") throw new CsApiError("SOURCE_SNAPSHOT_REDACTION_REQUIRED", 400);
+  if (!capturedAt) throw new CsApiError("SOURCE_SNAPSHOT_CAPTURED_AT_REQUIRED", 400);
+  return { case_key: caseKey, mime_type: "image/jpeg", data_base64: dataBase64, width, height, redaction_state: "MASKED_DOM", captured_at: capturedAt };
 }
 
 function assertMaskedRecord(record: JsonObject): void {
@@ -186,6 +203,14 @@ function publicDetail(
   return {
     ok: true,
     case: publicCase(detail.case),
+    snapshot: detail.snapshot ? {
+      mime_type: detail.snapshot.mime_type,
+      data_url: `data:${detail.snapshot.mime_type};base64,${detail.snapshot.data_base64}`,
+      width: detail.snapshot.width,
+      height: detail.snapshot.height,
+      redaction_state: detail.snapshot.redaction_state,
+      captured_at: detail.snapshot.captured_at,
+    } : null,
     messages: detail.messages.map((message) => ({ ...message, message_text_masked: message.text_masked ?? "" })),
     attachments: detail.attachments,
     drafts: detail.drafts.map((draft) => ({ ...draft, draft_text: draft.draft_text_masked ?? "", draft_state: draft.state ?? "" })),
@@ -259,6 +284,7 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
   const cases: CsCaseInput[] = [];
   const messages: CsMessageInput[] = [];
   const attachments: CsAttachmentInput[] = [];
+  const snapshots: CsCaseSnapshotInput[] = [];
   const drafts: DraftInput[] = [];
   for (const record of records) {
     assertMaskedRecord(record);
@@ -299,6 +325,8 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
     });
     messages.push(...caseMessages);
     attachments.push(...messageData.attachments);
+    const snapshot = snapshotFromRecord(record, caseKey);
+    if (snapshot) snapshots.push(snapshot);
     if (!explicitComplete && text(record.ai_draft, 20_000)) {
       throw new CsApiError("CONVERSATION_INCOMPLETE_DRAFT_FORBIDDEN", 400);
     }
@@ -422,7 +450,7 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
   });
   return {
     run_id: input.run_id, environment: "development", mode: "READ_ONLY",
-    started_at: collectedAt, finished_at: collectedAt, cases, messages, attachments, drafts, decisions,
+    started_at: collectedAt, finished_at: collectedAt, cases, messages, attachments, snapshots, drafts, decisions,
     case_summaries: caseSummaries, answer_library_entries: answerLibraryEntries, no_reply_patterns: noReplyPatterns,
   };
 }

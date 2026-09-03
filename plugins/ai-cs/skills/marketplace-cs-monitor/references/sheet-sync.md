@@ -17,6 +17,8 @@ After `buildReport` and all completion checks pass, `scripts/sync-client.mjs` se
 
 Before writing, require `/api/cs/health` to return `ok=true`, `environment=development`, `auto_send=false`, and `marketplace_write_actions=0`. The local client sends the key only through `X-CS-Sync-Key`; it never prints it or puts it in a URL. Apps Script environment variables are ignored.
 
+When a report contains `operational_refresh`, `ready` must be true. A missing same-window case from a complete history scan or a list-count mismatch rejects the request locally before any HTTP write. Incomplete pagination never closes a case and remains visible as a run warning.
+
 The collector reads the paginated D1 case index for `source_key + content_hash` comparison and reads at most three `quality_state=USE` answer-library examples for grounded draft generation. Only masked DTOs may cross the boundary. A failed PII check rejects the write.
 
 Complete unanswered snapshots may reconcile a previously open case only when channel, count, date window, and completeness checks pass. One absence yields `REVIEW`; two consecutive absences yield `CLOSED`; reappearance yields `NEEDS_REPLY`.

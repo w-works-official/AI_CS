@@ -1,4 +1,4 @@
-import type { AnswerLibraryEntryInput, CaseDetailResult, CaseFilters, CaseListItem, CaseSummaryInput, CsAttachmentInput, CsCaseInput, CsMessageInput, CursorListInput, CursorListResult, D1Database, D1PreparedStatement, DraftDecisionInput, DraftInput, DraftReviewInput, DraftReviewResult, HealthResult, LibraryEntryReviewInput, NoReplyPatternInput, OverviewResult, QualityState, ReplyTemplateInput, SyncRunInput, SyncRunResult, TemplateStateInput } from "./types.ts";
+import type { AnswerLibraryEntryInput, CaseDetailResult, CaseFilters, CaseListItem, CaseSummaryInput, CsAttachmentInput, CsCaseInput, CsCaseSnapshotInput, CsMessageInput, CursorListInput, CursorListResult, D1Database, D1PreparedStatement, DraftDecisionInput, DraftInput, DraftReviewInput, DraftReviewResult, HealthResult, LibraryEntryReviewInput, NoReplyPatternInput, OverviewResult, QualityState, ReplyTemplateInput, SyncRunInput, SyncRunResult, TemplateStateInput } from "./types.ts";
 
 const MAX_LIST_LIMIT = 100;
 const SERVICE = "ai-cs-d1-repository" as const;
@@ -72,8 +72,9 @@ export class CsDataRepository {
   async getCase(caseKey: string): Promise<CaseDetailResult | null> {
     const item = await this.db.prepare("SELECT * FROM cs_cases WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>();
     if (!item) return null;
-    const [summary, messages, attachments, drafts, decisions, reviewEvents, learningCandidates] = await Promise.all([
+    const [summary, snapshot, messages, attachments, drafts, decisions, reviewEvents, learningCandidates] = await Promise.all([
       this.db.prepare("SELECT * FROM case_summaries WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>(),
+      this.db.prepare("SELECT mime_type, data_base64, width, height, redaction_state, captured_at FROM cs_case_snapshots WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM cs_messages WHERE case_key = ? ORDER BY sequence ASC, message_key ASC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM cs_message_attachments WHERE case_key = ? ORDER BY message_key ASC, ordinal ASC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare(`SELECT d.*, seller.message_key AS comparison_seller_message_key, seller.text_masked AS comparison_seller_text_masked, seller.sent_at AS comparison_seller_sent_at
@@ -83,7 +84,7 @@ export class CsDataRepository {
       this.db.prepare("SELECT * FROM review_events WHERE case_key = ? ORDER BY created_at DESC, review_event_id DESC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM answer_library_entries WHERE case_key = ? ORDER BY updated_at DESC, library_entry_id DESC").bind(caseKey).all<Record<string, unknown>>(),
     ]);
-    return { case: item, summary, messages: messages.results, attachments: attachments.results, drafts: drafts.results, decisions: decisions.results, review_events: reviewEvents.results, learning_candidates: learningCandidates.results };
+    return { case: item, summary, snapshot, messages: messages.results, attachments: attachments.results, drafts: drafts.results, decisions: decisions.results, review_events: reviewEvents.results, learning_candidates: learningCandidates.results };
   }
 
   async listTemplates(qualityState?: QualityState): Promise<Record<string, unknown>[]> {
@@ -106,7 +107,7 @@ export class CsDataRepository {
       VALUES (?, ?, 'READ_ONLY', ?, ?, ?, ?, ?, 'RUNNING') ON CONFLICT(run_id) DO NOTHING`).bind(
       input.run_id, input.environment ?? "development", input.started_at, input.finished_at, input.cases.length, input.pii_rejected_count ?? 0, input.error_count ?? 0,
     ).run();
-    if (asNumber(claim.meta.changes) === 0) return { run_id: input.run_id, duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_attachments: 0, inserted_drafts: 0 };
+    if (asNumber(claim.meta.changes) === 0) return { run_id: input.run_id, duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_attachments: 0, inserted_snapshots: 0, inserted_drafts: 0 };
 
     let insertedCases = 0; let updatedCases = 0;
     for (const item of input.cases) {
@@ -116,6 +117,7 @@ export class CsDataRepository {
     }
     const messageResults = input.messages.length ? await this.db.batch(input.messages.map((item) => this.insertMessage(item, input.run_id))) : [];
     const attachmentResults = input.attachments?.length ? await this.db.batch(input.attachments.map((item) => this.insertAttachment(item, input.run_id))) : [];
+    const snapshotResults = input.snapshots?.length ? await this.db.batch(input.snapshots.map((item) => this.upsertSnapshot(item, input.run_id))) : [];
     let insertedDrafts = 0;
     for (const item of input.drafts) {
       if (item.created_run_id !== input.run_id) throw new Error("DRAFT_RUN_ID_MISMATCH");
@@ -131,7 +133,7 @@ export class CsDataRepository {
       input.finished_at, input.cases.filter((item) => item.processing_state === "NEW").length, input.cases.filter((item) => item.processing_state === "CHANGED").length,
       input.cases.filter((item) => item.processing_state === "UNCHANGED").length, insertedDrafts, input.run_id,
     ).run();
-    return { run_id: input.run_id, duplicate_run: false, inserted_cases: insertedCases, updated_cases: updatedCases, inserted_messages: messageResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_attachments: attachmentResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_drafts: insertedDrafts };
+    return { run_id: input.run_id, duplicate_run: false, inserted_cases: insertedCases, updated_cases: updatedCases, inserted_messages: messageResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_attachments: attachmentResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_snapshots: snapshotResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_drafts: insertedDrafts };
   }
 
   async upsertDraft(input: DraftInput): Promise<{ inserted: boolean }> {
@@ -302,6 +304,17 @@ export class CsDataRepository {
         captured_run_id = excluded.captured_run_id, updated_at = CURRENT_TIMESTAMP`).bind(
       item.attachment_key, item.message_key, item.case_key, item.ordinal, item.asset_url || null,
       item.thumbnail_url || null, item.alt_text_masked || null, item.access_state, runId,
+    );
+  }
+
+  private upsertSnapshot(item: CsCaseSnapshotInput, runId: string): D1PreparedStatement {
+    return this.db.prepare(`INSERT INTO cs_case_snapshots
+      (case_key, mime_type, data_base64, width, height, redaction_state, captured_at, captured_run_id)
+      VALUES (?, ?, ?, ?, ?, 'MASKED_DOM', ?, ?)
+      ON CONFLICT(case_key) DO UPDATE SET mime_type = excluded.mime_type, data_base64 = excluded.data_base64,
+        width = excluded.width, height = excluded.height, redaction_state = excluded.redaction_state,
+        captured_at = excluded.captured_at, captured_run_id = excluded.captured_run_id, updated_at = CURRENT_TIMESTAMP`).bind(
+      item.case_key, item.mime_type, item.data_base64, item.width, item.height, item.captured_at, runId,
     );
   }
 

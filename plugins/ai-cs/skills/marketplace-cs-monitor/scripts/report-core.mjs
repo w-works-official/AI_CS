@@ -93,6 +93,20 @@ function normalizeSourceUrlKind(value, sourceUrl) {
   return kind;
 }
 
+function normalizeSourceSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const mimeType = compact(value.mime_type);
+  const dataBase64 = compact(value.data_base64);
+  const width = Number(value.width);
+  const height = Number(value.height);
+  const redactionState = compact(value.redaction_state).toUpperCase();
+  const capturedAt = compact(value.captured_at);
+  if (mimeType !== "image/jpeg" || redactionState !== "MASKED_DOM" || !capturedAt) return null;
+  if (!dataBase64 || dataBase64.length > 450_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(dataBase64)) return null;
+  if (!Number.isInteger(width) || width < 1 || width > 2400 || !Number.isInteger(height) || height < 1 || height > 12000) return null;
+  return { mime_type: mimeType, data_base64: dataBase64, width, height, redaction_state: redactionState, captured_at: capturedAt };
+}
+
 function contentHashForRecord(record) {
   const material = { ...record };
   material.messages = (material.messages ?? []).map((message) => {
@@ -119,6 +133,7 @@ function contentHashForRecord(record) {
     "source_reference",
     "product_url",
     "product_thumbnail_url",
+    "source_snapshot",
     "ai_draft",
     "ai_draft_origin",
     "ai_draft_purpose",
@@ -352,6 +367,7 @@ function normalizeRecord(market, channel, raw) {
     source_reference: maskKnownCustomerIdentity(raw.source_reference_masked, customerIdentity),
     product_url: productUrl,
     product_thumbnail_url: productThumbnailUrl,
+    source_snapshot: normalizeSourceSnapshot(raw.source_snapshot),
     order_no_masked: maskLongNumber(raw.order_no ?? raw.order_id),
     product_order_no_masked: maskLongNumber(raw.product_order_no),
     messages,
@@ -433,6 +449,11 @@ export function buildReport(rawCollection, previousRecords = []) {
       error: compact(source.error),
       filter: compact(source.filter),
       sort: compact(source.sort),
+      history_scan_complete: source.history_scan_complete === true,
+      history_window_start: compact(source.history_window_start),
+      history_expected_total: Number(source.history_expected_total ?? 0) || 0,
+      history_observed_total: Number(source.history_observed_total ?? channelRows.length) || 0,
+      history_error: compact(source.history_error),
       open_queue_complete: openQueueComplete,
       open_queue_scope: compact(source.open_queue_scope),
       open_queue_window_start: compact(source.open_queue_window_start),
@@ -450,6 +471,7 @@ export function buildReport(rawCollection, previousRecords = []) {
   const report = {
     schema_version: 1,
     mode: rawCollection?.mode ?? "changes_today",
+    collection_profile: compact(rawCollection?.collection_profile).toLowerCase() || "operational",
     range: rawCollection?.range ?? {},
     collected_at: rawCollection?.collected_at ?? new Date().toISOString(),
     duration_ms: Number(rawCollection?.duration_ms ?? 0) || 0,

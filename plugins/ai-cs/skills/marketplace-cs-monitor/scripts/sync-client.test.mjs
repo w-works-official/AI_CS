@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { buildSyncRequest, loadSyncConfig, makeRunId, readCaseIndex, readCsData, searchVerifiedAnswers, syncReport, syncReportToD1, validateSyncReport } from "./sync-client.mjs";
+import { buildSyncBatches, buildSyncRequest, loadSyncConfig, makeRunId, readCaseIndex, readCsData, searchVerifiedAnswers, syncReport, syncReportToD1, validateSyncReport } from "./sync-client.mjs";
 
 const base = "https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs";
 const safety = { environment: "development", auto_send: false, marketplace_write_actions: 0 };
@@ -19,6 +19,7 @@ assert.throws(() => buildSyncRequest(report, { environment: "production" }), /DE
 assert.equal(validateSyncReport(report), report);
 assert.throws(() => validateSyncReport({ ...report, records: [...report.records, ...report.records] }), /DUPLICATE_SOURCE_KEY/);
 assert.throws(() => validateSyncReport({ ...report, channels: { smartstore_comments: { ...report.channels.smartstore_comments, open_queue_visible_total: 2 } } }), /OPEN_QUEUE_TOTAL_MISMATCH/);
+assert.throws(() => validateSyncReport({ ...report, operational_refresh: { ready: false } }), /OPERATIONAL_REFRESH_NOT_READY/);
 
 const loaded = await loadSyncConfig({ configPath: "missing.json", env: { MARKETPLACE_CS_D1_SYNC_KEY: "hidden", MARKETPLACE_CS_SYNC_ENVIRONMENT: "development" } });
 assert.equal(loaded.d1_api_url, base);
@@ -37,6 +38,24 @@ assert.equal(captured.url.includes("hidden-test-key"), false);
 assert.equal(captured.init.headers["X-CS-Sync-Key"], "hidden-test-key");
 assert.equal(JSON.parse(captured.init.body).report.records[0].customer_masked, "고*");
 assert.equal(syncReportToD1, syncReport);
+
+const largeReport = structuredClone(report);
+largeReport.records = Array.from({ length: 5 }, (_, index) => ({
+  ...report.records[0],
+  source_key: `smartstore:comments:large-${index}`,
+  content_hash: String(index).repeat(64),
+  source_snapshot: {
+    mime_type: "image/jpeg", data_base64: "A".repeat(400_000), width: 900, height: 600,
+    redaction_state: "MASKED_DOM", captured_at: report.collected_at,
+  },
+}));
+largeReport.channels.smartstore_comments.open_queue_complete = false;
+largeReport.channels.smartstore_comments.open_queue_source_keys = [];
+largeReport.channels.smartstore_comments.open_queue_visible_total = 0;
+const batches = buildSyncBatches(largeReport, { runId: "SYNC_large" });
+assert.ok(batches.length > 1);
+assert.equal(batches.at(-1).report.records.length > 0, true);
+assert.equal(batches.slice(0, -1).every((batch) => batch.report.channels.smartstore_comments.open_queue_complete === false), true);
 await assert.rejects(() => syncReport(report, { ...config, d1_api_url: "https://example.com/api/cs" }, { fetchImpl: syncFetch }), /MARKETPLACE_CS_D1_URL_INVALID/);
 await assert.rejects(() => syncReport(report, { ...config, environment: "production" }, { fetchImpl: syncFetch }), /DEVELOPMENT_D1_SYNC_REQUIRED/);
 

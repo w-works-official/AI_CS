@@ -71,7 +71,7 @@ function input(): SyncRunInput {
 }
 async function repository(): Promise<{ db: SqliteD1; store: CsDataRepository }> {
   const db = new SqliteD1();
-  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql", "0003_review_composition_and_knowledge.sql", "0004_message_attachments.sql"]) {
+  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql", "0003_review_composition_and_knowledge.sql", "0004_message_attachments.sql", "0005_masked_case_snapshots.sql"]) {
     const schemaPath = fileURLToPath(new URL(`./migrations/${migration}`, import.meta.url));
     db.database.exec(await readFile(schemaPath, "utf8"));
   }
@@ -82,7 +82,7 @@ test("actual migrations accept repository sync, detail, overview, and cursor que
   const { db, store } = await repository();
   try {
     assert.deepEqual(await store.health(), { ok: true, service: "ai-cs-d1-repository", schema_version: "v1", write_policy: "MASKED_DTO_ONLY" });
-    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: false, inserted_cases: 1, updated_cases: 0, inserted_messages: 2, inserted_attachments: 0, inserted_drafts: 1 });
+    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: false, inserted_cases: 1, updated_cases: 0, inserted_messages: 2, inserted_attachments: 0, inserted_snapshots: 0, inserted_drafts: 1 });
     assert.deepEqual(await store.overview(), {
       total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, closed: 0,
       by_market: { SMARTSTORE: 1 },
@@ -116,6 +116,25 @@ test("repository stores attachment metadata with its message and returns it in c
     const detail = await store.getCase(caseRow.case_key);
     assert.equal(detail?.attachments.length, 1);
     assert.equal(detail?.attachments[0].access_state, "PUBLIC_URL");
+  } finally { db.close(); }
+});
+
+test("repository stores only a MASKED_DOM inquiry screenshot and returns it in case detail", async () => {
+  const { db, store } = await repository();
+  try {
+    const withSnapshot = input();
+    withSnapshot.run_id = "SYNC:snapshot";
+    withSnapshot.drafts = [];
+    withSnapshot.decisions = [];
+    withSnapshot.snapshots = [{
+      case_key: caseRow.case_key, mime_type: "image/jpeg", data_base64: Buffer.from("masked-jpeg").toString("base64"),
+      width: 900, height: 600, redaction_state: "MASKED_DOM", captured_at: time,
+    }];
+    const result = await store.syncRun(withSnapshot);
+    assert.equal(result.inserted_snapshots, 1);
+    const detail = await store.getCase(caseRow.case_key);
+    assert.equal(detail?.snapshot?.redaction_state, "MASKED_DOM");
+    assert.equal(detail?.snapshot?.data_base64, Buffer.from("masked-jpeg").toString("base64"));
   } finally { db.close(); }
 });
 
@@ -166,7 +185,7 @@ test("sync run is idempotent through sync_runs.run_id and uses only bindings", a
   const { db, store } = await repository();
   try {
     await store.syncRun(input());
-    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_attachments: 0, inserted_drafts: 0 });
+    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_attachments: 0, inserted_snapshots: 0, inserted_drafts: 0 });
     assert.equal(db.calls.every((call) => !call.sql.includes(caseRow.case_key) && !call.sql.includes("DRAFT:case-1")), true);
   } finally { db.close(); }
 });

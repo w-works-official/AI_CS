@@ -1974,6 +1974,32 @@ button {
   object-fit: cover;
 }
 
+.captured-screen-wrap {
+  max-height: 62vh;
+  overflow: auto;
+  margin-top: 12px;
+  border: 1px solid #e1e4ea;
+  border-radius: 12px;
+  background: #eef1f5;
+  padding: 10px;
+}
+
+.captured-screen {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 4px 18px rgba(20, 26, 38, 0.12);
+}
+
+.captured-screen-wrap p {
+  margin: 9px 2px 0;
+  color: #687386;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
 .snapshot-conversation {
   display: grid;
   gap: 10px;

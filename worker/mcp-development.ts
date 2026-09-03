@@ -97,6 +97,9 @@ function runtimeFor(env: WorkerBindings): Runtime {
       store: new CsStoreAdapter(new CsDataRepository(env.AI_CS_DB)),
       syncKey: String(env.AI_CS_DEV_D1_SYNC_KEY ?? ""),
       allowedOrigins: [reviewOrigin, "http://localhost:3000", "http://127.0.0.1:3000"],
+      // Masked inquiry screenshots are sent with the channel report. Keep the
+      // public API bounded while leaving enough room for a small sync batch.
+      maxJsonBytes: 2 * 1024 * 1024,
     }) : null,
   };
   runtimeCache.set(cacheKey, runtime);

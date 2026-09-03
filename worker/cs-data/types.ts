@@ -43,6 +43,10 @@ export type CsAttachmentInput = {
   asset_url: string; thumbnail_url: string; alt_text_masked: string; media_type: "IMAGE";
   access_state: "PUBLIC_URL" | "SESSION_REQUIRED" | "UNAVAILABLE";
 };
+export type CsCaseSnapshotInput = {
+  case_key: string; mime_type: "image/jpeg"; data_base64: string;
+  width: number; height: number; redaction_state: "MASKED_DOM"; captured_at: string;
+};
 /** EVAL identifies the actual seller message; it never stores seller text in ai_drafts. */
 export type DraftInput = {
   draft_id: string; case_key: string; purpose: DraftPurpose; state?: DraftState;
@@ -53,7 +57,7 @@ export type DraftInput = {
 export type DraftDecisionInput = { decision_id: string; run_id: string; case_key: string; purpose: DraftDecisionPurpose; source_content_hash: string; decision: "GENERATE" | "SKIP"; reason_code: string; required_checks: string[]; draft_id: string | null; created_at: string };
 export type SyncRunInput = {
   run_id: string; environment?: "local" | "development"; mode?: "READ_ONLY"; started_at: string; finished_at: string | null;
-  pii_rejected_count?: number; error_count?: number; cases: CsCaseInput[]; messages: CsMessageInput[]; attachments?: CsAttachmentInput[]; drafts: DraftInput[]; decisions?: DraftDecisionInput[];
+  pii_rejected_count?: number; error_count?: number; cases: CsCaseInput[]; messages: CsMessageInput[]; attachments?: CsAttachmentInput[]; snapshots?: CsCaseSnapshotInput[]; drafts: DraftInput[]; decisions?: DraftDecisionInput[];
   case_summaries?: CaseSummaryInput[]; answer_library_entries?: AnswerLibraryEntryInput[]; no_reply_patterns?: NoReplyPatternInput[];
 };
 export type CaseFilters = Partial<Pick<CsCaseInput, "market" | "channel" | "ui_type" | "reply_state">> & { ai_draft_state?: DraftState | "NONE" };
@@ -90,9 +94,9 @@ export type CaseListItem = {
   customer_masked: string; subject_masked: string | null; preview_masked: string | null;
   product_id: string | null; product_name_masked: string | null; source_url: string | null;
   source_url_kind: "EXACT" | "LIST" | "UNAVAILABLE"; product_url: string | null; product_thumbnail_url: string | null;
-  reply_state: ReplyState; ai_draft_state: string; last_seen_at: string;
+  reply_state: ReplyState; content_hash: string; ai_draft_state: string; last_seen_at: string;
 };
 export type CursorListResult = { items: CaseListItem[]; cursor: number; next_cursor: number | null };
-export type CaseDetailResult = { case: Record<string, unknown>; summary?: Record<string, unknown> | null; messages: Record<string, unknown>[]; attachments: Record<string, unknown>[]; drafts: Record<string, unknown>[]; decisions: Record<string, unknown>[]; review_events: Record<string, unknown>[]; learning_candidates: Record<string, unknown>[] };
-export type SyncRunResult = { run_id: string; duplicate_run: boolean; inserted_cases: number; updated_cases: number; inserted_messages: number; inserted_attachments: number; inserted_drafts: number };
+export type CaseDetailResult = { case: Record<string, unknown>; summary?: Record<string, unknown> | null; snapshot?: Record<string, unknown> | null; messages: Record<string, unknown>[]; attachments: Record<string, unknown>[]; drafts: Record<string, unknown>[]; decisions: Record<string, unknown>[]; review_events: Record<string, unknown>[]; learning_candidates: Record<string, unknown>[] };
+export type SyncRunResult = { run_id: string; duplicate_run: boolean; inserted_cases: number; updated_cases: number; inserted_messages: number; inserted_attachments: number; inserted_snapshots: number; inserted_drafts: number };
 export type DraftReviewResult = { draft_id: string; case_key: string; draft_state: "APPROVED" | "REJECTED" | "REVISED"; reviewed_at: string; reply_state_changed: false; human_revision_saved: boolean };

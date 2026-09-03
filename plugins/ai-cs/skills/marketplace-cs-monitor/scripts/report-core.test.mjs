@@ -378,4 +378,19 @@ assert.throws(() => applyAiDrafts(first, [{
   ai_draft_pii_scan: "PASS",
 }]), /AI_DRAFT_REPLY_STATE_MISMATCH/);
 
+const snapshotInput = structuredClone(linkedTalktalkInput);
+snapshotInput.channels.smartstore_talktalk.records[0].source_snapshot = {
+  mime_type: "image/jpeg", data_base64: Buffer.from("masked-capture-one").toString("base64"),
+  width: 900, height: 600, redaction_state: "MASKED_DOM", captured_at: "2026-09-03T01:00:00.000Z",
+};
+const snapshotReport = buildReport(snapshotInput, []);
+const snapshotRecord = snapshotReport.records.find((row) => row.channel === "talktalk");
+assert.equal(snapshotRecord.source_snapshot.redaction_state, "MASKED_DOM");
+const changedSnapshotInput = structuredClone(snapshotInput);
+changedSnapshotInput.channels.smartstore_talktalk.records[0].source_snapshot.data_base64 = Buffer.from("masked-capture-two").toString("base64");
+changedSnapshotInput.channels.smartstore_talktalk.records[0].source_snapshot.captured_at = "2026-09-03T01:05:00.000Z";
+const changedSnapshotRecord = buildReport(changedSnapshotInput, []).records.find((row) => row.channel === "talktalk");
+assert.equal(changedSnapshotRecord.content_hash, snapshotRecord.content_hash);
+assert.notEqual(changedSnapshotRecord.source_snapshot.data_base64, snapshotRecord.source_snapshot.data_base64);
+
 console.log("marketplace-cs-monitor report core: PASS");

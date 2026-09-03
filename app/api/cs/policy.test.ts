@@ -110,6 +110,19 @@ test("sync request preserves only allowlisted image metadata", () => {
   assert.equal(images[1].access_state, "SESSION_REQUIRED");
 });
 
+test("sync request preserves only bounded MASKED_DOM inquiry screenshots", () => {
+  const record = {
+    ...safeRecord,
+    source_snapshot: {
+      mime_type: "image/jpeg", data_base64: Buffer.from("masked-inquiry-screen").toString("base64"),
+      width: 900, height: 600, redaction_state: "MASKED_DOM", captured_at: "2026-09-03T01:00:00.000Z",
+    },
+  };
+  const result = normalizeSyncRequest({ action: "syncRun", report: { schema_version: 1, summary: { marketplace_write_actions: 0 }, records: [record] } });
+  assert.equal((result.report.records[0].source_snapshot as Record<string, unknown>).redaction_state, "MASKED_DOM");
+  assert.throws(() => normalizeSyncRequest({ action: "syncRun", report: { schema_version: 1, summary: { marketplace_write_actions: 0 }, records: [{ ...record, source_snapshot: { ...record.source_snapshot, redaction_state: "RAW" } }] } }), /INVALID_SOURCE_SNAPSHOT/);
+});
+
 test("template and learning mutations stay development-only and bounded", () => {
   assert.equal(normalizeTemplateRequest({ action: "upsertTemplate", template_key: "delivery", template_version: "v1", template_name: "배송", template_text: "확인 후 안내드리겠습니다.", required_checks: ["출고일 확인"], ...{ environment: "development", auto_send: false, marketplace_write_actions: 0 } }).quality_state, "USE");
   assert.equal(normalizeTemplateStateRequest({ action: "setTemplateState", template_id: "TEMPLATE:delivery", quality_state: "EXCLUDE", environment: "development", auto_send: false, marketplace_write_actions: 0 }).quality_state, "EXCLUDE");

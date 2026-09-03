@@ -8,8 +8,9 @@ const schemaPath = fileURLToPath(new URL("./migrations/0001_initial.sql", import
 const diagnosticsPath = fileURLToPath(new URL("./migrations/0002_draft_decision_diagnostics.sql", import.meta.url));
 const knowledgePath = fileURLToPath(new URL("./migrations/0003_review_composition_and_knowledge.sql", import.meta.url));
 const attachmentsPath = fileURLToPath(new URL("./migrations/0004_message_attachments.sql", import.meta.url));
+const snapshotsPath = fileURLToPath(new URL("./migrations/0005_masked_case_snapshots.sql", import.meta.url));
 const schema = (await readFile(schemaPath, "utf8")).replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
-const allMigrations = await Promise.all([schemaPath, diagnosticsPath, knowledgePath, attachmentsPath].map((path) => readFile(path, "utf8")));
+const allMigrations = await Promise.all([schemaPath, diagnosticsPath, knowledgePath, attachmentsPath, snapshotsPath].map((path) => readFile(path, "utf8")));
 const allMigrationSql = allMigrations.join("\n").replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
 
 function createTable(name) {
@@ -25,6 +26,7 @@ test("migration executes in the local SQLite engine used for D1-compatible check
     database.exec(await readFile(diagnosticsPath, "utf8"));
     database.exec(await readFile(knowledgePath, "utf8"));
     database.exec(await readFile(attachmentsPath, "utf8"));
+    database.exec(await readFile(snapshotsPath, "utf8"));
   } finally {
     database.close();
   }
@@ -33,7 +35,7 @@ test("migration executes in the local SQLite engine used for D1-compatible check
 test("review composition and derived knowledge schema remain masked and review-only", async () => {
   const database = new DatabaseSync(":memory:");
   try {
-    for (const path of [schemaPath, diagnosticsPath, knowledgePath, attachmentsPath]) database.exec(await readFile(path, "utf8"));
+    for (const path of [schemaPath, diagnosticsPath, knowledgePath, attachmentsPath, snapshotsPath]) database.exec(await readFile(path, "utf8"));
     for (const table of ["case_summaries", "answer_library_entries", "no_reply_patterns", "reply_templates"]) {
       assert.ok(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table), `missing ${table}`);
     }
@@ -65,6 +67,20 @@ test("message attachment schema stores only safe masked metadata", async () => {
     assert.match(sql, /alt_text_masked TEXT/i);
     assert.match(sql, /access_state IN \('PUBLIC_URL', 'SESSION_REQUIRED', 'UNAVAILABLE'\)/i);
     assert.doesNotMatch(sql, /blob|cookie|token|authorization/i);
+  } finally {
+    database.close();
+  }
+});
+
+test("inquiry screenshot schema requires masked JPEG evidence and no session data", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const path of [schemaPath, diagnosticsPath, knowledgePath, attachmentsPath, snapshotsPath]) database.exec(await readFile(path, "utf8"));
+    const sql = String(database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cs_case_snapshots'").get()?.sql ?? "");
+    assert.match(sql, /mime_type TEXT NOT NULL CHECK \(mime_type = 'image\/jpeg'\)/i);
+    assert.match(sql, /redaction_state TEXT NOT NULL CHECK \(redaction_state = 'MASKED_DOM'\)/i);
+    assert.match(sql, /case_key TEXT PRIMARY KEY REFERENCES cs_cases\(case_key\)/i);
+    assert.doesNotMatch(sql, /cookie|token|authorization|customer_name|email|phone/i);
   } finally {
     database.close();
   }
