@@ -12,6 +12,23 @@ const CS_SHEETS = Object.freeze({
 const CS_WRITE_POLICY = 'MASKED_SYNC_AND_DRAFT_REVIEW_ONLY';
 const CS_ALLOWED_DRAFT_STATES = Object.freeze(['APPROVED', 'REJECTED', 'USED']);
 const CS_MAX_SYNC_RECORDS = 2000;
+const CS_D1_DEVELOPMENT_API_URL = 'https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs';
+const CS_D1_RELAY_ACTIONS = Object.freeze(['reviewDraft', 'upsertTemplate', 'setTemplateState', 'reviewLibraryEntry']);
+const CS_D1_RELAY_FIELDS = Object.freeze({
+  reviewDraft: Object.freeze([
+    'draft_state', 'review_note', 'human_revision', 'purpose',
+    'composition_source_type', 'composition_source_id', 'composition_source_version',
+    'base_text_hash', 'final_text_hash', 'unresolved_variables', 'source_content_hash',
+    'environment', 'auto_send', 'marketplace_write_actions',
+  ]),
+  upsertTemplate: Object.freeze([
+    'template_key', 'template_version', 'template_name', 'template_text',
+    'market', 'channel', 'intent', 'required_checks', 'quality_state',
+    'environment', 'auto_send', 'marketplace_write_actions',
+  ]),
+  setTemplateState: Object.freeze(['quality_state', 'environment', 'auto_send', 'marketplace_write_actions']),
+  reviewLibraryEntry: Object.freeze(['quality_state', 'review_note', 'environment', 'auto_send', 'marketplace_write_actions']),
+});
 const CS_RECONCILIATION_COLUMNS = Object.freeze([
   'last_status_verified_at',
   'status_missing_count',
@@ -55,6 +72,10 @@ function doPost(e) {
 
     assertWriteKeyConfigured_();
 
+    if (CS_D1_RELAY_ACTIONS.indexOf(action) !== -1 && isD1RelayConfigured_()) {
+      return json_(relayD1Write_(action, request));
+    }
+
     if (action === 'syncRun') {
       return json_(withDocumentLock_(function () {
         return syncRun_(request);
@@ -65,6 +86,10 @@ function doPost(e) {
       return json_(withDocumentLock_(function () {
         return reviewDraft_(request);
       }));
+    }
+
+    if (CS_D1_RELAY_ACTIONS.indexOf(action) !== -1) {
+      throw new Error('CS_D1_RELAY_NOT_CONFIGURED');
     }
 
     return json_({
@@ -97,9 +122,95 @@ function health_() {
     schema_version: 'cs-sheet-v1',
     write_policy: CS_WRITE_POLICY,
     write_key_configured: Boolean(PropertiesService.getScriptProperties().getProperty('CS_API_KEY')),
+    d1_relay_configured: isD1RelayConfigured_(),
     auto_send: false,
     now: new Date().toISOString(),
   };
+}
+
+function isD1RelayConfigured_() {
+  return Boolean(PropertiesService.getScriptProperties().getProperty('CS_D1_SYNC_KEY'));
+}
+
+function relayD1Write_(action, request) {
+  if (currentEnvironment_() !== 'development') throw new Error('D1_RELAY_DEVELOPMENT_ONLY');
+  const syncKey = String(PropertiesService.getScriptProperties().getProperty('CS_D1_SYNC_KEY') || '');
+  if (!syncKey) throw new Error('CS_D1_RELAY_NOT_CONFIGURED');
+  if (String(request.environment || '') !== 'development'
+    || request.auto_send !== false
+    || Number(request.marketplace_write_actions || 0) !== 0) {
+    throw new Error('DEVELOPMENT_SAFETY_REQUIRED');
+  }
+
+  const target = d1RelayTarget_(action, request);
+  const allowedFields = CS_D1_RELAY_FIELDS[action];
+  const body = {};
+  allowedFields.forEach(function (field) {
+    if (Object.prototype.hasOwnProperty.call(request, field)) body[field] = request[field];
+  });
+  assertD1RelayPayload_(body);
+
+  const response = UrlFetchApp.fetch(target.url, {
+    method: target.method,
+    contentType: 'application/json',
+    headers: {
+      Accept: 'application/json',
+      'X-CS-Sync-Key': syncKey,
+    },
+    payload: JSON.stringify(body),
+    followRedirects: false,
+    muteHttpExceptions: true,
+  });
+  const status = Number(response.getResponseCode());
+  let payload;
+  try {
+    payload = JSON.parse(response.getContentText());
+  } catch (error) {
+    throw new Error('CS_D1_RELAY_RESPONSE_INVALID');
+  }
+  if (status < 200 || status >= 300 || !payload || payload.ok === false) {
+    const code = payload && payload.error ? String(payload.error).slice(0, 100) : 'HTTP_' + status;
+    throw new Error('CS_D1_RELAY_FAILED:' + code);
+  }
+  if (payload.environment !== 'development'
+    || payload.auto_send !== false
+    || Number(payload.marketplace_write_actions || 0) !== 0) {
+    throw new Error('UNSAFE_D1_RELAY_RESPONSE');
+  }
+  return payload;
+}
+
+function d1RelayTarget_(action, request) {
+  if (action === 'reviewDraft') {
+    const draftId = relayId_(request.draft_id, 'INVALID_DRAFT_ID');
+    return { method: 'patch', url: CS_D1_DEVELOPMENT_API_URL + '/drafts/' + encodeURIComponent(draftId) + '/review' };
+  }
+  if (action === 'upsertTemplate') {
+    return { method: 'post', url: CS_D1_DEVELOPMENT_API_URL + '/templates' };
+  }
+  if (action === 'setTemplateState') {
+    const templateId = relayId_(request.template_id, 'INVALID_TEMPLATE_ID');
+    return { method: 'patch', url: CS_D1_DEVELOPMENT_API_URL + '/templates/' + encodeURIComponent(templateId) };
+  }
+  if (action === 'reviewLibraryEntry') {
+    const libraryEntryId = relayId_(request.library_entry_id, 'INVALID_LIBRARY_ENTRY_ID');
+    return { method: 'patch', url: CS_D1_DEVELOPMENT_API_URL + '/library/' + encodeURIComponent(libraryEntryId) };
+  }
+  throw new Error('WRITE_NOT_ALLOWED');
+}
+
+function relayId_(value, errorCode) {
+  const normalized = String(value || '');
+  if (!/^[A-Za-z0-9:_-]{1,300}$/.test(normalized)) throw new Error(errorCode);
+  return normalized;
+}
+
+function assertD1RelayPayload_(value) {
+  const serialized = JSON.stringify(value || {});
+  if (serialized.length > 100000) throw new Error('CS_D1_RELAY_PAYLOAD_TOO_LARGE');
+  if (/(?:^|[^0-9])01[016789][-. ]?\d{3,4}[-. ]?\d{4}(?:[^0-9]|$)/.test(serialized)) throw new Error('UNMASKED_PHONE');
+  if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(serialized)) throw new Error('UNMASKED_EMAIL');
+  if (/\b\d{12,}\b/.test(serialized)) throw new Error('UNMASKED_LONG_NUMBER');
 }
 
 function syncRun_(request) {
@@ -1187,6 +1298,20 @@ function errorJson_(error) {
 
 function testHealth() {
   Logger.log(JSON.stringify(health_(), null, 2));
+  testD1RelayHealth();
+}
+
+function testD1RelayHealth() {
+  const response = UrlFetchApp.fetch('https://ai-cs-mcp-development.kimhyein0214.workers.dev/healthz', {
+    method: 'get',
+    headers: { Accept: 'application/json' },
+    followRedirects: false,
+    muteHttpExceptions: true,
+  });
+  Logger.log(JSON.stringify({
+    status: Number(response.getResponseCode()),
+    ok: Number(response.getResponseCode()) === 200,
+  }, null, 2));
 }
 
 function testOverview() {

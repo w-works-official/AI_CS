@@ -3,6 +3,19 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
+const scriptProperties = {
+  CS_API_KEY: "apps-script-test-key",
+  CS_ENVIRONMENT: "development",
+  CS_D1_SYNC_KEY: "d1-test-key",
+};
+const relayCalls = [];
+let relayResponse = {
+  ok: true,
+  environment: "development",
+  auto_send: false,
+  marketplace_write_actions: 0,
+};
+
 const context = {
   console,
   Date,
@@ -22,11 +35,80 @@ const context = {
       return [...crypto.createHash("sha256").update(String(value)).digest()].map((byte) => byte > 127 ? byte - 256 : byte);
     },
   },
+  PropertiesService: {
+    getScriptProperties() {
+      return {
+        getProperty(key) { return scriptProperties[key] || ""; },
+      };
+    },
+  },
+  UrlFetchApp: {
+    fetch(url, options) {
+      relayCalls.push({ url, options });
+      return {
+        getResponseCode() { return 200; },
+        getContentText() { return JSON.stringify(relayResponse); },
+      };
+    },
+  },
 };
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(`${__dirname}/Code.gs`, "utf8"), context);
 const source = fs.readFileSync(`${__dirname}/Code.gs`, "utf8");
 assert.match(source, /\['health', 'overview', 'dashboard', 'cases', 'case', 'caseBatch', 'caseIndex', 'answerLibrary'\]/);
+
+assert.equal(context.isD1RelayConfigured_(), true);
+const relayedTemplate = context.relayD1Write_("upsertTemplate", {
+  action: "upsertTemplate",
+  api_key: "must-not-be-forwarded",
+  template_key: "shipping-delay",
+  template_version: "v1",
+  template_name: "배송 지연",
+  template_text: "확인 후 안내드리겠습니다.",
+  required_checks: ["출고일 확인"],
+  quality_state: "USE",
+  environment: "development",
+  auto_send: false,
+  marketplace_write_actions: 0,
+});
+assert.equal(relayedTemplate.ok, true);
+assert.equal(relayCalls[0].url, "https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs/templates");
+assert.equal(relayCalls[0].options.method, "post");
+assert.equal(relayCalls[0].options.headers["X-CS-Sync-Key"], "d1-test-key");
+const relayedTemplateBody = JSON.parse(relayCalls[0].options.payload);
+assert.equal(relayedTemplateBody.action, undefined);
+assert.equal(relayedTemplateBody.api_key, undefined);
+assert.equal(relayedTemplateBody.template_key, "shipping-delay");
+
+context.relayD1Write_("reviewDraft", {
+  draft_id: "DRAFT:test",
+  draft_state: "APPROVED",
+  human_revision: "검수한 답변입니다.",
+  environment: "development",
+  auto_send: false,
+  marketplace_write_actions: 0,
+});
+assert.equal(relayCalls[1].url, "https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs/drafts/DRAFT%3Atest/review");
+assert.equal(relayCalls[1].options.method, "patch");
+assert.throws(() => context.relayD1Write_("setTemplateState", {
+  template_id: "bad/id",
+  quality_state: "EXCLUDE",
+  environment: "development",
+  auto_send: false,
+  marketplace_write_actions: 0,
+}), /INVALID_TEMPLATE_ID/);
+assert.throws(() => context.relayD1Write_("upsertTemplate", {
+  template_text: "010-1234-5678",
+  environment: "development",
+  auto_send: false,
+  marketplace_write_actions: 0,
+}), /UNMASKED_PHONE/);
+assert.throws(() => context.relayD1Write_("upsertTemplate", {
+  template_text: "안전한 문장",
+  environment: "production",
+  auto_send: false,
+  marketplace_write_actions: 0,
+}), /DEVELOPMENT_SAFETY_REQUIRED/);
 
 const record = {
   market: "smartstore",

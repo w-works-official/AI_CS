@@ -54,15 +54,8 @@ function d1ReviewTarget() {
 
 type D1WriteRequest = ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeTemplateRequest> | ReturnType<typeof normalizeTemplateStateRequest> | ReturnType<typeof normalizeLibraryReviewRequest>;
 
-function appsScriptWriteBody(writeRequest: ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeSyncRequest>) {
-  if (writeRequest.action !== 'reviewDraft') return writeRequest;
-  return {
-    action: writeRequest.action,
-    draft_id: writeRequest.draft_id,
-    draft_state: writeRequest.draft_state,
-    review_note: writeRequest.review_note,
-    human_revision: writeRequest.human_revision,
-  };
+function appsScriptWriteBody(writeRequest: D1WriteRequest | ReturnType<typeof normalizeSyncRequest>) {
+  return writeRequest;
 }
 
 function privateJson(body: unknown, status = 200, cacheSeconds = 0) {
@@ -325,10 +318,6 @@ export async function POST(request: NextRequest) {
       const code = error instanceof D1ReadError ? error.code : 'CS_D1_REVIEW_CONNECTION_FAILED';
       return privateJson({ ok: false, error: code, environment: 'development', auto_send: false, marketplace_write_actions: 0 }, status);
     }
-  }
-
-  if (writeRequest.action !== 'reviewDraft' && writeRequest.action !== 'syncRun') {
-    return privateJson({ ok: false, error: 'CS_D1_WRITE_NOT_CONFIGURED', environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 403);
   }
 
   let target: ReturnType<typeof appsScriptTarget>;

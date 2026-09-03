@@ -1,6 +1,6 @@
 # Pink Rocket CS Apps Script API
 
-환경별 Google Sheet에 연결하는 읽기, 마스킹된 수집 결과 업서트, 검증된 사람답변 검색, AI 초안 검토 API입니다. 개발 배포는 테스트 Sheet만 사용하고 운영 배포만 승인 후 `Pink Rocket CS 운영 데이터 v1`을 사용합니다.
+환경별 Google Sheet 레거시 API이자, Sites에서 development D1으로 검수 쓰기를 전달하는 제한된 중계기입니다. 신규 검수 데이터의 기준 저장소는 D1이며, 중계 요청은 Sheet를 수정하지 않습니다.
 
 ## 안전 경계
 
@@ -13,6 +13,8 @@
 - `source_url_kind`는 개별 문의 `EXACT`, 목록 화면 `LIST`, 미수집 `UNAVAILABLE`을 구분하고 목록 링크는 개별 문의 링크처럼 표시하지 않음
 - AI 초안의 `APPROVED`, `REJECTED`, `USED`는 검토 상태일 뿐 마켓 응답 상태를 바꾸지 않음
 - 모든 응답에 `auto_send: false` 유지
+- `reviewDraft`, `upsertTemplate`, `setTemplateState`, `reviewLibraryEntry`는 `CS_D1_SYNC_KEY`가 설정된 development 배포에서만 고정된 development Worker로 전달
+- 중계 주소는 코드에 고정되어 있으며 임의 URL·임의 메서드·임의 action을 허용하지 않음
 
 ## 설치
 
@@ -26,6 +28,7 @@
 8. `03_AI_DRAFTS`에 사람 수정본을 AI 원문과 분리하는 `human_revision` 열을 추가합니다.
 9. `01_CASES`의 링크 열(`source_url_kind`, `source_reference`, `product_url`, `product_thumbnail_url`, `image_count`)은 첫 안전 동기화 때 자동으로 추가됩니다.
 10. 배포 URL과 키는 MCP 서버의 환경별 비밀값으로 등록합니다. 로컬 Windows 사용자 환경이나 프롬프트에서 읽지 않습니다.
+11. Sites 검수 쓰기 중계를 사용할 때만 스크립트 속성 `CS_D1_SYNC_KEY`를 설정합니다. 이 값은 development Worker의 D1 sync secret과 같으며 코드·시트·로그에 기록하지 않습니다.
 
 ## 읽기 요청
 

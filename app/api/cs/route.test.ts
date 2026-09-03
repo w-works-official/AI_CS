@@ -80,7 +80,7 @@ test('caseBatch stays compatible and reads each bounded case from D1', async () 
   }
 });
 
-test('POST retains the existing server-side Apps Script review path', async () => {
+test('POST forwards the complete normalized review to the Apps Script D1 relay', async () => {
   const previousFetch = globalThis.fetch;
   const previousEnvironment = process.env.AI_CS_WEB_ENVIRONMENT;
   const previousUrl = process.env.AI_CS_DEV_APPS_SCRIPT_URL;
@@ -112,11 +112,11 @@ test('POST retains the existing server-side Apps Script review path', async () =
     assert.equal(captured.upstream, 'https://script.example/exec');
     assert.equal(written.api_key, 'apps-script-only-test-key');
     assert.equal(written.action, 'reviewDraft');
-    assert.equal(written.composition_source_type, undefined);
-    assert.equal(written.final_text_hash, undefined);
+    assert.equal(written.composition_source_type, 'MANUAL');
+    assert.equal(written.final_text_hash, 'b'.repeat(64));
     assert.equal(written.environment, 'development');
-    assert.equal(written.auto_send, undefined);
-    assert.equal(written.marketplace_write_actions, undefined);
+    assert.equal(written.auto_send, false);
+    assert.equal(written.marketplace_write_actions, 0);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousEnvironment === undefined) delete process.env.AI_CS_WEB_ENVIRONMENT; else process.env.AI_CS_WEB_ENVIRONMENT = previousEnvironment;
@@ -125,6 +125,44 @@ test('POST retains the existing server-side Apps Script review path', async () =
     if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
     if (previousD1ReviewEnabled === undefined) delete process.env.AI_CS_ENABLE_D1_REVIEW; else process.env.AI_CS_ENABLE_D1_REVIEW = previousD1ReviewEnabled;
     if (previousMarketplaceSyncKey === undefined) delete process.env.MARKETPLACE_CS_SYNC_KEY; else process.env.MARKETPLACE_CS_SYNC_KEY = previousMarketplaceSyncKey;
+  }
+});
+
+test('POST forwards template and learning mutations to the Apps Script D1 relay when direct D1 writes are disabled', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousEnvironment = process.env.AI_CS_WEB_ENVIRONMENT;
+  const previousUrl = process.env.AI_CS_DEV_APPS_SCRIPT_URL;
+  const previousKey = process.env.AI_CS_DEV_APPS_SCRIPT_KEY;
+  const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
+  const previousD1ReviewEnabled = process.env.AI_CS_ENABLE_D1_REVIEW;
+  const captured: Array<Record<string, unknown>> = [];
+  process.env.AI_CS_WEB_ENVIRONMENT = 'development';
+  process.env.AI_CS_DEV_APPS_SCRIPT_URL = 'https://script.example/exec';
+  process.env.AI_CS_DEV_APPS_SCRIPT_KEY = 'apps-script-only-test-key';
+  delete process.env.AI_CS_DEV_D1_SYNC_KEY;
+  delete process.env.AI_CS_ENABLE_D1_REVIEW;
+  globalThis.fetch = async (_input, init) => {
+    captured.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response(JSON.stringify({ ok: true, ...safety }), { headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const template = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      action: 'upsertTemplate', template_key: 'delivery', template_version: 'v1', template_name: '배송 안내', template_text: '확인 후 안내드리겠습니다.', quality_state: 'USE', ...safety,
+    }) }));
+    const learning = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      action: 'reviewLibraryEntry', library_entry_id: 'ANSWER:reviewed', quality_state: 'USE', review_note: '사람 검증 완료', ...safety,
+    }) }));
+    assert.equal(template.status, 200);
+    assert.equal(learning.status, 200);
+    assert.deepEqual(captured.map((item) => item.action), ['upsertTemplate', 'reviewLibraryEntry']);
+    assert.equal(captured.every((item) => item.api_key === 'apps-script-only-test-key' && item.environment === 'development' && item.auto_send === false && item.marketplace_write_actions === 0), true);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousEnvironment === undefined) delete process.env.AI_CS_WEB_ENVIRONMENT; else process.env.AI_CS_WEB_ENVIRONMENT = previousEnvironment;
+    if (previousUrl === undefined) delete process.env.AI_CS_DEV_APPS_SCRIPT_URL; else process.env.AI_CS_DEV_APPS_SCRIPT_URL = previousUrl;
+    if (previousKey === undefined) delete process.env.AI_CS_DEV_APPS_SCRIPT_KEY; else process.env.AI_CS_DEV_APPS_SCRIPT_KEY = previousKey;
+    if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
+    if (previousD1ReviewEnabled === undefined) delete process.env.AI_CS_ENABLE_D1_REVIEW; else process.env.AI_CS_ENABLE_D1_REVIEW = previousD1ReviewEnabled;
   }
 });
 
