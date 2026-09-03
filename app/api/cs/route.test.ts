@@ -16,9 +16,11 @@ function d1Response(body: Record<string, unknown>, status = 200) {
 test('legacy dashboard and detail actions map to the fixed development D1 API', async () => {
   const previousFetch = globalThis.fetch;
   const calls: URL[] = [];
-  globalThis.fetch = async (input) => {
+  const redirectModes: Array<RequestRedirect | undefined> = [];
+  globalThis.fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     calls.push(url);
+    redirectModes.push(init?.redirect);
     if (url.pathname === '/api/cs/cases') return d1Response({ ok: true, items: [{ case_key: 'case-1', reply_state: 'NEEDS_REPLY', category_masked: '배송', subject_masked: '문의 제목', preview_masked: '문의 미리보기', product_name_masked: '상품명', source_reference_masked: '참조값' }], cursor: 0, next_cursor: 50 });
     if (url.pathname === '/api/cs/overview') return d1Response({ ok: true, total_live: 9, needs_reply: 2, answered: 3, review: 1, no_reply_required: 2, ai_ready: 1, by_market: {} });
     if (url.pathname === '/api/cs/cases/case-1') return d1Response({
@@ -39,6 +41,7 @@ test('legacy dashboard and detail actions map to the fixed development D1 API', 
     assert.deepEqual((dashboardBody.items as Array<Record<string, unknown>>)[0], { case_key: 'case-1', reply_state: 'NEEDS_REPLY', category_masked: '배송', subject_masked: '문의 제목', preview_masked: '문의 미리보기', product_name_masked: '상품명', source_reference_masked: '참조값', category: '배송', subject: '문의 제목', preview: '문의 미리보기', product_name: '상품명', source_reference: '참조값' });
     assert.equal(dashboardBody.environment, 'development');
     assert.equal(calls.every((url) => url.origin === 'https://ai-cs-mcp-development.kimhyein0214.workers.dev'), true);
+    assert.equal(redirectModes.every((mode) => mode === 'manual'), true);
     assert.deepEqual(calls.map((url) => url.pathname).sort(), ['/api/cs/cases', '/api/cs/overview']);
     assert.equal(calls.find((url) => url.pathname.endsWith('/cases'))?.searchParams.get('reply_state'), 'NEEDS_REPLY');
 
@@ -173,7 +176,7 @@ test('POST uses the development Worker PATCH review route only with the explicit
   const previousD1ReviewEnabled = process.env.AI_CS_ENABLE_D1_REVIEW;
   const previousMarketplaceSyncKey = process.env.MARKETPLACE_CS_SYNC_KEY;
   const previousD1Url = process.env.AI_CS_D1_API_URL;
-  const captured: { url?: string; method?: string; syncKey?: string | null; body?: Record<string, unknown> } = {};
+  const captured: { url?: string; method?: string; redirect?: RequestRedirect; syncKey?: string | null; body?: Record<string, unknown> } = {};
   process.env.AI_CS_DEV_D1_SYNC_KEY = 'worker-test-sync-key';
   process.env.AI_CS_ENABLE_D1_REVIEW = 'true';
   delete process.env.MARKETPLACE_CS_SYNC_KEY;
@@ -181,6 +184,7 @@ test('POST uses the development Worker PATCH review route only with the explicit
   globalThis.fetch = async (input, init) => {
     captured.url = new URL(input instanceof Request ? input.url : String(input)).href;
     captured.method = init?.method;
+    captured.redirect = init?.redirect;
     captured.syncKey = new Headers(init?.headers).get('X-CS-Sync-Key');
     captured.body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(JSON.stringify({ ok: true, draft_id: 'DRAFT:worker', ...safety }), { headers: { 'Content-Type': 'application/json' } });
@@ -195,6 +199,7 @@ test('POST uses the development Worker PATCH review route only with the explicit
     assert.equal(response.status, 200);
     assert.equal(captured.url, 'https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs/drafts/DRAFT%3Aworker/review');
     assert.equal(captured.method, 'PATCH');
+    assert.equal(captured.redirect, 'manual');
     assert.equal(captured.syncKey, 'worker-test-sync-key');
     assert.deepEqual(captured.body, {
       draft_id: 'DRAFT:worker', draft_state: 'APPROVED', review_note: 'checked', human_revision: 'masked revision',

@@ -90,7 +90,7 @@ async function readD1(base: URL, path: string, params?: URLSearchParams): Promis
   if (params) upstream.search = params.toString();
   let response: Response;
   try {
-    response = await fetch(upstream, { cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' } });
+    response = await fetch(upstream, { cache: 'no-store', redirect: 'manual', headers: { Accept: 'application/json' } });
   } catch (error) {
     const failure = error instanceof Error
       ? `${error.name}:${error.message}`.replace(/https?:\/\/\S+/gi, '[url]').slice(0, 240)
@@ -113,7 +113,7 @@ async function writeD1Review(target: NonNullable<ReturnType<typeof d1ReviewTarge
   let response: Response;
   try {
     response = await fetch(upstream, {
-      method: 'PATCH', cache: 'no-store', redirect: 'error',
+      method: 'PATCH', cache: 'no-store', redirect: 'manual',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CS-Sync-Key': target.syncKey },
       body: JSON.stringify(body),
     });
@@ -136,7 +136,7 @@ async function writeD1Mutation(target: NonNullable<ReturnType<typeof d1ReviewTar
   const body = Object.fromEntries(Object.entries(request).filter(([key]) => !['action', 'template_id', 'library_entry_id'].includes(key)));
   let response: Response;
   try {
-    response = await fetch(upstream, { method, cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CS-Sync-Key': target.syncKey }, body: JSON.stringify(body) });
+    response = await fetch(upstream, { method, cache: 'no-store', redirect: 'manual', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CS-Sync-Key': target.syncKey }, body: JSON.stringify(body) });
   } catch { throw new D1ReadError('CS_D1_WRITE_CONNECTION_FAILED', 502); }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
