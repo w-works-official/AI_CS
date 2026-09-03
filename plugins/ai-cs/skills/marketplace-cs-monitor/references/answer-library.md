@@ -9,7 +9,7 @@ Read this reference whenever creating, refreshing, or using AI answer recommenda
 - The library contains masked, verified human question-answer examples only.
 - `01_CASES`, `02_MESSAGES`, and `03_AI_DRAFTS` remain the source-of-truth logs. Do not replace or rewrite them to refresh the library.
 
-Use Google Sheets metadata and bounded range reads. The canonical library range is `06_ANSWER_LIBRARY!A1:T3000`. Read the live header before every write and match `ANSWER_LIBRARY_HEADERS` from `scripts/answer-library-core.mjs` exactly.
+Use the development D1 answer-library endpoint with `quality_state=USE`. The local client maps only masked question/answer fields into the bounded generation contract and returns at most three examples.
 
 ## Eligible sources
 
@@ -42,7 +42,7 @@ Create one candidate for each contiguous customer turn followed by a contiguous 
 6. Preserve manually edited `enabled`, `quality_state`, `risk_level`, and `note` cells when the example ID already exists.
 7. Verify the final row count, exact header, PII status, dropdown values, frozen header, filter, and wrapping.
 
-The normal Apps Script sync contract owns `01_CASES` through `04_SYNC_RUNS`. The MCP tool `search_verified_answers` provides bounded, read-only access to eligible `06_ANSWER_LIBRARY` examples. Maintaining that library remains the one explicit exception: use the Google Sheets connector only after exact-header validation and only in the fixed environment's Sheet. Never use this exception to write collection tabs directly.
+The D1 sync contract owns cases, messages, drafts, runs, and answer-library candidates. `searchVerifiedAnswers` provides bounded, read-only access to eligible `USE` examples. Promotion to `USE` still requires an explicit human review through the review UI; collection never promotes a candidate automatically.
 
 Allowed review values:
 

@@ -2,23 +2,19 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_SYNC_CONFIG = fileURLToPath(
-  new URL("../config/sheet-target.json", import.meta.url),
-);
+export const DEFAULT_SYNC_CONFIG = fileURLToPath(new URL("../config/d1-target.json", import.meta.url));
 export const DEVELOPMENT_D1_API_URL = "https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs";
 
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
 const READ_ACTIONS = new Set(["health", "overview", "cases", "case", "caseBatch", "caseIndex", "answerLibrary"]);
-const READ_PARAMS = new Set(["case_key", "case_keys", "record_type", "market", "channel", "ui_type", "reply_state", "ai_draft_state", "limit", "cursor", "query", "intent"]);
+const READ_PARAMS = new Set(["case_key", "case_keys", "market", "channel", "ui_type", "reply_state", "ai_draft_state", "limit", "cursor", "query", "intent"]);
+const CASE_FILTER_PARAMS = new Set(["market", "channel", "ui_type", "reply_state", "ai_draft_state", "limit", "cursor"]);
 
 export function makeRunId(report) {
   const identity = [
     report?.collected_at ?? "",
     ...(report?.records ?? []).map((row) => `${row.source_key}:${row.content_hash}:${sha256([
-      row.ai_draft ?? "",
-      row.ai_draft_purpose ?? "",
-      row.ai_draft_required_checks ?? "",
-      row.ai_draft_pii_scan ?? "",
+      row.ai_draft ?? "", row.ai_draft_purpose ?? "", row.ai_draft_required_checks ?? "", row.ai_draft_pii_scan ?? "",
     ].join("|")).slice(0, 16)}`),
   ].join("|");
   return `SYNC_${sha256(identity).slice(0, 24)}`;
@@ -27,9 +23,7 @@ export function makeRunId(report) {
 export function validateSyncReport(report) {
   if (!report || Number(report.schema_version) !== 1) throw new Error("INVALID_REPORT_SCHEMA");
   if (!Array.isArray(report.records)) throw new Error("REPORT_RECORDS_REQUIRED");
-  if (Number(report.summary?.marketplace_write_actions ?? 0) !== 0) {
-    throw new Error("MARKETPLACE_WRITE_ACTIONS_NOT_ALLOWED");
-  }
+  if (Number(report.summary?.marketplace_write_actions ?? 0) !== 0) throw new Error("MARKETPLACE_WRITE_ACTIONS_NOT_ALLOWED");
   const keys = report.records.map((row) => row?.source_key);
   if (keys.some((key) => !key)) throw new Error("SOURCE_KEY_REQUIRED");
   if (new Set(keys).size !== keys.length) throw new Error("DUPLICATE_SOURCE_KEY");
@@ -42,184 +36,157 @@ export function validateSyncReport(report) {
     const openKeys = channel.open_queue_source_keys;
     if (!Array.isArray(openKeys)) throw new Error(`OPEN_QUEUE_SOURCE_KEYS_REQUIRED:${channelKey}`);
     if (new Set(openKeys).size !== openKeys.length) throw new Error(`OPEN_QUEUE_DUPLICATE_SOURCE_KEY:${channelKey}`);
-    if (openKeys.some((key) => !String(key).startsWith(`${channel.market}:`))) {
-      throw new Error(`OPEN_QUEUE_SOURCE_KEY_SCOPE_MISMATCH:${channelKey}`);
-    }
-    if (Number(channel.open_queue_visible_total ?? -1) !== openKeys.length) {
-      throw new Error(`OPEN_QUEUE_TOTAL_MISMATCH:${channelKey}`);
-    }
+    if (openKeys.some((key) => !String(key).startsWith(`${channel.market}:`))) throw new Error(`OPEN_QUEUE_SOURCE_KEY_SCOPE_MISMATCH:${channelKey}`);
+    if (Number(channel.open_queue_visible_total ?? -1) !== openKeys.length) throw new Error(`OPEN_QUEUE_TOTAL_MISMATCH:${channelKey}`);
   }
   return report;
 }
 
 export function buildSyncRequest(report, options = {}) {
   validateSyncReport(report);
-  if (options.environment !== "development" && options.environment !== "production") {
-    throw new Error("SYNC_ENVIRONMENT_NOT_CONFIGURED");
-  }
+  if (options.environment !== "development") throw new Error("DEVELOPMENT_D1_SYNC_REQUIRED");
   return {
-    action: "syncRun",
-    environment: options.environment,
-    run_id: options.runId ?? makeRunId(report),
-    report,
-    model: options.model ?? "Codex",
-    prompt_version: options.promptVersion ?? "marketplace-cs-monitor-v1",
-    api_key: options.apiKey ?? "",
+    run_id: options.runId ?? makeRunId(report), report, environment: "development", auto_send: false, marketplace_write_actions: 0,
   };
 }
 
-export async function loadSyncConfig({
-  configPath = DEFAULT_SYNC_CONFIG,
-  env = globalThis.process?.env ?? {},
-} = {}) {
+export async function loadSyncConfig({ configPath = DEFAULT_SYNC_CONFIG, env = globalThis.process?.env ?? {} } = {}) {
   let file = {};
-  try {
-    file = JSON.parse(await readFile(configPath, "utf8"));
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  const syncUrl = env.MARKETPLACE_CS_SYNC_URL;
-  const syncKey = env.MARKETPLACE_CS_SYNC_KEY;
-  const d1Url = env.MARKETPLACE_CS_D1_URL;
-  const d1Key = env.MARKETPLACE_CS_D1_SYNC_KEY;
-  const environment = env.MARKETPLACE_CS_SYNC_ENVIRONMENT;
+  try { file = JSON.parse(await readFile(configPath, "utf8")); }
+  catch (error) { if (error?.code !== "ENOENT") throw error; }
   return {
-    ...file,
-    web_app_url: syncUrl || file.web_app_url || "",
-    api_key: syncKey || "",
-    d1_api_url: d1Url || file.d1_api_url || "",
-    d1_sync_key: d1Key || "",
-    environment: environment || file.environment || "",
+    d1_api_url: env.MARKETPLACE_CS_D1_URL || file.d1_api_url || DEVELOPMENT_D1_API_URL,
+    d1_sync_key: env.MARKETPLACE_CS_D1_SYNC_KEY || "",
+    environment: env.MARKETPLACE_CS_SYNC_ENVIRONMENT || file.environment || "development",
   };
 }
 
-function developmentD1SyncUrl(value) {
+function developmentD1BaseUrl(value) {
   let url;
   try { url = new URL(value); } catch { throw new Error("MARKETPLACE_CS_D1_URL_INVALID"); }
   const expected = new URL(DEVELOPMENT_D1_API_URL);
   const path = url.pathname.replace(/\/$/, "");
-  if (url.protocol !== "https:" || url.username || url.password || url.origin !== expected.origin || (path !== expected.pathname && path !== `${expected.pathname}/sync`)) {
+  if (url.protocol !== "https:" || url.username || url.password || url.origin !== expected.origin || path !== expected.pathname) {
     throw new Error("MARKETPLACE_CS_D1_URL_INVALID");
   }
-  url.pathname = `${expected.pathname}/sync`;
+  url.pathname = expected.pathname;
   url.search = "";
   url.hash = "";
-  return url.toString();
+  return url;
 }
 
-export async function syncReportToD1(report, config, { fetchImpl = globalThis.fetch, ...options } = {}) {
+function assertSafeResponse(parsed) {
+  if (!parsed?.ok) throw new Error("D1_RESPONSE_NOT_OK");
+  if (parsed.environment !== "development" || parsed.auto_send !== false || Number(parsed.marketplace_write_actions ?? 0) !== 0) {
+    throw new Error("UNSAFE_D1_RESPONSE");
+  }
+  return parsed;
+}
+
+async function parseResponse(response, label) {
+  const raw = await response.text();
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { throw new Error(`${label}_RESPONSE_NOT_JSON:${response.status}`); }
+  if (!response.ok || !parsed.ok) throw new Error(`${label}_FAILED:${parsed.error || response.status}`);
+  return assertSafeResponse(parsed);
+}
+
+function makeReadUrl(action, params, config) {
+  const base = developmentD1BaseUrl(config?.d1_api_url);
+  const url = new URL(`${base.toString().replace(/\/$/, "")}/`);
+  if (action === "health" || action === "overview") url.pathname += action;
+  else if (action === "cases" || action === "caseIndex") {
+    url.pathname += "cases";
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (CASE_FILTER_PARAMS.has(key) && value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+    }
+  } else if (action === "case") url.pathname += `cases/${encodeURIComponent(String(params.case_key || ""))}`;
+  else if (action === "answerLibrary") {
+    url.pathname += "library";
+    url.searchParams.set("quality_state", "USE");
+  }
+  return url;
+}
+
+export async function syncReport(report, config, { fetchImpl = globalThis.fetch, ...options } = {}) {
   if (config?.environment !== "development") throw new Error("DEVELOPMENT_D1_SYNC_REQUIRED");
   if (!config?.d1_api_url) throw new Error("MARKETPLACE_CS_D1_URL_NOT_CONFIGURED");
   if (!config?.d1_sync_key) throw new Error("MARKETPLACE_CS_D1_SYNC_KEY_NOT_CONFIGURED");
   if (typeof fetchImpl !== "function") throw new Error("FETCH_NOT_AVAILABLE");
-  validateSyncReport(report);
-  const payload = {
-    run_id: options.runId ?? makeRunId(report),
-    report,
-    environment: "development",
-    auto_send: false,
-    marketplace_write_actions: 0,
-  };
-  const response = await fetchImpl(developmentD1SyncUrl(config.d1_api_url), {
+  const payload = buildSyncRequest(report, { ...options, environment: "development" });
+  const base = developmentD1BaseUrl(config.d1_api_url);
+  const response = await fetchImpl(`${base.toString().replace(/\/$/, "")}/sync`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CS-Sync-Key": config.d1_sync_key,
-    },
+    headers: { "Content-Type": "application/json", "X-CS-Sync-Key": config.d1_sync_key },
     body: JSON.stringify(payload),
     redirect: "error",
   });
-  const raw = await response.text();
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch { throw new Error(`D1_SYNC_RESPONSE_NOT_JSON:${response.status}`); }
-  if (!response.ok || !parsed.ok) throw new Error(`D1_SYNC_FAILED:${parsed.error || response.status}`);
-  if (parsed.environment !== "development" || parsed.auto_send !== false || Number(parsed.marketplace_write_actions ?? 0) !== 0) {
-    throw new Error("UNSAFE_D1_SYNC_RESPONSE");
-  }
-  return parsed;
+  return parseResponse(response, "D1_SYNC");
 }
 
-export async function syncReport(report, config, { fetchImpl = globalThis.fetch, ...options } = {}) {
-  if (!config?.web_app_url) throw new Error("MARKETPLACE_CS_SYNC_URL_NOT_CONFIGURED");
-  if (!config?.api_key) throw new Error("MARKETPLACE_CS_SYNC_KEY_NOT_CONFIGURED");
-  if (config?.environment !== "development" && config?.environment !== "production") {
-    throw new Error("MARKETPLACE_CS_SYNC_ENVIRONMENT_NOT_CONFIGURED");
-  }
-  if (typeof fetchImpl !== "function") throw new Error("FETCH_NOT_AVAILABLE");
+// Older callers can keep this import; it no longer performs a second/shadow write.
+export const syncReportToD1 = syncReport;
 
-  const payload = buildSyncRequest(report, { ...options, apiKey: config.api_key, environment: config.environment });
-  const response = await fetchImpl(config.web_app_url, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload),
-    redirect: "follow",
-  });
-  const body = await response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    throw new Error(`SYNC_RESPONSE_NOT_JSON:${response.status}`);
-  }
-  if (!response.ok || !parsed.ok) {
-    throw new Error(`SHEET_SYNC_FAILED:${parsed.error || response.status}`);
-  }
-  if (Number(parsed.marketplace_write_actions ?? 0) !== 0 || parsed.auto_send !== false) {
-    throw new Error("UNSAFE_SYNC_RESPONSE");
-  }
-  return parsed;
-}
-
-export async function readCsData(action, params, config, { fetchImpl = globalThis.fetch } = {}) {
+export async function readCsData(action, params = {}, config, { fetchImpl = globalThis.fetch } = {}) {
   if (!READ_ACTIONS.has(action)) throw new Error("CS_READ_ACTION_NOT_ALLOWED");
-  if (!config?.web_app_url) throw new Error("MARKETPLACE_CS_SYNC_URL_NOT_CONFIGURED");
-  if (!config?.api_key) throw new Error("MARKETPLACE_CS_SYNC_KEY_NOT_CONFIGURED");
-  if (config?.environment !== "development" && config?.environment !== "production") {
-    throw new Error("MARKETPLACE_CS_SYNC_ENVIRONMENT_NOT_CONFIGURED");
-  }
+  for (const key of Object.keys(params ?? {})) if (!READ_PARAMS.has(key)) throw new Error(`CS_READ_PARAM_NOT_ALLOWED:${key}`);
+  if (config?.environment !== "development") throw new Error("DEVELOPMENT_D1_READ_REQUIRED");
+  if (!config?.d1_api_url) throw new Error("MARKETPLACE_CS_D1_URL_NOT_CONFIGURED");
   if (typeof fetchImpl !== "function") throw new Error("FETCH_NOT_AVAILABLE");
-  const body = { action, environment: config.environment, api_key: config.api_key };
-  for (const [key, value] of Object.entries(params ?? {})) {
-    if (!READ_PARAMS.has(key)) throw new Error(`CS_READ_PARAM_NOT_ALLOWED:${key}`);
-    if (value !== undefined && value !== null && value !== "") body[key] = value;
+  if (action === "caseBatch") {
+    const keys = Array.isArray(params.case_keys) ? params.case_keys.slice(0, 50) : [];
+    const items = await Promise.all(keys.map((case_key) => readCsData("case", { case_key }, config, { fetchImpl })));
+    return { ok: true, items, environment: "development", auto_send: false, marketplace_write_actions: 0 };
   }
-  const response = await fetchImpl(config.web_app_url, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8", Accept: "application/json" },
-    body: JSON.stringify(body),
-    redirect: "follow",
-  });
-  const raw = await response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`CS_READ_RESPONSE_NOT_JSON:${response.status}`);
-  }
-  if (!response.ok || !parsed.ok) throw new Error(`CS_READ_FAILED:${parsed.error || response.status}`);
-  if (parsed.environment !== config.environment || parsed.auto_send !== false || Number(parsed.marketplace_write_actions ?? 0) !== 0) {
-    throw new Error("UNSAFE_READ_RESPONSE");
-  }
-  return parsed;
+  const response = await fetchImpl(makeReadUrl(action, params, config), { method: "GET", headers: { Accept: "application/json" }, redirect: "error" });
+  const parsed = await parseResponse(response, "D1_READ");
+  if (action !== "answerLibrary") return parsed;
+
+  const query = String(params.query || "").toLowerCase().split(/\s+/).filter((token) => token.length >= 2);
+  const market = String(params.market || "").toUpperCase();
+  const channel = String(params.channel || "");
+  const intent = String(params.intent || "");
+  const limit = Math.min(3, Math.max(1, Number(params.limit ?? 3) || 3));
+  const examples = (Array.isArray(parsed.items) ? parsed.items : []).map((item) => ({
+    ...item,
+    example_id: String(item.library_entry_id || ""),
+    customer_question: String(item.question_text_masked || ""),
+    human_answer: String(item.answer_text_masked || ""),
+    product_name: "",
+    required_checks: (() => { try { const value = JSON.parse(String(item.required_checks_json || "[]")); return Array.isArray(value) ? value.join(" · ") : ""; } catch { return ""; } })(),
+    enabled: true,
+    pii_scan: String(item.pii_scan || "PASS"),
+    last_verified_at: String(item.reviewed_at || item.updated_at || item.created_at || ""),
+  })).filter((item) => {
+    if (market && String(item.market || "").toUpperCase() !== market) return false;
+    if (channel && String(item.channel || "") !== channel) return false;
+    if (intent && String(item.intent || "") !== intent) return false;
+    if (!query.length) return true;
+    const haystack = `${item.customer_question} ${item.human_answer} ${item.intent}`.toLowerCase();
+    return query.some((token) => haystack.includes(token));
+  }).slice(0, limit);
+  return { ...parsed, examples };
 }
 
 export function searchVerifiedAnswers(params, config, options) {
   return readCsData("answerLibrary", { ...params, limit: Math.min(3, Number(params?.limit ?? 3) || 3) }, config, options);
 }
 
-export async function readCaseIndex(config, options) {
-  const result = await readCsData("caseIndex", {}, config, options);
-  const items = Array.isArray(result.items) ? result.items : [];
-  if (result.truncated === true || Number(result.total_available ?? items.length) > items.length) throw new Error("CASE_INDEX_TRUNCATED");
-  if (items.length > 5000) throw new Error("CASE_INDEX_TOO_LARGE");
-  const keys = items.map((item) => String(item?.source_key || ""));
+export async function readCaseIndex(config, { fetchImpl = globalThis.fetch } = {}) {
+  const items = [];
+  let cursor = 0;
+  do {
+    const result = await readCsData("cases", { limit: 100, cursor }, config, { fetchImpl });
+    const page = Array.isArray(result.items) ? result.items : [];
+    items.push(...page);
+    if (items.length > 5000) throw new Error("CASE_INDEX_TOO_LARGE");
+    cursor = result.next_cursor === null || result.next_cursor === undefined ? null : Number(result.next_cursor);
+  } while (cursor !== null);
+  const keys = items.map((item) => String(item?.case_key || item?.source_key || ""));
   if (keys.some((key) => !key)) throw new Error("CASE_INDEX_KEY_REQUIRED");
   if (new Set(keys).size !== keys.length) throw new Error("CASE_INDEX_DUPLICATE_KEY");
-  return items.map((item) => ({
-    source_key: String(item.source_key),
-    content_hash: String(item.content_hash || ""),
-    ai_draft_state: String(item.ai_draft_state || "NONE"),
-    reply_state: String(item.reply_state || ""),
-    last_seen_at: String(item.last_seen_at || ""),
+  return items.map((item, index) => ({
+    source_key: keys[index], content_hash: String(item.content_hash || ""), ai_draft_state: String(item.ai_draft_state || "NONE"),
+    reply_state: String(item.reply_state || ""), last_seen_at: String(item.last_seen_at || ""),
   }));
 }

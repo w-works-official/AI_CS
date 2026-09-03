@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { chromium } from "playwright";
 import { buildReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/report-core.mjs";
-import { loadSyncConfig, readCaseIndex, readCsData, syncReport, syncReportToD1 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.mjs";
+import { loadSyncConfig, readCaseIndex, readCsData, syncReport } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/sync-client.mjs";
 import {
   acquireCollectorLock,
   inspectGoogleChromeSession,
@@ -1040,7 +1040,7 @@ let previousRecords = [];
 let caseIndexStatus = "UNAVAILABLE";
 try {
   const candidateConfig = await loadSyncConfig();
-  if (candidateConfig.web_app_url && candidateConfig.api_key && candidateConfig.environment === "development") {
+  if (candidateConfig.d1_api_url && candidateConfig.environment === "development") {
     const health = await readCsData("health", {}, candidateConfig);
     if (health.environment !== "development" || health.auto_send !== false || Number(health.marketplace_write_actions || 0) !== 0) {
       throw new Error("UNSAFE_DEVELOPMENT_HEALTH");
@@ -1055,7 +1055,6 @@ try {
 const report = buildReport(rawCollection, previousRecords);
 report.summary.case_index_status = caseIndexStatus;
 let syncResult = { skipped: true, reason: "PREPARE_ONLY" };
-let d1SyncResult = { skipped: true, reason: "PREPARE_ONLY" };
 if (syncMode === "sync") {
   syncConfig = syncConfig || await loadSyncConfig();
   if (syncConfig.environment !== "development") throw new Error("DEVELOPMENT_SYNC_REQUIRED");
@@ -1067,11 +1066,6 @@ if (syncMode === "sync") {
     model: process.env.CS_AI_MODEL || "Codex",
     promptVersion: process.env.CS_PROMPT_VERSION || "marketplace-cs-monitor-v1",
   });
-  if (syncConfig.d1_api_url && syncConfig.d1_sync_key) {
-    d1SyncResult = await syncReportToD1(report, syncConfig, { runId: syncResult.run_id || undefined });
-  } else {
-    d1SyncResult = { skipped: true, reason: "D1_SHADOW_SYNC_NOT_CONFIGURED" };
-  }
 }
 
 let maskedOutput = "";
@@ -1082,7 +1076,7 @@ if (process.env.CS_KEEP_MASKED_OUTPUT === "1" || syncMode === "prepare") {
   await writeFile(outputUrl, JSON.stringify(report, null, 2), "utf8");
   maskedOutput = decodeURIComponent(outputUrl.pathname).replace(/^\/(?:([A-Za-z]:))/, "$1");
 }
-console.log(JSON.stringify({ browser_session: { source: browserSession.source, label: browserSession.session_label }, range, channels: [...requestedChannels], summary: report.summary, masked_output: maskedOutput, sync: syncResult, d1_sync: d1SyncResult }, null, 2));
+console.log(JSON.stringify({ browser_session: { source: browserSession.source, label: browserSession.session_label }, range, channels: [...requestedChannels], summary: report.summary, masked_output: maskedOutput, sync_target: "development_d1", sync: syncResult }, null, 2));
 } finally {
   await releaseCollectorLock();
 }

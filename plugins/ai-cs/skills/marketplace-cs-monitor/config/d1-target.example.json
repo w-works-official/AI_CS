@@ -1,0 +1,5 @@
+{
+  "transport": "cloudflare_d1_worker",
+  "environment": "development",
+  "d1_api_url": "https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs"
+}

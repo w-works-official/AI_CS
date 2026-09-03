@@ -33,7 +33,7 @@ npm run collect:cs
 
 For an explicitly selected remote-debuggable Google Chrome on the same PC, `SMARTSTORE_CDP_URL` may be set for that process. Only `http://127.0.0.1:<port>`, `http://localhost:<port>`, or the IPv6 loopback equivalent is accepted.
 
-`prepare` is the default and performs no Apps Script or Sheet write. It may use the read-only development case index to classify records. The masked report is written below the macro project's `output/` directory and its path is returned as `masked_output`.
+`prepare` is the default and performs no D1 write. It may use the read-only development D1 case index to classify records. The masked report is written below the macro project's `output/` directory and its path is returned as `masked_output`.
 
 `collect_and_reconcile` is the normal collection mode. It still collects only the requested date range for ordinary detail work, but it also carries hashed source keys from a count-matched current unanswered view when the marketplace exposes one. It never changes marketplace state.
 
@@ -49,10 +49,10 @@ Standard output contains only the range, selected channel names, masked summary,
 
 ## Development sync preflight
 
-The collector does not need Apps Script secrets in `prepare` mode. Before later synchronization, load these existing Windows user variables without displaying them:
+The collector does not need a write secret in `prepare` mode. Before later synchronization, load these existing Windows user variables without displaying them:
 
-- `MARKETPLACE_CS_SYNC_URL`
-- `MARKETPLACE_CS_SYNC_KEY`
+- `MARKETPLACE_CS_D1_URL` (optional; omission uses the fixed approved development URL)
+- `MARKETPLACE_CS_D1_SYNC_KEY`
 - `MARKETPLACE_CS_SYNC_ENVIRONMENT=development`
 
-The URL and key must be the same existing development Apps Script target already used by the development system. Never create or rotate them during a collection run. Health must pass before `syncReport()` is called.
+The URL and key must be the existing development D1 Worker target. Apps Script URL/key variables are ignored by the collector. Never create or rotate secrets during a collection run. D1 health must pass before the single `syncReport()` call.

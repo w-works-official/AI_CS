@@ -89,7 +89,7 @@ test("actual migrations accept repository sync, detail, overview, and cursor que
       latest_sync: { run_id: "SYNC:case-1", status: "COMPLETED", started_at: "2026-09-01T09:59:00.000Z", finished_at: time, collected_count: 1, new_count: 1, changed_count: 0, unchanged_count: 0, draft_created_count: 1, pii_rejected_count: 0, error_count: 0 },
     });
     const list = await store.listCases({ limit: 1, cursor: 0, filters: { market: "SMARTSTORE", ai_draft_state: "READY" } });
-    assert.equal(list.items[0].case_key, caseRow.case_key); assert.equal(list.next_cursor, null);
+    assert.equal(list.items[0].case_key, caseRow.case_key); assert.equal(list.items[0].content_hash, caseRow.content_hash); assert.equal(list.next_cursor, null);
     const detail = await store.getCase(caseRow.case_key);
     assert.equal(detail?.messages.length, 2); assert.equal(detail?.attachments.length, 0); assert.equal(detail?.drafts.length, 1); assert.equal(detail?.decisions.length, 1);
     assert.equal(detail?.decisions[0].required_checks_json, '["송장 확인"]');

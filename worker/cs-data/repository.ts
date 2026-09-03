@@ -63,7 +63,7 @@ export class CsDataRepository {
     const { clause, values } = this.caseFilterClause(input.filters ?? {});
     const rows = (await this.db.prepare(`SELECT c.case_key, c.market, c.channel, c.ui_type, c.occurred_at, c.customer_masked,
       c.subject_masked, c.preview_masked, c.product_id, c.product_name_masked, c.source_url, c.source_url_kind,
-      c.product_url, c.product_thumbnail_url, c.reply_state, c.last_seen_at,
+      c.product_url, c.product_thumbnail_url, c.reply_state, c.content_hash, c.last_seen_at,
       COALESCE((SELECT d.state FROM ai_drafts d WHERE d.case_key = c.case_key ORDER BY d.created_at DESC, d.draft_id DESC LIMIT 1), 'NONE') AS ai_draft_state
       FROM cs_cases c WHERE 1 = 1${clause} ORDER BY c.last_seen_at DESC, c.case_key DESC LIMIT ? OFFSET ?`).bind(...values, limit + 1, cursor).all<CaseListItem>()).results;
     return { items: rows.slice(0, limit), cursor, next_cursor: rows.length > limit ? cursor + limit : null };

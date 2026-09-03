@@ -10,7 +10,7 @@ The heartbeat must run in this existing local task and project, reuse the regist
 
 ## Suggested prompt
 
-> `marketplace-cs-monitor` 스킬로 등록된 CS Chrome을 재사용하여 오늘 신규·변경 문의를 수집해. `collect_and_reconcile`과 prepare 모드로 수집·마스킹한 뒤, development case index와 비교하고, `NEEDS_REPLY` 문의에는 검증 답변을 최대 3개 검색해 AI 추천답변을 생성·PII 검사해. 답변이 있는 문의는 운영 상태를 바꾸지 말고 EVAL 초안을 만들지 마. health 안전조건을 확인한 후 development 대상에 한 번만 동기화하고, 쇼핑몰 쓰기 0건과 채널별 실패를 보고해. 인증 화면, CAPTCHA, 2단계 인증, 계정 확인, 불완전 open snapshot에서는 중단하거나 해당 채널의 완료 재조정을 건너뛰어.`
+> `marketplace-cs-monitor` 스킬로 등록된 CS Chrome을 재사용하여 오늘 신규·변경 문의를 수집해. `collect_and_reconcile`과 prepare 모드로 수집·마스킹한 뒤, development D1 case index와 비교하고, `NEEDS_REPLY` 문의에는 D1의 검증 답변을 최대 3개 검색해 AI 추천답변을 생성·PII 검사해. 답변이 있는 문의는 운영 상태를 바꾸지 말고 EVAL 초안을 만들지 마. D1 health 안전조건을 확인한 후 development D1에 한 번만 동기화하고, 쇼핑몰 쓰기 0건과 채널별 실패를 보고해. 인증 화면, CAPTCHA, 2단계 인증, 계정 확인, 불완전 open snapshot에서는 중단하거나 해당 채널의 완료 재조정을 건너뛰어.`
 
 ## Scheduling guardrails
 
