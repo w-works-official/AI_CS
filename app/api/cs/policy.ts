@@ -1,6 +1,7 @@
 const ALLOWED_REVIEW_STATES = new Set(["APPROVED", "REJECTED"]);
 const ALLOWED_COMPOSITION_SOURCE_TYPES = new Set(["AI_DRAFT", "REPLY_TEMPLATE", "ANSWER_LIBRARY_ENTRY", "MANUAL"]);
 const ALLOWED_REVIEW_KEYS = new Set([
+  "action",
   "draft_id", "draft_state", "review_note", "human_revision",
   "composition_source_type", "composition_source_id", "composition_source_version",
   "base_text_hash", "final_text_hash", "unresolved_variables", "source_content_hash",
@@ -118,6 +119,7 @@ export function normalizeReviewRequest(input: unknown) {
   for (const key of Object.keys(raw)) {
     if (!ALLOWED_REVIEW_KEYS.has(key)) throw new Error(`REVIEW_PARAM_NOT_ALLOWED:${key}`);
   }
+  if (raw.action !== undefined && raw.action !== "reviewDraft") throw new Error("UNKNOWN_WRITE_ACTION");
   const draftId = safeText(raw.draft_id, 300);
   const draftState = safeText(raw.draft_state, 20).toUpperCase();
   const reviewNote = safeText(raw.review_note, 1000);

@@ -102,6 +102,7 @@ test('POST forwards the complete normalized review to the Apps Script D1 relay',
   };
   try {
     const response = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      action: 'reviewDraft',
       draft_id: 'DRAFT:test', draft_state: 'REJECTED', review_note: '', human_revision: '',
       composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1',
       base_text_hash: 'a'.repeat(64), final_text_hash: 'b'.repeat(64), unresolved_variables: [], source_content_hash: 'c'.repeat(64),

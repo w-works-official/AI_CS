@@ -12,6 +12,7 @@ test("case batch accepts one to three distinct safe case keys", () => {
 
 test("development review request allows only bounded review fields", () => {
   assert.deepEqual(normalizeReviewRequest({
+    action: "reviewDraft",
     draft_id: "DRAFT:test",
     draft_state: "APPROVED",
     review_note: "사람 검수 완료",
@@ -46,6 +47,7 @@ test("development review request allows only bounded review fields", () => {
 });
 
 test("review request rejects unsafe fields and unmasked PII", () => {
+  assert.throws(() => normalizeReviewRequest({ action: "deleteDraft", draft_id: "DRAFT:test", draft_state: "REJECTED" }), /UNKNOWN_WRITE_ACTION/);
   assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "USED", human_revision: "ok" }), /INVALID_DRAFT_STATE/);
   assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "010-1234-5678" }), /UNMASKED_PHONE/);
   assert.throws(() => normalizeReviewRequest({ draft_id: "DRAFT:test", draft_state: "APPROVED", human_revision: "ok", api_key: "no" }), /REVIEW_PARAM_NOT_ALLOWED/);
