@@ -13,12 +13,17 @@ import {
   normalizeChatMessage,
   normalizeFlexibleDate,
   parseTalktalkTotalText,
+  stripKnownActorPrefix,
 } from "./collector-ui-core.mjs";
 
 assert.equal(parseTalktalkTotalText("전체 64"), 64);
 assert.equal(parseTalktalkTotalText("전체 (1,234건)"), 1234);
 assert.equal(parseTalktalkTotalText("전체 문의 7개"), 7);
 assert.equal(parseTalktalkTotalText("전체 메뉴"), null);
+assert.equal(stripKnownActorPrefix("홍길동요 제품은 하나 가격이죠?", "홍길동"), "요 제품은 하나 가격이죠?");
+assert.equal(stripKnownActorPrefix("홍길동 : 배송은 언제 오나요?", "홍길동"), "배송은 언제 오나요?");
+assert.equal(stripKnownActorPrefix("배송은 언제 오나요?", "홍길동"), "배송은 언제 오나요?");
+assert.equal(stripKnownActorPrefix("고*** 배송은 언제 오나요?", "고***"), "고*** 배송은 언제 오나요?");
 
 assert.equal(normalizeFlexibleDate("2026.08.25 15:29:28", "2026-09-01"), "2026-08-25");
 assert.equal(normalizeFlexibleDate("2026/9/1 오전 10:20", "2026-09-01"), "2026-09-01");

@@ -177,6 +177,20 @@ function maskSensitiveText(value) {
     .replace(/(?:[가-힣]{2,}(?:특별시|광역시|특별자치시|도|시)\s+)?[가-힣]{1,}(?:시|군|구)\s+[가-힣0-9·.-]{1,}(?:대로|로|길)\s*\d+(?:-\d+)?(?:\s+[가-힣A-Za-z0-9·()_-]{1,40})?/g, "[주소 마스킹]");
 }
 
+const GENERIC_CUSTOMER_LABELS = new Set(["고객", "고객님", "구매자", "판매자", "상담원", "관리자", "핑크로켓"]);
+
+function knownCustomerIdentity(value) {
+  const identity = compact(value);
+  if (!identity || identity.includes("*") || identity.length < 2 || identity.length > 80 || GENERIC_CUSTOMER_LABELS.has(identity)) return "";
+  return identity;
+}
+
+function maskKnownCustomerIdentity(value, customerIdentity) {
+  const text = maskSensitiveText(value);
+  const identity = knownCustomerIdentity(customerIdentity);
+  return identity && text.includes(identity) ? text.split(identity).join(maskName(identity)) : text;
+}
+
 export function inspectUnmaskedPii(value) {
   const text = compact(value);
   const issues = [];
@@ -222,7 +236,7 @@ function inferReplyState(status, lastActor, lastMessage) {
   return "REVIEW";
 }
 
-function normalizeMessage(message) {
+function normalizeMessage(message, customerIdentity = "") {
   const actor = compact(message?.direction ?? message?.actor).toLowerCase();
   const rawImages = Array.isArray(message?.images) ? message.images.slice(0, 20) : [];
   const images = rawImages.map((image, index) => {
@@ -233,7 +247,7 @@ function normalizeMessage(message) {
       ordinal: index + 1,
       url: assetUrl,
       thumbnail_url: thumbnailUrl,
-      alt_text: maskSensitiveText(raw.alt_text ?? raw.alt ?? ""),
+      alt_text: maskKnownCustomerIdentity(raw.alt_text ?? raw.alt ?? "", customerIdentity),
       media_type: "IMAGE",
       access_state: assetUrl || thumbnailUrl ? "PUBLIC_URL" : "SESSION_REQUIRED",
     };
@@ -245,7 +259,7 @@ function normalizeMessage(message) {
     direction: ["customer", "seller", "automatic", "system"].includes(actor) ? actor : "unknown",
     direction_confidence: compact(message?.direction_confidence).toUpperCase(),
     at: compact(message?.at ?? message?.time),
-    text: maskSensitiveText(message?.text),
+    text: maskKnownCustomerIdentity(message?.text, customerIdentity),
     image_count: Math.max(Number(message?.image_count ?? 0) || 0, images.length),
     images,
   };
@@ -266,10 +280,10 @@ function normalizeConversationState(raw, messages) {
   };
 }
 
-function normalizeReply(reply) {
+function normalizeReply(reply, customerIdentity = "") {
   return {
     at: compact(reply?.at ?? reply?.replied_at),
-    text: maskSensitiveText(reply?.text ?? reply?.body),
+    text: maskKnownCustomerIdentity(reply?.text ?? reply?.body, customerIdentity),
   };
 }
 
@@ -277,7 +291,9 @@ function normalizeRecord(market, channel, raw) {
   const sourceId = rawSourceId(market, channel, raw);
   if (!sourceId) throw new Error(`Missing stable source id for ${market}/${channel}`);
 
-  const messages = (raw.messages ?? []).map(normalizeMessage);
+  const customer = raw.customer_name ?? raw.customer ?? raw.customer_id ?? raw.customer_id_masked ?? "";
+  const customerIdentity = knownCustomerIdentity(customer);
+  const messages = (raw.messages ?? []).map((message) => normalizeMessage(message, customerIdentity));
   if (!messages.length && Array.isArray(raw.images) && raw.images.length) {
     messages.push(normalizeMessage({
       source_message_id: "post-body",
@@ -287,10 +303,10 @@ function normalizeRecord(market, channel, raw) {
       text: raw.body ?? raw.preview ?? raw.subject,
       image_count: raw.images.length,
       images: raw.images,
-    }));
+    }, customerIdentity));
   }
-  const sellerReplies = (raw.seller_replies ?? raw.replies ?? []).map(normalizeReply);
-  if (raw.seller_reply) sellerReplies.push({ at: compact(raw.processed_at), text: maskSensitiveText(raw.seller_reply) });
+  const sellerReplies = (raw.seller_replies ?? raw.replies ?? []).map((reply) => normalizeReply(reply, customerIdentity));
+  if (raw.seller_reply) sellerReplies.push({ at: compact(raw.processed_at), text: maskKnownCustomerIdentity(raw.seller_reply, customerIdentity) });
 
   const conversation = normalizeConversationState(raw, messages);
   const lastMessage = conversation.last_message;
@@ -298,13 +314,12 @@ function normalizeRecord(market, channel, raw) {
   const lastActor = ["customer", "seller"].includes(requestedLastActor)
     ? requestedLastActor
     : (conversation.last_actor !== "unknown" ? conversation.last_actor : (sellerReplies.length ? "seller" : "unknown"));
-  const customer = raw.customer_name ?? raw.customer ?? raw.customer_id ?? raw.customer_id_masked ?? "";
   const inferredReplyState = market === "ably" && /완료|종료/.test(compact(raw.status))
     ? (lastActor === "seller" ? "ANSWERED" : "NO_REPLY")
     : inferReplyState(raw.status, lastActor, lastMessage?.text ?? raw.last_message ?? "");
   const isChat = channel === "talktalk" || channel === "inquiry" || compact(raw.ui_type ?? raw.conversation_type).toUpperCase() === "CHAT";
   const replyState = isChat && conversation.complete !== true ? "REVIEW" : inferredReplyState;
-  const aiDraft = maskSensitiveText(raw.ai_draft);
+  const aiDraft = maskKnownCustomerIdentity(raw.ai_draft, customerIdentity);
   const requestedDraftPurpose = compact(raw.ai_draft_purpose).toUpperCase();
   const aiDraftPurpose = aiDraft
     ? (requestedDraftPurpose || (replyState === "NEEDS_REPLY" ? "REPLY" : ""))
@@ -325,16 +340,16 @@ function normalizeRecord(market, channel, raw) {
     channel,
     source_key: sourceKeyForRaw(market, channel, raw),
     occurred_at: compact(raw.occurred_at ?? raw.created_at ?? raw.received_at ?? raw.updated_at ?? raw.message_date),
-    status: compact(raw.status),
-    category: compact(raw.category ?? raw.tag ?? raw.type),
-    customer_masked: /\*/.test(String(customer)) ? compact(customer) : (String(customer).includes(" ") ? maskName(customer) : maskId(customer)),
-    subject: maskSensitiveText(raw.subject ?? raw.title ?? raw.body),
-    preview: maskSensitiveText(raw.preview ?? raw.body),
+    status: maskKnownCustomerIdentity(raw.status, customerIdentity),
+    category: maskKnownCustomerIdentity(raw.category ?? raw.tag ?? raw.type, customerIdentity),
+    customer_masked: /\*/.test(String(customer)) ? compact(customer) : (/^[가-힣]{2,4}$/.test(compact(customer)) ? maskName(customer) : maskId(customer)),
+    subject: maskKnownCustomerIdentity(raw.subject ?? raw.title ?? raw.body, customerIdentity),
+    preview: maskKnownCustomerIdentity(raw.preview ?? raw.body, customerIdentity),
     product_id: compact(raw.product_id),
-    product_name: maskSensitiveText(raw.product_name ?? raw.product),
+    product_name: maskKnownCustomerIdentity(raw.product_name ?? raw.product, customerIdentity),
     source_url: sourceUrl,
     source_url_kind: normalizeSourceUrlKind(raw.source_url_kind, sourceUrl),
-    source_reference: maskSensitiveText(raw.source_reference_masked),
+    source_reference: maskKnownCustomerIdentity(raw.source_reference_masked, customerIdentity),
     product_url: productUrl,
     product_thumbnail_url: productThumbnailUrl,
     order_no_masked: maskLongNumber(raw.order_no ?? raw.order_id),
@@ -350,10 +365,13 @@ function normalizeRecord(market, channel, raw) {
     ai_draft: draftAllowed ? aiDraft : "",
     ai_draft_origin: draftAllowed && aiDraft ? "AI" : "",
     ai_draft_purpose: draftAllowed && aiDraft ? aiDraftPurpose : "",
-    ai_draft_required_checks: draftAllowed && aiDraft ? maskSensitiveText(raw.ai_draft_required_checks) : "",
+    ai_draft_required_checks: draftAllowed && aiDraft ? maskKnownCustomerIdentity(raw.ai_draft_required_checks, customerIdentity) : "",
     ai_draft_pii_scan: draftAllowed && aiDraft && raw.ai_draft_pii_scan === "PASS" ? "PASS" : "REVIEW",
     pii_scan: "PASS",
   };
+  if (customerIdentity && JSON.stringify(masked).includes(customerIdentity)) {
+    throw new Error("KNOWN_CUSTOMER_IDENTITY_UNMASKED");
+  }
   masked.content_hash = contentHashForRecord(masked);
   return masked;
 }
@@ -547,4 +565,4 @@ export function applyDraftDecisions(report, decisions = []) {
   return next;
 }
 
-export { CHANNEL_KEYS, maskSensitiveText, normalizeMarketplaceUrl, normalizeRecord, sourceKeyForRaw };
+export { CHANNEL_KEYS, maskKnownCustomerIdentity, maskSensitiveText, normalizeMarketplaceUrl, normalizeRecord, sourceKeyForRaw };

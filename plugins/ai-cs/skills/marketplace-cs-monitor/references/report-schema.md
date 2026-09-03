@@ -55,6 +55,8 @@ Required fields:
 - `draft_decisions[]`: one audit row per record with `source_key`, `source_content_hash`, `purpose=REPLY|EVAL`, `decision=GENERATE|SKIP`, stable `reason_code`, and bounded `required_checks[]`; non-reply states use `REPLY/SKIP` unless they are answered-case evaluations
 - `pii_scan`: `PASS` or `REVIEW`
 
+When a collector exposes a separate raw `customer_name`, treat that value as known PII evidence. Remove an exact leading TalkTalk list label before normalization, mask exact occurrences in every persisted text field, and reject the normalized record if the unmasked value remains anywhere. Do not use a broad Korean-name regex because ordinary inquiry words can resemble names.
+
 `source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time, run duration, link fields, all AI-draft fields, and decision diagnostics. Draft generation, skip classification, or review must never create a false inquiry-content change.
 Chat completeness failure and conversational message direction are inquiry-content evidence. Collector-only metadata such as redundant actor labels, sequence numbers, confidence labels, and a verified-complete marker do not churn legacy hashes. An incomplete record includes the failure in `content_hash`, so a later complete collection is still detected as a change. A chat with `conversation_complete=false` is `REVIEW` and cannot receive a draft.
 Link fields are excluded from `content_hash`, so a harmless route or filter change does not turn an otherwise unchanged inquiry into `CHANGED`. Reject non-HTTPS URLs, non-marketplace hosts, embedded credentials, authentication-like query keys or fragments, and query values containing an unmasked phone or email before writing the masked report.

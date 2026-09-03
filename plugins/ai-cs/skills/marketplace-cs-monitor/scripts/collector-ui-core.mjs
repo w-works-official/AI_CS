@@ -214,6 +214,18 @@ export function filterChatMessages(messages = []) {
   });
 }
 
+/**
+ * TalkTalk list rows can expose the visible customer label as the first text
+ * node inside the message preview. Remove only the exact known leading label;
+ * arbitrary Korean text is never guessed to be a person's name.
+ */
+export function stripKnownActorPrefix(value, knownActorName) {
+  const text = compact(value);
+  const name = compact(knownActorName);
+  if (!text || !name || name.includes("*") || name.length < 2 || !text.startsWith(name)) return text;
+  return compact(text.slice(name.length).replace(/^[\s:：·|>\-]+/, ""));
+}
+
 export function parseTalktalkTotalText(value) {
   const text = compact(value);
   const match = text.match(/^전체(?:\s*문의)?\s*(?:\(|\[)?\s*([\d,]+)\s*(?:건|개)?\s*(?:\)|\])?$/);

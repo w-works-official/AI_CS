@@ -17,6 +17,7 @@ import {
   normalizeChatConversation,
   normalizeFlexibleDate,
   parseTalktalkTotalText,
+  stripKnownActorPrefix,
 } from "../../plugins/ai-cs/skills/marketplace-cs-monitor/scripts/collector-ui-core.mjs";
 
 const OUTPUT_DIR = new URL("../../output/", import.meta.url);
@@ -632,7 +633,10 @@ async function collectTalktalk(context, range) {
       product_url: productLink?.href ?? "",
     };
   }));
-  const listRows = [...new Map(listRowsRaw.filter((row) => row.thread_id).map((row) => [row.thread_id, row])).values()];
+  const listRows = [...new Map(listRowsRaw.filter((row) => row.thread_id).map((row) => [row.thread_id, {
+    ...row,
+    preview: stripKnownActorPrefix(row.preview, row.customer_name),
+  }])).values()];
 
   const records = [];
   for (const meta of listRows.filter((row) => normalizeDateLabel(row.time_label, range.end) >= range.start)) {

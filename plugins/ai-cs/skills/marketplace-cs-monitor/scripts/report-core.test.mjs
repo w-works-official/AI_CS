@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { applyAiDrafts, applyDraftDecisions, buildReport, inspectUnmaskedPii, maskSensitiveText, normalizeMarketplaceUrl } from "./report-core.mjs";
+import { applyAiDrafts, applyDraftDecisions, buildReport, inspectUnmaskedPii, maskKnownCustomerIdentity, maskSensitiveText, normalizeMarketplaceUrl } from "./report-core.mjs";
 import { selectDraftCandidates } from "./ai-draft-core.mjs";
 import { isCustomerAcknowledgement } from "./conversation-policy.mjs";
 
@@ -44,6 +44,7 @@ assert.deepEqual(inspectUnmaskedPii("우리 1002-123-456789 입금"), ["ACCOUNT"
 assert.deepEqual(inspectUnmaskedPii(maskSensitiveText("우리 1002-123-456789 입금")), []);
 assert.equal(maskSensitiveText("부산시 동구 중앙대로197 부산역온누리약국"), "[주소 마스킹]");
 assert.deepEqual(inspectUnmaskedPii("부산시 동구 중앙대로197 부산역온누리약국"), ["ADDRESS"]);
+assert.equal(maskKnownCustomerIdentity("홍길동 배송 문의입니다", "홍길동"), "홍** 배송 문의입니다");
 assert.equal(first.records.find((row) => row.market === "ably").reply_state, "NO_REPLY");
 assert.equal(first.records.find((row) => row.market === "zigzag").reply_state, "NEEDS_REPLY");
 assert.equal(first.summary.reconciled_channel_count, 1);
@@ -131,6 +132,23 @@ assert.match(linkedRecord.source_url, /^https:\/\/talk\.naver\.com\/ct\/thread-1
 assert.equal(linkedRecord.source_reference, "TT-0b6d54a12345");
 assert.equal(linkedRecord.product_name, "샘플 피어싱");
 assert.equal(linkedRecord.messages[0].image_count, 1);
+
+const talktalkNameLeakInput = structuredClone(linkedTalktalkInput);
+talktalkNameLeakInput.channels.smartstore_talktalk.records[0] = {
+  ...talktalkNameLeakInput.channels.smartstore_talktalk.records[0],
+  customer_name: "홍길동",
+  preview: "홍길동요 제품은 하나 가격이죠?",
+  messages: [
+    { direction: "seller", text: "홍길동 고객님, 확인했습니다." },
+    { direction: "customer", text: "요 제품은 하나 가격이죠?" },
+  ],
+};
+const talktalkNameLeakRecord = buildReport(talktalkNameLeakInput, []).records.find((row) => row.channel === "talktalk");
+assert.equal(talktalkNameLeakRecord.preview, "홍**요 제품은 하나 가격이죠?");
+assert.equal(talktalkNameLeakRecord.messages[0].text, "홍** 고객님, 확인했습니다.");
+assert.equal(talktalkNameLeakRecord.customer_masked, "홍**");
+assert.equal(JSON.stringify(talktalkNameLeakRecord).includes("홍길동"), false);
+assert.equal(talktalkNameLeakRecord.pii_scan, "PASS");
 
 const imageInput = structuredClone(base);
 imageInput.range = { start: "2026-09-03", end: "2026-09-03" };
