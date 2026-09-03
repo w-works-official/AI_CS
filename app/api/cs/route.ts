@@ -91,7 +91,13 @@ async function readD1(base: URL, path: string, params?: URLSearchParams): Promis
   let response: Response;
   try {
     response = await fetch(upstream, { cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' } });
-  } catch { throw new D1ReadError('CS_D1_CONNECTION_FAILED', 502); }
+  } catch (error) {
+    const failure = error instanceof Error
+      ? `${error.name}:${error.message}`.replace(/https?:\/\/\S+/gi, '[url]').slice(0, 240)
+      : 'unknown';
+    console.error('CS_D1_FETCH_FAILED', failure);
+    throw new D1ReadError('CS_D1_CONNECTION_FAILED', 502);
+  }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const code = payload && typeof payload === 'object' && !Array.isArray(payload) ? String((payload as D1Payload).error ?? `D1_HTTP_${response.status}`) : `D1_HTTP_${response.status}`;
