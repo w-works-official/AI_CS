@@ -40,6 +40,7 @@ Required fields:
 - `messages[]`, `seller_replies[]`
 - `messages[].actor`: normalized `CUSTOMER`, `SELLER`, `AUTOMATIC`, `SYSTEM`, or `UNKNOWN`; keep lowercase `direction` for compatibility
 - `messages[].sequence`: stable observed conversation order within the collected detail
+- `messages[].image_count`, `messages[].images[]`: bounded attachment metadata. Each image contains `ordinal`, allowlisted HTTPS `url`/`thumbnail_url` when safe, masked `alt_text`, `media_type=IMAGE`, and `access_state=PUBLIC_URL|SESSION_REQUIRED|UNAVAILABLE`. Never store image bytes, cookies, tokens, or signed session URLs.
 - `last_actor`: `customer`, `seller`, `automatic`, or `unknown`
 - `last_actor_confidence`: collector evidence such as `CLASS_VERIFIED` when available
 - `conversation_complete`: explicit Boolean for chat collectors, or `null` for legacy/post records without a history-loading step
@@ -57,6 +58,7 @@ Required fields:
 `source_key` uses the stable marketplace ID when available. `content_hash` excludes collection time, run duration, link fields, all AI-draft fields, and decision diagnostics. Draft generation, skip classification, or review must never create a false inquiry-content change.
 Chat completeness failure and conversational message direction are inquiry-content evidence. Collector-only metadata such as redundant actor labels, sequence numbers, confidence labels, and a verified-complete marker do not churn legacy hashes. An incomplete record includes the failure in `content_hash`, so a later complete collection is still detected as a change. A chat with `conversation_complete=false` is `REVIEW` and cannot receive a draft.
 Link fields are excluded from `content_hash`, so a harmless route or filter change does not turn an otherwise unchanged inquiry into `CHANGED`. Reject non-HTTPS URLs, non-marketplace hosts, embedded credentials, authentication-like query keys or fragments, and query values containing an unmasked phone or email before writing the masked report.
+Image URLs are also excluded from `content_hash` because CDN resize and expiry parameters can change independently of the inquiry. `image_count` remains material, so adding or removing an attachment is still detected.
 
 ## Channel report
 

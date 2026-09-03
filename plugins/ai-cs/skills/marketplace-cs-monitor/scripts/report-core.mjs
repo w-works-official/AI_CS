@@ -14,6 +14,12 @@ const CHANNEL_KEYS = [
 const compact = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
 const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
 const MARKETPLACE_HOST_SUFFIXES = ["naver.com", "kakaostyle.com", "a-bly.com"];
+const MARKETPLACE_ASSET_HOST_SUFFIXES = [
+  ...MARKETPLACE_HOST_SUFFIXES,
+  "pstatic.net",
+  "kakaocdn.net",
+  "daumcdn.net",
+];
 const SENSITIVE_URL_KEY_PARTS = ["token", "secret", "session", "cookie", "auth", "authorization", "password", "passwd", "credential", "signature", "jwt", "apikey", "accesskey", "refreshtoken"];
 const isSensitiveUrlKey = (key) => {
   const normalized = String(key ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -60,6 +66,24 @@ function normalizeMarketplaceUrl(value) {
   return parsed.toString();
 }
 
+function normalizeMarketplaceAssetUrl(value) {
+  const text = compact(value);
+  if (!text) return "";
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) return "";
+    const host = parsed.hostname.toLowerCase();
+    if (!MARKETPLACE_ASSET_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return "";
+    for (const [key, item] of parsed.searchParams) {
+      if (isSensitiveUrlKey(key)) return "";
+      if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(item) || /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(item)) return "";
+    }
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
 function normalizeSourceUrlKind(value, sourceUrl) {
   const requested = compact(value).toUpperCase();
   const kind = requested || (sourceUrl ? "LIST" : "UNAVAILABLE");
@@ -78,6 +102,9 @@ function contentHashForRecord(record) {
     delete normalized.actor;
     delete normalized.sequence;
     delete normalized.direction_confidence;
+    // Image URLs can expire or be resized without changing the inquiry itself.
+    // image_count remains in the hash while view-only attachment metadata does not.
+    delete normalized.images;
     return normalized;
   });
   if (material.conversation_complete !== false) delete material.conversation_complete;
@@ -144,6 +171,7 @@ function maskSensitiveText(value) {
     .replace(/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/g, "010-****-****")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "**@***")
     .replace(/((?:상품\s*)?주문번호\s*[:：]?\s*)\d{6,}/gi, "$1[마스킹]")
+    .replace(/((?:계좌|은행|국민|신한|우리|하나|농협|기업|카카오뱅크|토스뱅크|SC|씨티)\s*[:：]?\s*)\d{2,6}(?:[- ]\d{2,8}){2}/gi, "$1[계좌 마스킹]")
     .replace(/\b\d{12,}\b/g, (number) => maskLongNumber(number))
     .replace(/(주소\s*[:：]?)[^,;]+/gi, "$1 [주소 마스킹]");
 }
@@ -154,7 +182,7 @@ export function inspectUnmaskedPii(value) {
   if (/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/.test(text)) issues.push("PHONE");
   if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(text)) issues.push("EMAIL");
   if (/\b\d{12,}\b/.test(text)) issues.push("LONG_NUMBER");
-  if (/(?:계좌|은행)\s*[:：]?\s*[0-9-]{6,}/.test(text)) issues.push("ACCOUNT");
+  if (/(?:계좌|은행|국민|신한|우리|하나|농협|기업|카카오뱅크|토스뱅크|SC|씨티)\s*[:：]?\s*\d{2,6}(?:[- ]\d{2,8}){2}/i.test(text)) issues.push("ACCOUNT");
   if (/(?:상품\s*)?(?:주문번호|송장번호|운송장)\s*[:：]?\s*\d{6,}/i.test(text)) issues.push("ORDER_OR_TRACKING");
   if (/(?:주소|배송지)\s*[:：]\s*[^,;]{5,}/i.test(text)) issues.push("ADDRESS");
   return [...new Set(issues)];
@@ -194,6 +222,20 @@ function inferReplyState(status, lastActor, lastMessage) {
 
 function normalizeMessage(message) {
   const actor = compact(message?.direction ?? message?.actor).toLowerCase();
+  const rawImages = Array.isArray(message?.images) ? message.images.slice(0, 20) : [];
+  const images = rawImages.map((image, index) => {
+    const raw = image && typeof image === "object" ? image : {};
+    const assetUrl = normalizeMarketplaceAssetUrl(raw.url ?? raw.src);
+    const thumbnailUrl = normalizeMarketplaceAssetUrl(raw.thumbnail_url ?? raw.thumbnail ?? raw.url ?? raw.src);
+    return {
+      ordinal: index + 1,
+      url: assetUrl,
+      thumbnail_url: thumbnailUrl,
+      alt_text: maskSensitiveText(raw.alt_text ?? raw.alt ?? ""),
+      media_type: "IMAGE",
+      access_state: assetUrl || thumbnailUrl ? "PUBLIC_URL" : "SESSION_REQUIRED",
+    };
+  });
   return {
     source_message_id: compact(message?.source_message_id),
     sequence: Number.isFinite(Number(message?.sequence)) ? Number(message.sequence) : null,
@@ -202,7 +244,8 @@ function normalizeMessage(message) {
     direction_confidence: compact(message?.direction_confidence).toUpperCase(),
     at: compact(message?.at ?? message?.time),
     text: maskSensitiveText(message?.text),
-    image_count: Number(message?.image_count ?? 0) || 0,
+    image_count: Math.max(Number(message?.image_count ?? 0) || 0, images.length),
+    images,
   };
 }
 
@@ -233,6 +276,17 @@ function normalizeRecord(market, channel, raw) {
   if (!sourceId) throw new Error(`Missing stable source id for ${market}/${channel}`);
 
   const messages = (raw.messages ?? []).map(normalizeMessage);
+  if (!messages.length && Array.isArray(raw.images) && raw.images.length) {
+    messages.push(normalizeMessage({
+      source_message_id: "post-body",
+      sequence: 1,
+      direction: "customer",
+      at: raw.occurred_at ?? raw.created_at ?? raw.received_at ?? raw.updated_at,
+      text: raw.body ?? raw.preview ?? raw.subject,
+      image_count: raw.images.length,
+      images: raw.images,
+    }));
+  }
   const sellerReplies = (raw.seller_replies ?? raw.replies ?? []).map(normalizeReply);
   if (raw.seller_reply) sellerReplies.push({ at: compact(raw.processed_at), text: maskSensitiveText(raw.seller_reply) });
 
@@ -263,7 +317,7 @@ function normalizeRecord(market, channel, raw) {
   }
   const sourceUrl = normalizeMarketplaceUrl(raw.source_url);
   const productUrl = normalizeMarketplaceUrl(raw.product_url);
-  const productThumbnailUrl = normalizeMarketplaceUrl(raw.product_thumbnail_url);
+  const productThumbnailUrl = normalizeMarketplaceAssetUrl(raw.product_thumbnail_url);
   const masked = {
     market,
     channel,

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server.js';
-import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeReviewRequest, normalizeSyncRequest } from './policy.ts';
+import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeLibraryReviewRequest, normalizeReviewRequest, normalizeSyncRequest, normalizeTemplateRequest, normalizeTemplateStateRequest } from './policy.ts';
 
 export const dynamic = 'force-dynamic';
 
@@ -39,9 +39,8 @@ function d1Target() {
 function d1ReviewTarget() {
   if (process.env.AI_CS_WEB_ENVIRONMENT === 'production') return null;
   if (process.env.AI_CS_ENABLE_D1_REVIEW !== 'true') return null;
-  // Sites cannot call a public workers.dev Worker server-to-server. Keep this
-  // opt-in for non-Sites runtimes; Sites falls back to its existing Apps Script
-  // review path without exposing a credential to the browser.
+  // All D1 review/template/library mutations remain server-side and require an
+  // explicit development-only opt-in plus the Worker sync credential.
   const syncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
   if (!syncKey) return null;
   try {
@@ -52,6 +51,8 @@ function d1ReviewTarget() {
     throw new D1ReadError('CS_D1_REVIEW_TARGET_INVALID', 502);
   }
 }
+
+type D1WriteRequest = ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeTemplateRequest> | ReturnType<typeof normalizeTemplateStateRequest> | ReturnType<typeof normalizeLibraryReviewRequest>;
 
 function appsScriptWriteBody(writeRequest: ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeSyncRequest>) {
   if (writeRequest.action !== 'reviewDraft') return writeRequest;
@@ -118,6 +119,26 @@ async function writeD1Review(target: NonNullable<ReturnType<typeof d1ReviewTarge
       body: JSON.stringify(body),
     });
   } catch { throw new D1ReadError('CS_D1_REVIEW_CONNECTION_FAILED', 502); }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const code = payload && typeof payload === 'object' && !Array.isArray(payload) ? String((payload as D1Payload).error ?? `D1_HTTP_${response.status}`) : `D1_HTTP_${response.status}`;
+    throw new D1ReadError(code, response.status >= 400 && response.status < 500 ? response.status : 502);
+  }
+  return d1Safety(payload);
+}
+
+async function writeD1Mutation(target: NonNullable<ReturnType<typeof d1ReviewTarget>>, request: D1WriteRequest): Promise<D1Payload> {
+  const upstream = new URL(target.endpoint);
+  let method = 'PATCH';
+  if (request.action === 'reviewDraft') upstream.pathname = `${target.endpoint.pathname.replace(/\/$/, '')}/drafts/${encodeURIComponent(request.draft_id)}/review`;
+  else if (request.action === 'upsertTemplate') { upstream.pathname = `${target.endpoint.pathname.replace(/\/$/, '')}/templates`; method = 'POST'; }
+  else if (request.action === 'setTemplateState') upstream.pathname = `${target.endpoint.pathname.replace(/\/$/, '')}/templates/${encodeURIComponent(request.template_id)}`;
+  else upstream.pathname = `${target.endpoint.pathname.replace(/\/$/, '')}/library/${encodeURIComponent(request.library_entry_id)}`;
+  const body = Object.fromEntries(Object.entries(request).filter(([key]) => !['action', 'template_id', 'library_entry_id'].includes(key)));
+  let response: Response;
+  try {
+    response = await fetch(upstream, { method, cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CS-Sync-Key': target.syncKey }, body: JSON.stringify(body) });
+  } catch { throw new D1ReadError('CS_D1_WRITE_CONNECTION_FAILED', 502); }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const code = payload && typeof payload === 'object' && !Array.isArray(payload) ? String((payload as D1Payload).error ?? `D1_HTTP_${response.status}`) : `D1_HTTP_${response.status}`;
@@ -272,25 +293,31 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  let writeRequest: ReturnType<typeof normalizeReviewRequest> | ReturnType<typeof normalizeSyncRequest>;
+  let writeRequest: D1WriteRequest | ReturnType<typeof normalizeSyncRequest>;
   try {
     const raw = await request.json() as Record<string, unknown>;
-    writeRequest = raw?.action === 'syncRun' ? normalizeSyncRequest(raw) : normalizeReviewRequest(raw);
+    writeRequest = raw?.action === 'syncRun' ? normalizeSyncRequest(raw)
+      : raw?.action === 'upsertTemplate' ? normalizeTemplateRequest(raw)
+        : raw?.action === 'setTemplateState' ? normalizeTemplateStateRequest(raw)
+          : raw?.action === 'reviewLibraryEntry' ? normalizeLibraryReviewRequest(raw)
+            : normalizeReviewRequest(raw);
   } catch (error) {
     return privateJson({ ok: false, error: error instanceof Error ? error.message : 'INVALID_WRITE_REQUEST', environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 400);
   }
 
   let workerTarget: ReturnType<typeof d1ReviewTarget> = null;
   try {
-    if (writeRequest.action === 'reviewDraft') workerTarget = d1ReviewTarget();
+    if (writeRequest.action !== 'syncRun') workerTarget = d1ReviewTarget();
   } catch (error) {
     const code = error instanceof D1ReadError ? error.code : 'CS_D1_REVIEW_TARGET_INVALID';
     return privateJson({ ok: false, error: code, environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 502);
   }
 
-  if (workerTarget && writeRequest.action === 'reviewDraft') {
+  if (workerTarget && writeRequest.action !== 'syncRun') {
     try {
-      const payload = await writeD1Review(workerTarget, writeRequest);
+      const payload = writeRequest.action === 'reviewDraft'
+        ? await writeD1Review(workerTarget, writeRequest)
+        : await writeD1Mutation(workerTarget, writeRequest);
       responseCache.clear();
       return privateJson({ ...payload, environment: 'development', auto_send: false, marketplace_write_actions: 0 });
     } catch (error) {
@@ -298,6 +325,10 @@ export async function POST(request: NextRequest) {
       const code = error instanceof D1ReadError ? error.code : 'CS_D1_REVIEW_CONNECTION_FAILED';
       return privateJson({ ok: false, error: code, environment: 'development', auto_send: false, marketplace_write_actions: 0 }, status);
     }
+  }
+
+  if (writeRequest.action !== 'reviewDraft' && writeRequest.action !== 'syncRun') {
+    return privateJson({ ok: false, error: 'CS_D1_WRITE_NOT_CONFIGURED', environment: 'development', auto_send: false, marketplace_write_actions: 0 }, 403);
   }
 
   let target: ReturnType<typeof appsScriptTarget>;

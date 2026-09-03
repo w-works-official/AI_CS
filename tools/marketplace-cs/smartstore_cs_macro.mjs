@@ -142,6 +142,7 @@ function maskSensitiveText(value) {
     .replace(/\b01[016789][-. ]?\d{3,4}[-. ]?\d{4}\b/g, "010-****-****")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "**@***")
     .replace(/((?:상품\s*)?주문번호\s*[:：]?\s*)\d{6,}/gi, "$1[마스킹]")
+    .replace(/((?:계좌|은행|국민|신한|우리|하나|농협|기업|카카오뱅크|토스뱅크|SC|씨티)\s*[:：]?\s*)\d{2,6}(?:[- ]\d{2,8}){2}/gi, "$1[계좌 마스킹]")
     .replace(/\b\d{12,}\b/g, (number) => maskLongNumber(number))
     .replace(/(주소\s*[:：]?)[^,;]+/gi, "$1 [주소 마스킹]");
 }
@@ -200,6 +201,11 @@ async function collectComments(context, range) {
 
       const record = await card.evaluate((el) => {
         const q = (selector) => el.querySelector(selector);
+        const imageAssets = (root) => [...(root?.querySelectorAll("img") ?? [])].map((image) => ({
+          src: image.currentSrc || image.src || image.getAttribute("src") || "",
+          thumbnail_url: image.currentSrc || image.src || image.getAttribute("src") || "",
+          alt_text: (image.getAttribute("alt") || "").replace(/\s+/g, " ").trim(),
+        })).filter((image) => image.src && !image.src.startsWith("data:") && !image.src.startsWith("blob:"));
         const part = q(".partition-area")?.innerText ?? "";
         const date = part.match(/(20\d{2}\.\d{2}\.\d{2}\s+\d{2}:\d{2})(?:\s+\(([^)]+)\))?/);
         return {
@@ -212,6 +218,7 @@ async function collectComments(context, range) {
           created_at: date?.[1] ?? "",
           updated_note: date?.[2] ?? "",
           body: q(".text-area")?.innerText?.trim() ?? "",
+          images: imageAssets(q(".text-area")),
           reply_count: Number(q(".btn-area .count")?.innerText ?? 0),
           replies: [...el.querySelectorAll(".seller-reply-list > li")].map((li) => ({
             replied_at: li.querySelector(".info-date")?.innerText?.trim() ?? "",
@@ -286,6 +293,11 @@ async function collectCustomerQna(context, range) {
       await page.waitForTimeout(220);
       const detail = await frame.getByRole("table", { name: "고객문의 내용 보기", exact: true }).evaluate((table) => {
         const result = {};
+        const imageAssets = (root) => [...(root?.querySelectorAll("img") ?? [])].map((image) => ({
+          src: image.currentSrc || image.src || image.getAttribute("src") || "",
+          thumbnail_url: image.currentSrc || image.src || image.getAttribute("src") || "",
+          alt_text: (image.getAttribute("alt") || "").replace(/\s+/g, " ").trim(),
+        })).filter((image) => image.src && !image.src.startsWith("data:") && !image.src.startsWith("blob:"));
         for (const tr of table.querySelectorAll("tr")) {
           const children = [...tr.children];
           for (let i = 0; i < children.length; i += 1) {
@@ -294,6 +306,7 @@ async function collectCustomerQna(context, range) {
               const valueCell = children[i + 1];
               result[label] = valueCell?.innerText?.trim() ?? "";
               if (/상품명/.test(label)) result.__product_url = valueCell?.querySelector("a[href]")?.href ?? "";
+              if (/문의내용/.test(label)) result.__images = imageAssets(valueCell);
             }
           }
         }
@@ -318,6 +331,7 @@ async function collectCustomerQna(context, range) {
         customer_name: detail["질문자"] || "", customer_id_masked: detail["질문자ID"] || "",
         processed_at: compact(cells[8]), satisfaction: compact(cells[9]),
         product_order_no: detail["상품주문번호"] || "", body: detail["문의내용"] || "", seller_reply: sellerReply,
+        messages: [{ direction: "customer", at: compact(cells[0]), text: detail["문의내용"] || compact(cells[4]), image_count: detail.__images?.length || 0, images: detail.__images || [] }],
       });
     }
     const next = frame.getByRole("link", { name: "다음 ›", exact: true });
@@ -493,6 +507,11 @@ async function loadTalktalkHistory(frame, page) {
 
 async function extractTalktalkMessages(frame) {
   const messages = await frame.locator(".balloon_item._message").evaluateAll((items) => items.map((item, index) => {
+    const imageAssets = (root) => [...root.querySelectorAll("img")].map((image) => ({
+      src: image.currentSrc || image.src || image.getAttribute("src") || "",
+      thumbnail_url: image.currentSrc || image.src || image.getAttribute("src") || "",
+      alt_text: (image.getAttribute("alt") || "").replace(/\s+/g, " ").trim(),
+    })).filter((image) => image.src && !image.src.startsWith("data:") && !image.src.startsWith("blob:"));
     const area = item.querySelector(".balloon_area") ?? item;
     const styleNode = area.matches("[data-balloon-style]") ? area : area.querySelector("[data-balloon-style]");
     const text = (
@@ -503,6 +522,7 @@ async function extractTalktalkMessages(frame) {
       ?? ""
     ).replace(/\s+/g, " ").trim();
     const imageCount = area.querySelectorAll("img").length;
+    const images = imageAssets(area);
     const sourceMessageId = [...item.classList].find((className) => /^_msgId\d+$/.test(className)) ?? "";
     return {
       source_message_id: sourceMessageId,
@@ -513,6 +533,7 @@ async function extractTalktalkMessages(frame) {
       text: text || (imageCount ? "첨부 이미지" : ""),
       time: item.querySelector(".status_time")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
       image_count: imageCount,
+      images,
     };
   }));
   return filterChatMessages(messages);
@@ -826,14 +847,21 @@ async function collectAbly(context, range) {
         const chatFrame = frame.locator('iframe[class*="InquiryChat__Iframe"]').first().contentFrame();
         await chatFrame.locator("body").waitFor({ state: "visible", timeout: 10_000 });
         const extractedMessages = await chatFrame.locator("p.typography__body1.color__black, p.typography__body1.color__white").evaluateAll((items) => items.map((el) => {
+          const imageAssets = (root) => [...root.querySelectorAll("img")].map((image) => ({
+            src: image.currentSrc || image.src || image.getAttribute("src") || "",
+            thumbnail_url: image.currentSrc || image.src || image.getAttribute("src") || "",
+            alt_text: (image.getAttribute("alt") || "").replace(/\s+/g, " ").trim(),
+          })).filter((image) => image.src && !image.src.startsWith("data:") && !image.src.startsWith("blob:"));
           let root = el.parentElement;
           let time = "";
           let imageCount = 0;
+          let images = [];
           for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
             const timeNode = root.querySelector("p.typography__body5.color__content_tertiary");
             if (timeNode) {
               time = (timeNode.textContent ?? "").replace(/\s+/g, " ").trim();
               imageCount = root.querySelectorAll("img").length;
+              images = imageAssets(root);
               break;
             }
           }
@@ -842,6 +870,7 @@ async function collectAbly(context, range) {
             text: (el.textContent ?? "").replace(/\s+/g, " ").trim(),
             at: time,
             image_count: imageCount,
+            images,
           };
         }));
         const messages = filterChatMessages(extractedMessages);

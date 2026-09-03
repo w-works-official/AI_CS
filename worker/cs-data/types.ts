@@ -38,6 +38,11 @@ export type CsCaseInput = {
 };
 /** message_key is supplied by the collector; it is never synthesized by this layer. */
 export type CsMessageInput = { message_key: string; case_key: string; sequence: number; actor: Actor; text_masked: string; sent_at: string; has_image: boolean; image_count: number; content_hash: string };
+export type CsAttachmentInput = {
+  attachment_key: string; message_key: string; case_key: string; ordinal: number;
+  asset_url: string; thumbnail_url: string; alt_text_masked: string; media_type: "IMAGE";
+  access_state: "PUBLIC_URL" | "SESSION_REQUIRED" | "UNAVAILABLE";
+};
 /** EVAL identifies the actual seller message; it never stores seller text in ai_drafts. */
 export type DraftInput = {
   draft_id: string; case_key: string; purpose: DraftPurpose; state?: DraftState;
@@ -48,7 +53,7 @@ export type DraftInput = {
 export type DraftDecisionInput = { decision_id: string; run_id: string; case_key: string; purpose: DraftDecisionPurpose; source_content_hash: string; decision: "GENERATE" | "SKIP"; reason_code: string; required_checks: string[]; draft_id: string | null; created_at: string };
 export type SyncRunInput = {
   run_id: string; environment?: "local" | "development"; mode?: "READ_ONLY"; started_at: string; finished_at: string | null;
-  pii_rejected_count?: number; error_count?: number; cases: CsCaseInput[]; messages: CsMessageInput[]; drafts: DraftInput[]; decisions?: DraftDecisionInput[];
+  pii_rejected_count?: number; error_count?: number; cases: CsCaseInput[]; messages: CsMessageInput[]; attachments?: CsAttachmentInput[]; drafts: DraftInput[]; decisions?: DraftDecisionInput[];
   case_summaries?: CaseSummaryInput[]; answer_library_entries?: AnswerLibraryEntryInput[]; no_reply_patterns?: NoReplyPatternInput[];
 };
 export type CaseFilters = Partial<Pick<CsCaseInput, "market" | "channel" | "ui_type" | "reply_state">> & { ai_draft_state?: DraftState | "NONE" };
@@ -76,6 +81,7 @@ export type ReplyTemplateInput = {
   market?: string | null; channel?: string | null; intent?: string | null; required_checks: string[]; quality_state?: QualityState; created_at: string;
 };
 export type LibraryEntryReviewInput = { library_entry_id: string; quality_state: "USE" | "EXCLUDE"; review_note_masked: string; reviewer_ref: string; reviewed_at: string };
+export type TemplateStateInput = { template_id: string; quality_state: "USE" | "EXCLUDE"; updated_at: string };
 export type HealthResult = { ok: true; service: "ai-cs-d1-repository"; schema_version: "v1"; write_policy: "MASKED_DTO_ONLY" };
 export type LatestSyncResult = { run_id: string; status: string; started_at: string; finished_at: string | null; collected_count: number; new_count: number; changed_count: number; unchanged_count: number; draft_created_count: number; pii_rejected_count: number; error_count: number } | null;
 export type OverviewResult = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; closed: number; by_market: Record<string, number>; latest_sync: LatestSyncResult };
@@ -87,6 +93,6 @@ export type CaseListItem = {
   reply_state: ReplyState; ai_draft_state: string; last_seen_at: string;
 };
 export type CursorListResult = { items: CaseListItem[]; cursor: number; next_cursor: number | null };
-export type CaseDetailResult = { case: Record<string, unknown>; summary?: Record<string, unknown> | null; messages: Record<string, unknown>[]; drafts: Record<string, unknown>[]; decisions: Record<string, unknown>[]; review_events: Record<string, unknown>[] };
-export type SyncRunResult = { run_id: string; duplicate_run: boolean; inserted_cases: number; updated_cases: number; inserted_messages: number; inserted_drafts: number };
+export type CaseDetailResult = { case: Record<string, unknown>; summary?: Record<string, unknown> | null; messages: Record<string, unknown>[]; attachments: Record<string, unknown>[]; drafts: Record<string, unknown>[]; decisions: Record<string, unknown>[]; review_events: Record<string, unknown>[]; learning_candidates: Record<string, unknown>[] };
+export type SyncRunResult = { run_id: string; duplicate_run: boolean; inserted_cases: number; updated_cases: number; inserted_messages: number; inserted_attachments: number; inserted_drafts: number };
 export type DraftReviewResult = { draft_id: string; case_key: string; draft_state: "APPROVED" | "REJECTED" | "REVISED"; reviewed_at: string; reply_state_changed: false; human_revision_saved: boolean };

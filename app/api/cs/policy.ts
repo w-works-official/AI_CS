@@ -7,6 +7,9 @@ const ALLOWED_REVIEW_KEYS = new Set([
   "environment", "auto_send", "marketplace_write_actions",
 ]);
 const ALLOWED_SYNC_KEYS = new Set(["action", "run_id", "report", "model", "prompt_version"]);
+const ALLOWED_TEMPLATE_KEYS = new Set(["action", "template_key", "template_version", "template_name", "template_text", "market", "channel", "intent", "required_checks", "quality_state", "environment", "auto_send", "marketplace_write_actions"]);
+const ALLOWED_TEMPLATE_STATE_KEYS = new Set(["action", "template_id", "quality_state", "environment", "auto_send", "marketplace_write_actions"]);
+const ALLOWED_LIBRARY_REVIEW_KEYS = new Set(["action", "library_entry_id", "quality_state", "review_note", "environment", "auto_send", "marketplace_write_actions"]);
 const ALLOWED_REPORT_KEYS = new Set(["schema_version", "mode", "range", "collected_at", "duration_ms", "summary", "channels", "records"]);
 const ALLOWED_RECORD_KEYS = new Set([
   "market", "channel", "source_key", "occurred_at", "status", "category", "customer_masked",
@@ -15,13 +18,15 @@ const ALLOWED_RECORD_KEYS = new Set([
   "messages", "seller_replies", "last_actor", "reply_state", "ai_draft", "ai_draft_origin",
   "ai_draft_purpose", "ai_draft_required_checks", "ai_draft_pii_scan", "pii_scan", "content_hash", "change_state",
 ]);
-const ALLOWED_MESSAGE_KEYS = new Set(["source_message_id", "direction", "actor", "at", "text", "image_count"]);
+const ALLOWED_MESSAGE_KEYS = new Set(["source_message_id", "direction", "actor", "at", "text", "image_count", "images"]);
+const ALLOWED_IMAGE_KEYS = new Set(["ordinal", "url", "src", "thumbnail_url", "thumbnail", "alt_text", "alt", "media_type", "access_state"]);
 
 function safeText(value: unknown, maxLength: number): string {
   return String(value ?? "").trim().slice(0, maxLength);
 }
 
 const ALLOWED_MARKETPLACE_SUFFIXES = ["naver.com", "kakaostyle.com", "a-bly.com"];
+const ALLOWED_ASSET_SUFFIXES = [...ALLOWED_MARKETPLACE_SUFFIXES, "pstatic.net", "kakaocdn.net", "daumcdn.net"];
 const SENSITIVE_URL_PARTS = ["token", "secret", "session", "cookie", "auth", "authorization", "password", "passwd", "credential", "signature", "jwt", "apikey", "accesskey", "refreshtoken"];
 function isSensitiveUrlKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -45,6 +50,18 @@ function safeMarketplaceUrl(value: unknown): string {
   inspectParams(url.searchParams);
   const hashQuery = decodeURIComponent(url.hash || "");
   if (hashQuery.includes("?")) inspectParams(new URLSearchParams(hashQuery.slice(hashQuery.indexOf("?") + 1)));
+  return url.toString();
+}
+
+function safeAssetUrl(value: unknown): string {
+  const textValue = safeText(value, 3000);
+  if (!textValue) return "";
+  let url: URL;
+  try { url = new URL(textValue); } catch { return ""; }
+  if (url.protocol !== "https:" || url.username || url.password) return "";
+  const host = url.hostname.toLowerCase();
+  if (!ALLOWED_ASSET_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return "";
+  for (const key of url.searchParams.keys()) if (isSensitiveUrlKey(key)) return "";
   return url.toString();
 }
 
@@ -143,6 +160,63 @@ export function normalizeReviewRequest(input: unknown) {
   };
 }
 
+function assertDevelopmentMutation(raw: Record<string, unknown>): void {
+  const environment = raw.environment === undefined ? "development" : safeText(raw.environment, 30);
+  const autoSend = raw.auto_send === undefined ? false : raw.auto_send;
+  const marketplaceWrites = raw.marketplace_write_actions === undefined ? 0 : raw.marketplace_write_actions;
+  if (environment !== "development" || autoSend !== false || Number(marketplaceWrites) !== 0) throw new Error("DEVELOPMENT_SAFETY_REQUIRED");
+}
+
+function normalizedQualityState(value: unknown, allowCandidate = true): "CANDIDATE" | "USE" | "EXCLUDE" {
+  const state = safeText(value, 20).toUpperCase() || (allowCandidate ? "USE" : "");
+  const allowed = allowCandidate ? ["CANDIDATE", "USE", "EXCLUDE"] : ["USE", "EXCLUDE"];
+  if (!allowed.includes(state)) throw new Error("INVALID_QUALITY_STATE");
+  return state as "CANDIDATE" | "USE" | "EXCLUDE";
+}
+
+export function normalizeTemplateRequest(input: unknown) {
+  const raw = plainObject(input, "INVALID_TEMPLATE_REQUEST");
+  assertOnlyKeys(raw, ALLOWED_TEMPLATE_KEYS, "TEMPLATE_PARAM_NOT_ALLOWED");
+  if (raw.action !== "upsertTemplate") throw new Error("UNKNOWN_WRITE_ACTION");
+  assertDevelopmentMutation(raw);
+  const templateKey = optionalMaskedText(raw.template_key, 200, "TEMPLATE_KEY_TOO_LONG");
+  const version = optionalMaskedText(raw.template_version, 100, "TEMPLATE_VERSION_TOO_LONG");
+  const name = optionalMaskedText(raw.template_name, 500, "TEMPLATE_NAME_TOO_LONG");
+  const body = optionalMaskedText(raw.template_text, 20_000, "TEMPLATE_TEXT_TOO_LONG");
+  if (!templateKey || !version || !name || !body) throw new Error("TEMPLATE_REQUIRED_FIELD_MISSING");
+  const checks = Array.isArray(raw.required_checks) ? raw.required_checks.map((item) => optionalMaskedText(item, 500, "TEMPLATE_CHECK_TOO_LONG")) : [];
+  if (checks.length > 20) throw new Error("INVALID_REQUIRED_CHECKS");
+  return {
+    action: "upsertTemplate" as const, template_key: templateKey, template_version: version,
+    template_name: name, template_text: body,
+    market: optionalMaskedText(raw.market, 50, "TEMPLATE_MARKET_TOO_LONG"),
+    channel: optionalMaskedText(raw.channel, 100, "TEMPLATE_CHANNEL_TOO_LONG"),
+    intent: optionalMaskedText(raw.intent, 100, "TEMPLATE_INTENT_TOO_LONG"),
+    required_checks: checks, quality_state: normalizedQualityState(raw.quality_state),
+    environment: "development" as const, auto_send: false as const, marketplace_write_actions: 0 as const,
+  };
+}
+
+export function normalizeTemplateStateRequest(input: unknown) {
+  const raw = plainObject(input, "INVALID_TEMPLATE_STATE_REQUEST");
+  assertOnlyKeys(raw, ALLOWED_TEMPLATE_STATE_KEYS, "TEMPLATE_STATE_PARAM_NOT_ALLOWED");
+  if (raw.action !== "setTemplateState") throw new Error("UNKNOWN_WRITE_ACTION");
+  assertDevelopmentMutation(raw);
+  const templateId = optionalMaskedText(raw.template_id, 300, "TEMPLATE_ID_TOO_LONG");
+  if (!templateId || !/^[A-Za-z0-9:_-]+$/.test(templateId)) throw new Error("INVALID_TEMPLATE_ID");
+  return { action: "setTemplateState" as const, template_id: templateId, quality_state: normalizedQualityState(raw.quality_state, false) as "USE" | "EXCLUDE", environment: "development" as const, auto_send: false as const, marketplace_write_actions: 0 as const };
+}
+
+export function normalizeLibraryReviewRequest(input: unknown) {
+  const raw = plainObject(input, "INVALID_LIBRARY_REVIEW_REQUEST");
+  assertOnlyKeys(raw, ALLOWED_LIBRARY_REVIEW_KEYS, "LIBRARY_REVIEW_PARAM_NOT_ALLOWED");
+  if (raw.action !== "reviewLibraryEntry") throw new Error("UNKNOWN_WRITE_ACTION");
+  assertDevelopmentMutation(raw);
+  const entryId = optionalMaskedText(raw.library_entry_id, 300, "LIBRARY_ENTRY_ID_TOO_LONG");
+  if (!entryId || !/^[A-Za-z0-9:_-]+$/.test(entryId)) throw new Error("INVALID_LIBRARY_ENTRY_ID");
+  return { action: "reviewLibraryEntry" as const, library_entry_id: entryId, quality_state: normalizedQualityState(raw.quality_state, false) as "USE" | "EXCLUDE", review_note: optionalMaskedText(raw.review_note, 1_000, "REVIEW_NOTE_TOO_LONG"), environment: "development" as const, auto_send: false as const, marketplace_write_actions: 0 as const };
+}
+
 function plainObject(value: unknown, error: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(error);
   return value as Record<string, unknown>;
@@ -159,13 +233,23 @@ function normalizedMessage(value: unknown): Record<string, unknown> {
   assertOnlyKeys(raw, ALLOWED_MESSAGE_KEYS, "MESSAGE_PARAM_NOT_ALLOWED");
   const text = safeText(raw.text, 8000);
   assertMaskedReviewText(text);
+  const images = Array.isArray(raw.images) ? raw.images.slice(0, 20).map((value, index) => {
+    const image = plainObject(value, "INVALID_MESSAGE_IMAGE");
+    assertOnlyKeys(image, ALLOWED_IMAGE_KEYS, "MESSAGE_IMAGE_PARAM_NOT_ALLOWED");
+    const assetUrl = safeAssetUrl(image.url ?? image.src);
+    const thumbnailUrl = safeAssetUrl(image.thumbnail_url ?? image.thumbnail ?? image.url ?? image.src);
+    const accessState = assetUrl || thumbnailUrl ? "PUBLIC_URL" : safeText(image.access_state, 30).toUpperCase() === "UNAVAILABLE" ? "UNAVAILABLE" : "SESSION_REQUIRED";
+    const altText = optionalMaskedText(image.alt_text ?? image.alt, 500, "MESSAGE_IMAGE_ALT_TOO_LONG");
+    return { ordinal: index + 1, url: assetUrl, thumbnail_url: thumbnailUrl, alt_text: altText, media_type: "IMAGE", access_state: accessState };
+  }) : [];
   return {
     ...(raw.source_message_id !== undefined ? { source_message_id: safeText(raw.source_message_id, 300) } : {}),
     ...(raw.direction !== undefined ? { direction: safeText(raw.direction, 20) } : {}),
     ...(raw.actor !== undefined ? { actor: safeText(raw.actor, 20) } : {}),
     at: safeText(raw.at, 50),
     text,
-    image_count: Math.max(0, Math.min(Number(raw.image_count) || 0, 100)),
+    image_count: Math.max(images.length, Math.max(0, Math.min(Number(raw.image_count) || 0, 100))),
+    images,
   };
 }
 

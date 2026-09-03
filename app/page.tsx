@@ -1,4 +1,5 @@
 'use client';
+/* eslint-disable @next/next/no-img-element -- marketplace CDN images are transient and must not be proxied or persisted */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -11,12 +12,15 @@ declare global {
 
 type CaseStatus = 'unanswered' | 'ai-ready' | 'review' | 'no-reply' | 'replied' | 'closed';
 type RawRow = Record<string, unknown>;
-type Message = { actor: 'customer' | 'seller'; time: string; text: string; image?: boolean };
+type Attachment = { id: string; url: string; thumbnailUrl: string; alt: string; accessState: 'PUBLIC_URL' | 'SESSION_REQUIRED' | 'UNAVAILABLE' };
+type Message = { id: string; actor: 'customer' | 'seller'; time: string; text: string; image?: boolean; attachments: Attachment[] };
 type SourceUrlKind = 'EXACT' | 'LIST' | 'UNAVAILABLE';
 type SourceGuide = { url: string; reference: string; product: string };
 type CompositionSourceType = 'AI_DRAFT' | 'REPLY_TEMPLATE' | 'ANSWER_LIBRARY_ENTRY' | 'MANUAL';
 type CompositionSource = { composition_source_type: CompositionSourceType; composition_source_id: string; composition_source_version: string };
 type CompositionOption = { id: string; title: string; text: string; version: string; variables: string[]; meta: string };
+type LearningCandidate = { id: string; question: string; answer: string; state: 'CANDIDATE' | 'USE' | 'EXCLUDE'; note: string; sourceType: string; updatedAt: string };
+type TemplateRecord = CompositionOption & { key: string; market: string; channel: string; intent: string; state: 'CANDIDATE' | 'USE' | 'EXCLUDE'; requiredChecks: string[] };
 type CaseSummary = { title: string; text: string; points: string[] };
 type CsCase = {
   id: string;
@@ -51,14 +55,16 @@ type CsCase = {
   summary?: CaseSummary;
   templates: CompositionOption[];
   libraryExamples: CompositionOption[];
+  learningCandidates: LearningCandidate[];
 };
 type Overview = { total_live: number; needs_reply: number; answered: number; review: number; no_reply_required: number; ai_ready: number; closed: number };
 type LatestSync = { run_id: string; status: string; finished_at: string; collected_count: number; draft_created_count: number; error_count: number } | null;
 type EnvironmentName = 'development' | 'production' | 'unconfigured';
 type DashboardSnapshot = { savedAt: number; cases: CsCase[]; total: number; overview: Overview; environment: EnvironmentName; latestSync?: LatestSync };
 type DetailSnapshot = { savedAt: number; item: CsCase };
-type DetailPayload = { case?: RawRow; messages?: RawRow[]; drafts?: RawRow[]; decisions?: RawRow[]; summary?: unknown; templates?: unknown; library_examples?: unknown };
+type DetailPayload = { case?: RawRow; messages?: RawRow[]; attachments?: RawRow[]; drafts?: RawRow[]; decisions?: RawRow[]; summary?: unknown; templates?: unknown; library_examples?: unknown; learning_candidates?: unknown };
 type DataFreshness = 'fresh' | 'refreshing' | 'stale';
+type TemplateForm = { id: string; key: string; version: string; name: string; body: string; market: string; channel: string; intent: string; checks: string };
 
 const EMPTY_OVERVIEW: Overview = { total_live: 0, needs_reply: 0, answered: 0, review: 0, no_reply_required: 0, ai_ready: 0, closed: 0 };
 const INITIAL_CASE_LIMIT = 50;
@@ -67,6 +73,7 @@ const DETAIL_CACHE_TTL = 2 * 60 * 1000;
 const DASHBOARD_CACHE_PREFIX = 'pinkrocket-cs-dashboard-v2:';
 const DETAIL_CACHE_PREFIX = 'pinkrocket-cs-detail-v2:';
 const D1_READ_API_BASE = 'https://ai-cs-mcp-development.kimhyein0214.workers.dev/api/cs';
+const EMPTY_TEMPLATE_FORM: TemplateForm = { id: '', key: '', version: 'v1', name: '', body: '', market: '', channel: '', intent: '', checks: '' };
 const statusMeta: Record<CaseStatus, { label: string; shortLabel: string; tone: string; dot: string }> = {
   unanswered: { label: '미응답', shortLabel: '미응답', tone: 'status-red', dot: '#e24b4b' },
   'ai-ready': { label: 'AI 답변 준비', shortLabel: 'AI 준비', tone: 'status-purple', dot: '#7257d7' },
@@ -93,6 +100,14 @@ function safeExternalUrl(value: unknown) {
     const fragment = decodeURIComponent(url.hash || '');
     const fragmentParams = new URLSearchParams(fragment.includes('?') ? fragment.slice(fragment.indexOf('?') + 1) : fragment.replace(/^#/, ''));
     for (const key of fragmentParams.keys()) if (sensitive(key)) return '';
+    return url.toString();
+  } catch { return ''; }
+}
+function safeAssetUrl(value: unknown) {
+  const raw = text(value); if (!raw) return '';
+  try {
+    const url = new URL(raw); const host = url.hostname.toLowerCase();
+    if (url.protocol !== 'https:' || url.username || url.password || !['naver.com', 'pstatic.net', 'kakaostyle.com', 'kakaocdn.net', 'daumcdn.net', 'a-bly.com'].some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return '';
     return url.toString();
   } catch { return ''; }
 }
@@ -164,6 +179,33 @@ function normalizeCompositionOptions(value: unknown, fallbackTitle: string): Com
     };
   }).filter((entry): entry is CompositionOption => entry !== null);
 }
+function normalizeTemplateRecords(value: unknown): TemplateRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index): TemplateRecord | null => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const raw = entry as RawRow;
+    const body = text(raw.template_text_masked ?? raw.template_text ?? raw.text);
+    if (!body) return null;
+    return {
+      id: text(raw.template_id, `TEMPLATE:${index + 1}`), key: text(raw.template_key, `template-${index + 1}`),
+      title: text(raw.template_name_masked ?? raw.template_name, `템플릿 ${index + 1}`), text: body,
+      version: text(raw.template_version, 'v1'), variables: compositionVariables(raw.required_checks_json, body),
+      meta: [text(raw.market), text(raw.channel), text(raw.intent)].filter(Boolean).join(' · '),
+      market: text(raw.market), channel: text(raw.channel), intent: text(raw.intent),
+      state: ['CANDIDATE', 'USE', 'EXCLUDE'].includes(text(raw.quality_state).toUpperCase()) ? text(raw.quality_state).toUpperCase() as TemplateRecord['state'] : 'CANDIDATE',
+      requiredChecks: jsonStringList(raw.required_checks_json),
+    };
+  }).filter((entry): entry is TemplateRecord => entry !== null);
+}
+function normalizeLearningCandidates(value: unknown): LearningCandidate[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry): LearningCandidate | null => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const raw = entry as RawRow; const id = text(raw.library_entry_id); if (!id) return null;
+    const state = text(raw.quality_state).toUpperCase();
+    return { id, question: text(raw.question_text_masked), answer: text(raw.answer_text_masked), state: ['USE', 'EXCLUDE'].includes(state) ? state as LearningCandidate['state'] : 'CANDIDATE', note: text(raw.review_note_masked), sourceType: text(raw.source_type), updatedAt: formatDate(raw.updated_at ?? raw.created_at) };
+  }).filter((entry): entry is LearningCandidate => entry !== null);
+}
 function sourceLabel(type: CompositionSourceType) {
   return ({ AI_DRAFT: 'AI 초안', REPLY_TEMPLATE: '템플릿', ANSWER_LIBRARY_ENTRY: '과거 답변', MANUAL: '직접 작성' } as const)[type];
 }
@@ -194,23 +236,31 @@ function baseCase(row: RawRow): CsCase {
     preview: rawPreview || '과거 이관 데이터 · 문의 본문 미수집', updatedAt: formatDate(row.last_changed_at ?? row.last_seen_at ?? row.last_message_at),
     updatedRaw: text(row.last_seen_at ?? row.last_changed_at ?? row.last_message_at), status, sourceUrl, sourceUrlKind,
     sourceReference: text(row.source_reference ?? row.source_reference_masked), productUrl: safeExternalUrl(row.product_url), productId: text(row.product_id),
-    productThumbnailUrl: safeExternalUrl(row.product_thumbnail_url), imageCount: Math.max(0, Number(row.image_count ?? 0) || 0), bodyCollected: Boolean(rawPreview),
+    productThumbnailUrl: safeAssetUrl(row.product_thumbnail_url), imageCount: Math.max(0, Number(row.image_count ?? 0) || 0), bodyCollected: Boolean(rawPreview),
     alert: status === 'review' ? '수집 상태 또는 답변 여부 확인 필요' : (scan.includes('WARN') || scan.includes('FAIL') ? `개인정보 검사 ${text(row.pii_scan)}` : undefined),
     postTitle: text(row.subject ?? row.subject_masked, text(row.category ?? row.category_masked, '문의 내용')), messages: [],
-    conversationComplete: row.conversation_complete === undefined ? true : bool(row.conversation_complete), conversationIncompleteReason: text(row.conversation_incomplete_reason), sourceContentHash: text(row.content_hash).toLowerCase(), templates: [], libraryExamples: [],
+    conversationComplete: row.conversation_complete === undefined ? true : bool(row.conversation_complete), conversationIncompleteReason: text(row.conversation_incomplete_reason), sourceContentHash: text(row.content_hash).toLowerCase(), templates: [], libraryExamples: [], learningCandidates: [],
     actualReply: bool(row.human_reply_exists) ? { text: text(row.latest_human_reply_preview, '답변 존재 · 본문 미수집'), sentAt: formatDate(row.human_reply_at), verifiedAt: formatDate(row.last_seen_at) } : undefined,
   };
 }
-function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[], decisionRows: RawRow[] = [], summary?: unknown, templates?: unknown, libraryExamples?: unknown): CsCase {
+function hydrateCase(row: RawRow, messageRows: RawRow[], attachmentRows: RawRow[], draftRows: RawRow[], decisionRows: RawRow[] = [], summary?: unknown, templates?: unknown, libraryExamples?: unknown, learningCandidates?: unknown): CsCase {
   const item = baseCase(row);
   item.messages = messageRows.map((message): Message | null => {
-    const body = text(message.message_text_masked ?? message.text_masked); if (!body) return null;
+    const rawBody = text(message.message_text_masked ?? message.text_masked);
+    const hasImage = Number(message.image_count ?? 0) > 0 || bool(message.has_image);
+    if (!rawBody && !hasImage) return null;
+    const body = rawBody || '첨부 이미지';
     const actorRaw = text(message.actor_type ?? message.actor).toUpperCase();
-    return { actor: actorRaw.includes('SELLER') || actorRaw.includes('ADMIN') ? 'seller' : 'customer', time: formatDate(message.message_at ?? message.sent_at), text: body, image: Number(message.image_count ?? 0) > 0 || bool(message.has_image) };
+    const messageId = text(message.message_key);
+    const attachments = attachmentRows.filter((attachment) => text(attachment.message_key) === messageId).map((attachment): Attachment => ({
+      id: text(attachment.attachment_key), url: safeAssetUrl(attachment.asset_url), thumbnailUrl: safeAssetUrl(attachment.thumbnail_url),
+      alt: text(attachment.alt_text_masked, '문의 첨부 이미지'), accessState: ['PUBLIC_URL', 'UNAVAILABLE'].includes(text(attachment.access_state).toUpperCase()) ? text(attachment.access_state).toUpperCase() as Attachment['accessState'] : 'SESSION_REQUIRED',
+    }));
+    return { id: messageId, actor: actorRaw.includes('SELLER') || actorRaw.includes('ADMIN') ? 'seller' : 'customer', time: formatDate(message.message_at ?? message.sent_at), text: body, image: hasImage, attachments };
   }).filter((message): message is Message => message !== null);
   item.imageCount = Math.max(item.imageCount, messageRows.reduce((total, message) => total + Math.max(0, Number(message.image_count ?? 0) || 0), 0));
-  if (!item.messages.length && item.bodyCollected) item.messages.push({ actor: 'customer', time: item.updatedAt, text: item.preview });
-  if (item.actualReply && !item.messages.some((message) => message.actor === 'seller')) item.messages.push({ actor: 'seller', time: item.actualReply.sentAt, text: item.actualReply.text });
+  if (!item.messages.length && item.bodyCollected) item.messages.push({ id: `${item.id}:preview`, actor: 'customer', time: item.updatedAt, text: item.preview, attachments: [] });
+  if (item.actualReply && !item.messages.some((message) => message.actor === 'seller')) item.messages.push({ id: `${item.id}:seller`, actor: 'seller', time: item.actualReply.sentAt, text: item.actualReply.text, attachments: [] });
   const draft = draftRows.find((row) => ['READY', 'APPROVED', 'EVAL'].includes(text(row.draft_state).toUpperCase()));
   if (draft && text(draft.draft_text ?? draft.draft_text_masked)) {
     const draftState = text(draft.draft_state).toUpperCase();
@@ -231,11 +281,12 @@ function hydrateCase(row: RawRow, messageRows: RawRow[], draftRows: RawRow[], de
   item.summary = normalizeSummary(summary);
   item.templates = normalizeCompositionOptions(templates, '템플릿');
   item.libraryExamples = normalizeCompositionOptions(libraryExamples, '과거 답변').slice(0, 3);
+  item.learningCandidates = normalizeLearningCandidates(learningCandidates);
   return item;
 }
 function hydrateDetailPayload(payload: DetailPayload): CsCase | null {
   if (!payload?.case) return null;
-  return hydrateCase(payload.case, payload.messages ?? [], payload.drafts ?? [], payload.decisions ?? [], payload.summary, payload.templates, payload.library_examples);
+  return hydrateCase(payload.case, payload.messages ?? [], payload.attachments ?? [], payload.drafts ?? [], payload.decisions ?? [], payload.summary, payload.templates, payload.library_examples, payload.learning_candidates);
 }
 function statusQuery(filter: 'all' | CaseStatus) {
   if (filter === 'all') return '';
@@ -276,6 +327,21 @@ function readSessionCache<T>(key: string, maxAge: number): T | null {
 function writeSessionCache(key: string, value: unknown) {
   try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* A full/disabled cache must not block the review desk. */ }
 }
+function parseCsv(value: string): string[][] {
+  const rows: string[][] = []; let row: string[] = []; let cell = ''; let quoted = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === '"' && quoted && value[index + 1] === '"') { cell += '"'; index += 1; }
+    else if (char === '"') quoted = !quoted;
+    else if (char === ',' && !quoted) { row.push(cell.trim()); cell = ''; }
+    else if ((char === '\n' || char === '\r') && !quoted) {
+      if (char === '\r' && value[index + 1] === '\n') index += 1;
+      row.push(cell.trim()); if (row.some(Boolean)) rows.push(row); row = []; cell = '';
+    } else cell += char;
+  }
+  row.push(cell.trim()); if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
 
 function totalForFilter(filter: 'all' | CaseStatus, overview: Overview) {
   if (filter === 'unanswered') return overview.needs_reply;
@@ -309,11 +375,13 @@ function nativeDetail(payload: RawRow): DetailPayload {
   return {
     case: payload.case as RawRow | undefined,
     messages: payload.messages as RawRow[] | undefined,
+    attachments: payload.attachments as RawRow[] | undefined,
     drafts,
     decisions: payload.decisions as RawRow[] | undefined,
     summary: payload.summary,
     templates: payload.templates,
     library_examples: payload.library_examples,
+    learning_candidates: payload.learning_candidates,
   };
 }
 function clearSessionCachePrefix(prefix: string) {
@@ -323,6 +391,15 @@ function clearSessionCachePrefix(prefix: string) {
       if (key?.startsWith(prefix)) sessionStorage.removeItem(key);
     }
   } catch { /* Cache cleanup must not block the review desk. */ }
+}
+
+function AttachmentGallery({ attachments, compact = false }: { attachments: Attachment[]; compact?: boolean }) {
+  if (!attachments.length) return null;
+  return <div className={`attachment-gallery ${compact ? 'compact' : ''}`}>{attachments.map((attachment) => {
+    const imageUrl = attachment.thumbnailUrl || attachment.url;
+    return imageUrl ? <a key={attachment.id} href={attachment.url || imageUrl} target="_blank" rel="noopener noreferrer" className="attachment-card"><img src={imageUrl} alt={attachment.alt} loading="lazy" referrerPolicy="no-referrer"/><span>이미지 크게 보기 ↗</span></a>
+      : <div key={attachment.id} className="attachment-card unavailable"><span>로그인된 원문에서 이미지 확인</span></div>;
+  })}</div>;
 }
 
 function CompositionWorkbench({
@@ -373,6 +450,14 @@ export default function Home() {
   const [compositionSource, setCompositionSource] = useState<CompositionSource>({ composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1' });
   const [templateSearch, setTemplateSearch] = useState('');
   const [sourceGuide, setSourceGuide] = useState<SourceGuide | null>(null);
+  const [sourceSnapshotOpen, setSourceSnapshotOpen] = useState(false);
+  const [templateManagerOpen, setTemplateManagerOpen] = useState(false);
+  const [templateRecords, setTemplateRecords] = useState<TemplateRecord[]>([]);
+  const [templateForm, setTemplateForm] = useState<TemplateForm>(EMPTY_TEMPLATE_FORM);
+  const [templateSaving, setTemplateSaving] = useState(false);
+  const [reviewReason, setReviewReason] = useState('');
+  const [learningReason, setLearningReason] = useState('');
+  const [learningSaving, setLearningSaving] = useState(false);
   const [reviewSaving, setReviewSaving] = useState(false);
   const [loading, setLoading] = useState(true); const [loadingMore, setLoadingMore] = useState(false); const [detailLoading, setDetailLoading] = useState(false); const [error, setError] = useState(''); const [detailError, setDetailError] = useState('');
   const [freshness, setFreshness] = useState<DataFreshness>('refreshing');
@@ -516,6 +601,7 @@ export default function Home() {
   const selectedTemplate = compositionSource.composition_source_type === 'REPLY_TEMPLATE'
     ? (selected?.templates ?? []).find((item) => item.id === compositionSource.composition_source_id) ?? null : null;
   const selectedLibraryExample = (selected?.libraryExamples ?? []).find((item) => item.id === compositionSource.composition_source_id) ?? null;
+  const learningCandidate = selected?.learningCandidates.find((item) => item.state !== 'EXCLUDE') ?? null;
   const compositionBaseText = compositionSource.composition_source_type === 'AI_DRAFT' ? selected?.ai?.text ?? ''
     : compositionSource.composition_source_type === 'REPLY_TEMPLATE' ? selectedTemplate?.text ?? ''
       : compositionSource.composition_source_type === 'ANSWER_LIBRARY_ENTRY' ? selectedLibraryExample?.text ?? ''
@@ -532,12 +618,83 @@ export default function Home() {
     document.body.appendChild(link); link.click(); link.remove();
     notify(`${label}을 새 탭에서 열었습니다. 열리지 않으면 주소 복사를 사용해 주세요.`);
   };
+  const loadTemplates = useCallback(async () => {
+    const payload = await getJson(`${D1_READ_API_BASE}/templates`);
+    setTemplateRecords(normalizeTemplateRecords(payload.items));
+  }, []);
+  const openTemplateManager = async () => {
+    setTemplateManagerOpen(true); setTemplateForm(EMPTY_TEMPLATE_FORM);
+    try { await loadTemplates(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'TEMPLATE_LOAD_FAILED'); }
+  };
+  const saveTemplate = async (form: TemplateForm) => {
+    if (!localReviewEnabled || templateSaving || !form.name.trim() || !form.body.trim()) return;
+    setTemplateSaving(true); setError('');
+    try {
+      const key = form.key.trim() || `manual-${Date.now()}`;
+      await postJson('/api/cs', {
+        action: 'upsertTemplate', template_key: key, template_version: form.version.trim() || 'v1',
+        template_name: form.name.trim(), template_text: form.body.trim(), market: form.market.trim(),
+        channel: form.channel.trim(), intent: form.intent.trim(), required_checks: form.checks.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+        quality_state: 'USE', environment: 'development', auto_send: false, marketplace_write_actions: 0,
+      });
+      await loadTemplates(); setTemplateForm(EMPTY_TEMPLATE_FORM); clearSessionCachePrefix(DETAIL_CACHE_PREFIX); detailCache.current.clear(); setDetailEpoch((value) => value + 1);
+      notify('답변 템플릿을 저장했습니다.');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'TEMPLATE_SAVE_FAILED'); }
+    finally { setTemplateSaving(false); }
+  };
+  const editTemplate = (record: TemplateRecord) => setTemplateForm({ id: record.id, key: record.key, version: record.version, name: record.title, body: record.text, market: record.market, channel: record.channel, intent: record.intent, checks: record.requiredChecks.join('\n') });
+  const disableTemplate = async (record: TemplateRecord) => {
+    if (!localReviewEnabled || templateSaving) return;
+    setTemplateSaving(true);
+    try {
+      await postJson('/api/cs', { action: 'setTemplateState', template_id: record.id, quality_state: 'EXCLUDE', environment: 'development', auto_send: false, marketplace_write_actions: 0 });
+      await loadTemplates(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX); detailCache.current.clear(); setDetailEpoch((value) => value + 1); notify('템플릿을 사용 중지했습니다.');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'TEMPLATE_DELETE_FAILED'); }
+    finally { setTemplateSaving(false); }
+  };
+  const uploadTemplates = async (file: File) => {
+    if (!localReviewEnabled || templateSaving) return;
+    setTemplateSaving(true); setError('');
+    try {
+      const parsed = parseCsv(await file.text());
+      if (parsed.length < 2) throw new Error('TEMPLATE_CSV_EMPTY');
+      const headers = parsed[0].map((item) => item.trim().toLowerCase());
+      const indexOf = (...names: string[]) => names.map((name) => headers.indexOf(name)).find((index) => index >= 0) ?? -1;
+      const nameIndex = indexOf('template_name', 'name', '템플릿명'); const bodyIndex = indexOf('template_text', 'text', '답변', '본문');
+      if (nameIndex < 0 || bodyIndex < 0) throw new Error('TEMPLATE_CSV_HEADER_REQUIRED');
+      const field = (row: string[], ...names: string[]) => { const index = indexOf(...names); return index >= 0 ? row[index] ?? '' : ''; };
+      let saved = 0;
+      for (const [index, row] of parsed.slice(1).entries()) {
+        if (!row[nameIndex]?.trim() || !row[bodyIndex]?.trim()) continue;
+        await postJson('/api/cs', {
+          action: 'upsertTemplate', template_key: field(row, 'template_key', 'key') || `upload-${Date.now()}-${index + 1}`,
+          template_version: field(row, 'template_version', 'version', '버전') || 'v1', template_name: row[nameIndex].trim(), template_text: row[bodyIndex].trim(),
+          market: field(row, 'market', '쇼핑몰'), channel: field(row, 'channel', '채널'), intent: field(row, 'intent', '분류'),
+          required_checks: field(row, 'required_checks', '확인사항').split('|').map((item) => item.trim()).filter(Boolean), quality_state: 'USE',
+          environment: 'development', auto_send: false, marketplace_write_actions: 0,
+        }); saved += 1;
+      }
+      if (!saved) throw new Error('TEMPLATE_CSV_NO_VALID_ROW');
+      await loadTemplates(); clearSessionCachePrefix(DETAIL_CACHE_PREFIX); detailCache.current.clear(); setDetailEpoch((value) => value + 1); notify(`템플릿 ${saved}개를 저장했습니다.`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'TEMPLATE_UPLOAD_FAILED'); }
+    finally { setTemplateSaving(false); }
+  };
+  const trainCandidate = async () => {
+    if (!learningCandidate || !learningReason.trim() || !localReviewEnabled || learningSaving) return;
+    setLearningSaving(true); setError('');
+    try {
+      await postJson('/api/cs', { action: 'reviewLibraryEntry', library_entry_id: learningCandidate.id, quality_state: 'USE', review_note: learningReason.trim(), environment: 'development', auto_send: false, marketplace_write_actions: 0 });
+      if (selected) setSelectedDetail({ ...selected, learningCandidates: selected.learningCandidates.map((item) => item.id === learningCandidate.id ? { ...item, state: 'USE', note: learningReason.trim() } : item) });
+      setLearningReason(''); notify('검증된 사람 답변을 AI 참고 라이브러리에 저장했습니다.');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'LIBRARY_SAVE_FAILED'); }
+    finally { setLearningSaving(false); }
+  };
   useEffect(() => {
-    if (!sourceGuide) return;
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setSourceGuide(null); };
+    if (!sourceGuide && !sourceSnapshotOpen && !templateManagerOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') { setSourceGuide(null); setSourceSnapshotOpen(false); setTemplateManagerOpen(false); } };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [sourceGuide]);
+  }, [sourceGuide, sourceSnapshotOpen, templateManagerOpen]);
   const selectFilter = (filter: 'all' | CaseStatus) => {
     if (filter === activeFilter) return;
     listRequestId.current += 1; detailRequestId.current += 1; setLoading(true); setLoadingMore(false); setError(''); setDetailError(''); setFreshness('refreshing'); setCases([]); setTotalCases(0); setSelectedId(''); setSelectedDetail(null); setCompositionSource({ composition_source_type: 'MANUAL', composition_source_id: 'MANUAL', composition_source_version: 'v1' }); setTemplateSearch(''); setActiveFilter(filter);
@@ -558,7 +715,7 @@ export default function Home() {
       const reviewPayload = {
         draft_id: selected.draftId,
         draft_state: draftState,
-        review_note: draftState === 'APPROVED' ? '개발 프론트에서 사람 검수 완료' : '개발 프론트에서 AI 초안 거절',
+        review_note: reviewReason.trim() || (draftState === 'APPROVED' ? '사람 검수 완료' : 'AI 초안 거절'),
         human_revision: revision,
         ...compositionSource,
         base_text_hash: baseTextHash,
@@ -569,8 +726,11 @@ export default function Home() {
         auto_send: false as const,
         marketplace_write_actions: 0 as const,
       };
-      await postJson('/api/cs', reviewPayload);
-      setSelectedDetail({ ...selected, humanRevision: revision ? { text: revision, state: draftState, reviewedAt: formatDate(new Date().toISOString()) } : selected.humanRevision });
+      const saved = await postJson('/api/cs', reviewPayload);
+      const candidateId = text(saved.library_candidate_id);
+      const nextCandidates = candidateId && revision ? [{ id: candidateId, question: customerMessages.at(-1)?.text ?? selected.preview, answer: revision, state: 'CANDIDATE' as const, note: '', sourceType: compositionSource.composition_source_type, updatedAt: formatDate(new Date().toISOString()) }, ...selected.learningCandidates.filter((item) => item.id !== candidateId)] : selected.learningCandidates;
+      setSelectedDetail({ ...selected, humanRevision: revision ? { text: revision, state: draftState, reviewedAt: formatDate(new Date().toISOString()) } : selected.humanRevision, learningCandidates: nextCandidates });
+      setReviewReason('');
       notify(draftState === 'APPROVED' ? '사람 수정본을 개발 검수 저장소에 저장했습니다.' : 'AI 초안을 거절로 기록했습니다.');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'REVIEW_SAVE_FAILED');
@@ -582,7 +742,7 @@ export default function Home() {
   return <main className="app-shell">
     <aside className="nav-rail"><div className="brand-mark">PR</div><nav aria-label="주 메뉴"><button className="rail-button active"><span>◫</span><small>검수함</small></button><button className="rail-button"><span>⌁</span><small>통계</small></button><button className="rail-button"><span>⚙</span><small>설정</small></button></nav><div className="rail-footer">LIVE</div></aside>
     <section className="workspace">
-      <header className="topbar"><div><div className="eyebrow">PINK ROCKET · CS REVIEW</div><h1>AI 답변 검수함</h1></div><div className="sync-area"><span className={`environment-badge ${environment}`}>{environment}</span><div className="sync-copy"><span className={`live-dot ${error || (latestSync?.error_count ?? 0) > 0 ? 'error' : ''}`} /><strong>{error && !cases.length ? '연결 확인 필요' : `실데이터 ${overview.total_live.toLocaleString()}건`}</strong><small>{freshness === 'stale' ? '연결이 지연되어 저장된 목록을 표시 중' : latestSync?.finished_at ? `최근 동기화 ${formatDate(latestSync.finished_at)} · 수집 ${latestSync.collected_count} / AI ${latestSync.draft_created_count}` : syncAt ? `최근 수집 기록 ${formatDate(syncAt)}` : '수집 기록 확인 중'}</small></div><button className="secondary-button" onClick={refresh} disabled={loading}>↻ {loading ? '확인 중' : '최신 확인'}</button></div></header>
+      <header className="topbar"><div><div className="eyebrow">PINK ROCKET · CS REVIEW</div><h1>AI 답변 검수함</h1></div><div className="sync-area"><button className="secondary-button" onClick={openTemplateManager}>템플릿 관리</button><span className={`environment-badge ${environment}`}>{environment}</span><div className="sync-copy"><span className={`live-dot ${error || (latestSync?.error_count ?? 0) > 0 ? 'error' : ''}`} /><strong>{error && !cases.length ? '연결 확인 필요' : `실데이터 ${overview.total_live.toLocaleString()}건`}</strong><small>{freshness === 'stale' ? '연결이 지연되어 저장된 목록을 표시 중' : latestSync?.finished_at ? `최근 동기화 ${formatDate(latestSync.finished_at)} · 수집 ${latestSync.collected_count} / AI ${latestSync.draft_created_count}` : syncAt ? `최근 수집 기록 ${formatDate(syncAt)}` : '수집 기록 확인 중'}</small></div><button className="secondary-button" onClick={refresh} disabled={loading}>↻ {loading ? '확인 중' : '최신 확인'}</button></div></header>
       {error && !cases.length && <div className="connection-error" role="alert"><strong>데이터를 불러오지 못했습니다.</strong><span>{error}</span><button onClick={refresh}>다시 시도</button></div>}
       <section className="status-strip" aria-label="문의 상태 요약">{filters.slice(1).map((filter) => { const meta = statusMeta[filter.key as CaseStatus]; return <button key={filter.key} className={`stat-card ${activeFilter === filter.key ? 'selected' : ''}`} onClick={() => selectFilter(filter.key as CaseStatus)}><span className="stat-dot" style={{ background: meta.dot }} /><span>{filter.label}</span><strong>{countFor(filter.key as CaseStatus).toLocaleString()}</strong></button>; })}</section>
       <div className="desk-grid">
@@ -590,19 +750,23 @@ export default function Home() {
           <div className="case-list">{loading && !cases.length && <div className="empty-list loading-list"><span>⌁</span><strong>첫 연결을 확인하고 있습니다.</strong><p>한 번 불러온 뒤에는 같은 탭에서 즉시 표시하고, 최신 정보는 뒤에서 확인합니다.</p></div>}{filteredCases.map((item) => { const meta = statusMeta[item.status]; return <button key={item.id} className={`case-item ${selected?.id === item.id ? 'active' : ''}`} onClick={() => selectCase(item.id)}><div className="case-item-top"><span className={`status-pill ${meta.tone}`}>{meta.shortLabel}</span><time>{item.updatedAt}</time></div><div className="case-title-row"><strong>{item.customer}</strong></div><p className="case-product">{item.product}</p><p className="case-preview">{item.preview}</p><div className="case-meta"><span className={`surface-tag ${item.surface}`}>{item.surface === 'chat' ? '● 채팅형' : '▤ 게시글형'}</span><span>{item.channel}</span><span>{item.category}</span></div></button>; })}{!loading && !filteredCases.length && <div className="empty-list">조건에 맞는 문의가 없습니다.</div>}{cases.length < totalCases && <div className="load-more-row"><button className="secondary-button" onClick={loadMore} disabled={loadingMore}>{loadingMore ? '불러오는 중…' : `다음 ${Math.min(INITIAL_CASE_LIMIT, totalCases - cases.length)}건 보기`}</button></div>}</div>
         </section>
         <section className="conversation-column" aria-label="전체 대화">{!selected ? <div className="panel-empty"><span>⌁</span><strong>표시할 문의가 없습니다.</strong><p>상태 필터를 바꾸거나 데이터를 다시 불러와 주세요.</p></div> : <>
-          <header className="case-header"><div className="case-header-copy"><div className="case-heading-line"><span className={`status-pill ${statusMeta[selected.status].tone}`}>{statusMeta[selected.status].label}</span><span className={`surface-label ${selected.surface}`}>{selected.surface === 'chat' ? '● 채팅형 문의' : '▤ 게시글형 문의'}</span><span className="case-id">{selected.id}</span></div><div className="case-product-heading">{selected.productThumbnailUrl && <img src={selected.productThumbnailUrl} alt="" referrerPolicy="no-referrer"/>}<div><h2>{selected.product}</h2><p>{selected.productId ? `상품 ID ${selected.productId} · ` : ''}{selected.channel} · 고객 {selected.customer}</p></div></div><div className="case-link-meta"><span>{selected.imageCount > 0 ? `첨부 이미지 ${selected.imageCount}개 · 원문에서 확인` : '첨부 여부 미수집'}</span>{selected.sourceUrlKind === 'LIST' && <span>개별 원문 링크 아님</span>}</div></div><div className="case-header-actions">{selected.sourceUrlKind === 'EXACT' && <><button className="icon-button" title="판매자센터 로그인을 이어받으려면 이 검수함을 CS Chrome에서 열어 주세요." disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && openExternal(selected.sourceUrl, '원문')}>원문 새 탭 ↗</button><button className="icon-button source-copy-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && copyText(selected.sourceUrl)}>주소 복사</button></>}{selected.sourceUrlKind === 'LIST' && <button className="icon-button" disabled={!selected.sourceUrl} onClick={() => selected.sourceUrl && setSourceGuide({ url: selected.sourceUrl, reference: selected.sourceReference, product: selected.product })}>문의관리 안내</button>}{selected.sourceUrlKind === 'UNAVAILABLE' && <button className="icon-button" disabled>원문 미수집</button>}{selected.productUrl && <button className="icon-button product-link-button" onClick={() => openExternal(selected.productUrl, '상품 페이지')}>상품 보기 ↗</button>}</div></header>
+          <header className="case-header"><div className="case-header-copy"><div className="case-heading-line"><span className={`status-pill ${statusMeta[selected.status].tone}`}>{statusMeta[selected.status].label}</span><span className={`surface-label ${selected.surface}`}>{selected.surface === 'chat' ? '● 채팅형 문의' : '▤ 게시글형 문의'}</span><span className="case-id">{selected.id}</span></div><div className="case-product-heading">{selected.productThumbnailUrl && <img src={selected.productThumbnailUrl} alt="" referrerPolicy="no-referrer"/>}<div><h2>{selected.product}</h2><p>{selected.productId ? `상품 ID ${selected.productId} · ` : ''}{selected.channel} · 고객 {selected.customer}</p></div></div><div className="case-link-meta"><span>{selected.imageCount > 0 ? `첨부 이미지 ${selected.imageCount}개` : '첨부 이미지 없음'}</span>{selected.sourceUrlKind === 'LIST' && <span>판매자센터 주소는 목록형</span>}</div></div><div className="case-header-actions"><button className="icon-button" onClick={() => setSourceSnapshotOpen(true)}>원문 보기</button>{selected.sourceUrl && <button className="icon-button source-copy-button" onClick={() => copyText(selected.sourceUrl)}>주소 복사</button>}{selected.productUrl && <button className="icon-button product-link-button" onClick={() => openExternal(selected.productUrl, '상품 페이지')}>상품 보기 ↗</button>}</div></header>
           {selected.alert && <div className="warning-banner"><span>!</span><div><strong>사람 검토가 필요한 문의입니다.</strong><p>{selected.alert} · 자동 전송 금지</p></div></div>}{detailLoading && <div className="detail-loading">선택한 문의와 다음 문의를 함께 불러오는 중…</div>}{detailError && <div className="detail-loading" role="alert">상세 메시지를 불러오지 못했습니다. 목록 정보는 유지됩니다. · {detailError}</div>}
-          {selected.surface === 'chat' ? <div className="conversation-scroll chat-surface"><div className="chat-notice">수집된 대화 · 시간순 메시지</div><div className="date-divider"><span>최근 대화</span></div>{selected.messages.length ? selected.messages.map((message, index) => <div key={`${selected.id}-${index}`} className={`message-row ${message.actor}`}><div className="avatar">{message.actor === 'seller' ? 'P' : 'C'}</div><div className="message-wrap"><div className="message-label"><strong>{message.actor === 'seller' ? '판매자 실제 답변' : '고객'}</strong><time>{message.time}</time></div><div className="message-bubble">{message.image && <div className="image-placeholder">▧ 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div></div></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 열기에서 쇼핑몰의 문의 내용을 확인해 주세요.</p></div>}</div>
-          : <div className="post-scroll"><article className="post-card"><div className="post-card-label"><span>문의 게시글</span><span>공개여부 미수집</span></div><h3>{selected.postTitle ?? selected.category}</h3><dl className="post-meta-grid"><div><dt>작성자</dt><dd>{selected.customer}</dd></div><div><dt>등록 시각</dt><dd>{customerMessages[0]?.time ?? selected.updatedAt}</dd></div><div><dt>문의 유형</dt><dd>{selected.category}</dd></div><div><dt>상품</dt><dd>{selected.product}</dd></div></dl><div className="post-body">{customerMessages.length ? customerMessages.map((message, index) => <div key={`${selected.id}-post-${index}`}>{message.image && <div className="post-attachment">▧ 고객 첨부 이미지 있음 · 원문에서 확인</div>}<p>{message.text}</p></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 열기에서 쇼핑몰의 문의 내용을 확인해 주세요.</p></div>}</div></article><section className="board-answer"><div className="board-answer-title"><div><span className="answer-icon">P</span><div><strong>판매자 답변</strong><small>쇼핑몰에서 수집된 실제 답변</small></div></div>{sellerMessages[0] && <time>{sellerMessages[0].time}</time>}</div>{sellerMessages.length ? <div className="board-answer-body">{sellerMessages.map((message, index) => <p key={`${selected.id}-answer-${index}`}>{message.text}</p>)}</div> : <div className="board-answer-empty">아직 수집된 판매자 답변이 없습니다.</div>}</section></div>}
+          {selected.surface === 'chat' ? <div className="conversation-scroll chat-surface"><div className="chat-notice">수집된 대화 · 시간순 메시지</div><div className="date-divider"><span>최근 대화</span></div>{selected.messages.length ? selected.messages.map((message, index) => <div key={`${selected.id}-${index}`} className={`message-row ${message.actor}`}><div className="avatar">{message.actor === 'seller' ? 'P' : 'C'}</div><div className="message-wrap"><div className="message-label"><strong>{message.actor === 'seller' ? '판매자 실제 답변' : '고객'}</strong><time>{message.time}</time></div><div className="message-bubble"><AttachmentGallery attachments={message.attachments} compact/>{message.image && !message.attachments.length && <div className="image-placeholder">▧ 첨 이미지 · 로그인된 원문에서 확인</div>}<p>{message.text}</p></div></div></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 보기에서 수집 상태를 확인해 주세요.</p></div>}</div>
+          : <div className="post-scroll"><article className="post-card"><div className="post-card-label"><span>문의 게시글</span><span>공개여부 미수집</span></div><h3>{selected.postTitle ?? selected.category}</h3><dl className="post-meta-grid"><div><dt>작성자</dt><dd>{selected.customer}</dd></div><div><dt>등록 시각</dt><dd>{customerMessages[0]?.time ?? selected.updatedAt}</dd></div><div><dt>문의 유형</dt><dd>{selected.category}</dd></div><div><dt>상품</dt><dd>{selected.product}</dd></div></dl><div className="post-body">{customerMessages.length ? customerMessages.map((message, index) => <div key={`${selected.id}-post-${index}`}><AttachmentGallery attachments={message.attachments}/>{message.image && !message.attachments.length && <div className="post-attachment">▧ 고객 첨부 이미지 · 로그인된 원문에서 확인</div>}<p>{message.text}</p></div>) : detailLoading ? <div className="collection-gap loading"><span>…</span><strong>문의 내용을 불러오는 중입니다.</strong><p>잠시 후 이 영역에 자동으로 표시됩니다.</p></div> : <div className="collection-gap"><span>!</span><strong>수집된 문의 본문이 없습니다.</strong><p>원문 보기에서 수집 상태를 확인해 주세요.</p></div>}</div></article><section className="board-answer"><div className="board-answer-title"><div><span className="answer-icon">P</span><div><strong>판매자 답변</strong><small>쇼핑몰에서 수집된 실제 답변</small></div></div>{sellerMessages[0] && <time>{sellerMessages[0].time}</time>}</div>{sellerMessages.length ? <div className="board-answer-body">{sellerMessages.map((message, index) => <p key={`${selected.id}-answer-${index}`}>{message.text}</p>)}</div> : <div className="board-answer-empty">아직 수집된 판매자 답변이 없습니다.</div>}</section></div>}
           <footer className="source-footer"><span>🔒 고객정보 마스킹됨</span><span>{selected.surface === 'chat' ? '채팅형' : '게시글형'} · 읽기 전용 수집 기록</span><span>원본 확인 {selected.updatedAt}</span></footer></>}
         </section>
         <aside className="reply-column" aria-label="답변 검수">{!selected ? <div className="panel-empty"><strong>문의를 선택해 주세요.</strong></div> : <><div className="reply-scroll">
           <section className="reply-section ai-section"><div className="section-title"><div><span className="section-kicker ai">AI</span><h3>{selected.ai?.mode === 'eval' ? 'AI 검증 초안' : 'AI 추천답변'}</h3></div>{selected.ai && <span className={`risk risk-${selected.ai.risk}`}>위험도 {selected.ai.risk}</span>}</div><div className="not-sent-label">{selected.ai?.mode === 'eval' ? '답변 완료 후 생성된 학습·검증용 초안 · 실제 사람 답변과 비교' : '사람 답변과 구분 · 자동 전송되지 않은 참고 문장'}</div>{selected.ai ? <><div className="draft-card ai-draft">{selected.ai.text}</div><div className="ai-reason"><strong>{selected.ai.mode === 'eval' ? '검증 조건' : '필수 확인사항'}</strong><p>{selected.ai.reason}</p><small>{selected.ai.generatedAt} · {selected.ai.mode === 'eval' ? 'EVAL 섀도 초안' : '저장된 AI 초안'}</small></div><div className="button-row"><button className="secondary-button" onClick={() => copyText(selected.ai!.text)}>복사</button>{selected.ai.mode !== 'eval' && <button className="purple-button" onClick={() => applyComposition({ composition_source_type: 'AI_DRAFT', composition_source_id: selected.draftId ?? 'AI_DRAFT', composition_source_version: selected.ai!.generatedAt }, selected.ai!.text)}>수정란에 적용</button>}</div></> : selected.skipDecision ? <div className="empty-draft decision-empty"><span>✓</span><strong>{selected.status === 'no-reply' ? '답변 불필요로 분류했습니다.' : '이번 수집에서는 AI 초안을 만들지 않았습니다.'}</strong><p>{selected.skipDecision.reason}</p>{selected.skipDecision.checks.length > 0 && <small>확인사항 · {selected.skipDecision.checks.join(' · ')}</small>}<code>{selected.skipDecision.reasonCode}</code></div> : <div className="empty-draft"><span>✦</span><strong>AI 처리 결과를 기다리고 있습니다.</strong><p>다음 수집에서 생성 여부와 제외 사유가 함께 표시됩니다.</p></div>}</section>
           <CompositionWorkbench item={selected} source={compositionSource} locked={compositionLocked} lockReason={compositionLockReason} templateSearch={templateSearch} templateMatches={templateMatches} selectedTemplate={selectedTemplate} unresolvedVariables={unresolvedVariables} onSearch={setTemplateSearch} onSelectSource={setCompositionSource} onApply={applyComposition} />
-          <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>{selected.ai?.mode === 'eval' ? '검증 메모' : '사람 수정본'}</h3></div><span className="draft-status">{selected.ai?.mode === 'eval' ? 'EVAL · 실제 답변과 비교' : (selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력')}</span></div><label className="editor-label" htmlFor="human-draft">{selected.ai?.mode === 'eval' ? '학습·검증용 초안은 실제 답변과 비교만 합니다.' : '쇼핑몰에 복사할 최종 문장을 확인하세요.'}</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} disabled={compositionLocked} placeholder={selected.ai?.mode === 'eval' ? '아래 실제 사람 답변과 AI 검증 초안을 비교해 주세요.' : 'AI 추천을 적용하거나 직접 답변을 작성하세요.'}/><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" disabled={!selected.draftId || compositionLocked || !localReviewEnabled || reviewSaving} onClick={() => saveReview('REJECTED')}>초안 거절</button><button className="primary-button" disabled={!selected.draftId || compositionLocked || unresolvedVariables.length > 0 || !localReviewEnabled || !editor.trim() || reviewSaving} onClick={() => saveReview('APPROVED')}>{reviewSaving ? '저장 중' : '검수 저장'}</button><button className="secondary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">{selected.ai?.mode === 'eval' ? '학습·검증용 섀도 초안입니다. 운영 상태와 쇼핑몰 답변에는 영향을 주지 않습니다.' : (localReviewEnabled ? '개발 검수 저장소에 사람 검수본만 저장합니다. 쇼핑몰로는 전송하지 않습니다.' : '검수 저장은 로컬 development 화면에서만 사용할 수 있습니다. 쇼핑몰로는 전송하지 않습니다.')}</p></section>
+          <section className="reply-section human-section"><div className="section-title"><div><span className="section-kicker human">사람</span><h3>{selected.ai?.mode === 'eval' ? '검증 메모' : '사람 수정본'}</h3></div><span className="draft-status">{selected.ai?.mode === 'eval' ? 'EVAL · 실제 답변과 비교' : (selected.humanRevision ? `${selected.humanRevision.state} · ${selected.humanRevision.reviewedAt}` : '브라우저 임시 입력')}</span></div><label className="editor-label" htmlFor="human-draft">{selected.ai?.mode === 'eval' ? '학습·검증용 초안은 실제 답변과 비교만 합니다.' : '쇼핑몰에 복사할 최종 문장을 확인하세요.'}</label><textarea id="human-draft" value={editor} onChange={(event) => setEditor(event.target.value)} disabled={compositionLocked} placeholder={selected.ai?.mode === 'eval' ? '아래 실제 사람 답변과 AI 검증 초안을 비교해 주세요.' : 'AI 추천을 적용하거나 직접 답변을 작성하세요.'}/><label className="review-reason"><span>수정·판단 이유</span><input value={reviewReason} onChange={(event) => setReviewReason(event.target.value)} disabled={compositionLocked} placeholder="예: 출고일을 확정할 수 없어 확인 문구로 수정"/></label><div className="editor-footer"><span>{editor.length}자</span><div className="button-row"><button className="secondary-button" disabled={!selected.draftId || compositionLocked || !localReviewEnabled || reviewSaving} onClick={() => saveReview('REJECTED')}>초안 거절</button><button className="primary-button" disabled={!selected.draftId || compositionLocked || unresolvedVariables.length > 0 || !localReviewEnabled || !editor.trim() || reviewSaving} onClick={() => saveReview('APPROVED')}>{reviewSaving ? '저장 중' : '검수 저장'}</button><button className="secondary-button" disabled={!editor.trim()} onClick={() => copyText(editor)}>답변 복사</button></div></div><p className="send-boundary">{selected.ai?.mode === 'eval' ? '학습·검증용 섀도 초안입니다. 운영 상태와 쇼핑몰 답변에는 영향을 주지 않습니다.' : (localReviewEnabled ? '개발 검수 저장소에 사람 검수본만 저장합니다. 쇼핑몰로는 전송하지 않습니다.' : '검수 저장은 현재 development 화면에서만 사용할 수 있습니다. 쇼핑몰로는 전송하지 않습니다.')}</p></section>
+          {learningCandidate && <section className="reply-section learning-section"><div className="section-title"><div><span className="section-kicker learning">학습</span><h3>AI 참고 라이브러리</h3></div><span className={`learning-state ${learningCandidate.state.toLowerCase()}`}>{learningCandidate.state}</span></div><p className="learning-help">검수한 사람 답변을 자동 학습시키지 않습니다. 내용을 확인하고 이유를 적은 뒤 명시적으로 등록해 주세요.</p><div className="learning-preview"><strong>고객 문의</strong><p>{learningCandidate.question}</p><strong>검증 답변</strong><p>{learningCandidate.answer}</p></div><label className="review-reason"><span>학습시키는 이유</span><textarea value={learningReason} onChange={(event) => setLearningReason(event.target.value)} disabled={learningCandidate.state === 'USE'} placeholder="예: 실제 배송문의에서 검증된 안전한 안내 문장"/></label><button className="learning-button" disabled={!localReviewEnabled || learningSaving || learningCandidate.state === 'USE' || !learningReason.trim()} onClick={trainCandidate}>{learningCandidate.state === 'USE' ? '학습 라이브러리에 등록됨' : learningSaving ? '저장 중…' : 'AI 학습시키기'}</button></section>}
           <section className={`reply-section actual-section ${selected.actualReply ? 'verified' : ''}`}><div className="section-title"><div><span className="section-kicker actual">실제</span><h3>쇼핑몰 실제 답변</h3></div>{selected.actualReply ? <span className="verified-label">✓ 확인 완료</span> : <span className="unverified-label">미확인</span>}</div>{selected.actualReply ? <><div className="draft-card actual-draft">{selected.actualReply.text}</div><div className="verification-meta"><span>답변 시각 {selected.actualReply.sentAt}</span><span>최근 수집 확인 {selected.actualReply.verifiedAt}</span></div></> : <div className="verification-empty"><span className="scan-icon">⌁</span><div><strong>판매자 답변이 아직 확인되지 않았습니다.</strong><p>다음 수집에서 쇼핑몰 메시지와 답변 상태를 다시 확인합니다.</p></div></div>}</section>
         </div><div className="reply-bottom-bar"><div><span className="reply-state-dot" style={{ background: statusMeta[selected.status].dot }}/><strong>{statusMeta[selected.status].label}</strong></div><button onClick={() => notify('이 버튼은 아직 수집 매크로를 실행하지 않습니다.')}>답변 재확인 준비중</button></div></>}</aside>
       </div>
-    </section>{sourceGuide && <div className="source-guide-backdrop" role="presentation" onMouseDown={() => setSourceGuide(null)}><section className="source-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="source-guide-title" aria-describedby="source-guide-description" onMouseDown={(event) => event.stopPropagation()}><div className="source-guide-heading"><div><span className="source-guide-kicker">원문 확인</span><h2 id="source-guide-title">개별 문의 링크가 아닙니다.</h2></div><button className="dialog-close" type="button" aria-label="안내 닫기" onClick={() => setSourceGuide(null)}>×</button></div><p id="source-guide-description">이 버튼은 해당 문의를 바로 여는 주소가 아니라 쇼핑몰 문의관리 목록으로 이동합니다. 목록에서 아래 참조값 또는 상품명으로 문의를 확인해 주세요. 판매자센터 로그인 상태를 이어받으려면 이 검수함을 먼저 CS Chrome에서 열어 주세요.</p><dl className="source-guide-reference"><dt>상품</dt><dd>{sourceGuide.product}</dd>{sourceGuide.reference && <><dt>참조값</dt><dd><code>{sourceGuide.reference}</code><button className="copy-reference" type="button" onClick={() => copyText(sourceGuide.reference)}>복사</button></dd></>}</dl><div className="source-guide-actions"><button className="secondary-button" type="button" onClick={() => setSourceGuide(null)}>닫기</button><button className="primary-button" type="button" onClick={() => { setSourceGuide(null); openExternal(sourceGuide.url, '문의관리'); }}>문의관리 새 탭 ↗</button></div></section></div>}{toast && <div className="toast" role="status">{toast}</div>}
+    </section>
+    {sourceSnapshotOpen && selected && <div className="source-guide-backdrop snapshot-backdrop" role="presentation" onMouseDown={() => setSourceSnapshotOpen(false)}><section className="source-snapshot-dialog" role="dialog" aria-modal="true" aria-labelledby="source-snapshot-title" onMouseDown={(event) => event.stopPropagation()}><div className="source-guide-heading"><div><span className="source-guide-kicker">수집 원문</span><h2 id="source-snapshot-title">{selected.product}</h2></div><button className="dialog-close" type="button" aria-label="원문 닫기" onClick={() => setSourceSnapshotOpen(false)}>×</button></div><div className="snapshot-meta"><span>{selected.channel}</span><span>{selected.surface === 'chat' ? '채팅형' : '게시글형'}</span><span>고객 {selected.customer}</span><span>{selected.updatedAt}</span></div>{selected.productThumbnailUrl && <img className="snapshot-product-image" src={selected.productThumbnailUrl} alt="상품 이미지" referrerPolicy="no-referrer"/>}<div className="snapshot-conversation">{selected.messages.length ? selected.messages.map((message) => <article key={`snapshot-${message.id}`} className={`snapshot-message ${message.actor}`}><header><strong>{message.actor === 'seller' ? '판매자 실제 답변' : '고객'}</strong><time>{message.time}</time></header><AttachmentGallery attachments={message.attachments}/><p>{message.text}</p></article>) : <div className="collection-gap"><span>!</span><strong>수집된 본문이 없습니다.</strong><p>다음 수집에서 상세 본문과 이미지를 다시 확인해 주세요.</p></div>}</div><div className="snapshot-actions"><span>{selected.imageCount > 0 ? `이미지 ${selected.imageCount}개 기록` : '이미지 없음'}</span><div>{selected.sourceUrl && <button className="secondary-button" onClick={() => copyText(selected.sourceUrl)}>주소 복사</button>}{selected.sourceUrl && <button className="primary-button" onClick={() => selected.sourceUrlKind === 'LIST' ? setSourceGuide({ url: selected.sourceUrl, reference: selected.sourceReference, product: selected.product }) : openExternal(selected.sourceUrl, '판매자센터 원문')}>판매자센터에서 열기 ↗</button>}</div></div></section></div>}
+    {templateManagerOpen && <div className="source-guide-backdrop template-backdrop" role="presentation" onMouseDown={() => setTemplateManagerOpen(false)}><section className="template-manager-dialog" role="dialog" aria-modal="true" aria-labelledby="template-manager-title" onMouseDown={(event) => event.stopPropagation()}><div className="source-guide-heading"><div><span className="source-guide-kicker">답변 작성 도구</span><h2 id="template-manager-title">답변 템플릿 관리</h2></div><button className="dialog-close" type="button" aria-label="템플릿 관리 닫기" onClick={() => setTemplateManagerOpen(false)}>×</button></div><div className="template-manager-grid"><div className="template-record-list"><div className="template-upload"><label className="secondary-button" htmlFor="template-csv">CSV 업로드</label><input id="template-csv" type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadTemplates(file); event.currentTarget.value = ''; }}/><small>template_name, template_text 필수 · 확인사항은 | 로 구분</small></div>{templateRecords.length ? templateRecords.map((record) => <article key={record.id} className={`template-record ${record.state.toLowerCase()}`}><div><strong>{record.title}</strong><small>{record.meta || '공통 템플릿'} · {record.version} · {record.state}</small></div><p>{record.text}</p><div className="button-row"><button className="secondary-button" onClick={() => editTemplate(record)}>수정</button>{record.state !== 'EXCLUDE' && <button className="danger-button" disabled={templateSaving || !localReviewEnabled} onClick={() => disableTemplate(record)}>사용 중지</button>}</div></article>) : <div className="collection-gap"><span>⌁</span><strong>저장된 템플릿이 없습니다.</strong><p>오른쪽에서 직접 작성하거나 CSV로 업로드하세요.</p></div>}</div><form className="template-form" onSubmit={(event) => { event.preventDefault(); void saveTemplate(templateForm); }}><label><span>템플릿명 *</span><input value={templateForm.name} onChange={(event) => setTemplateForm({ ...templateForm, name: event.target.value })}/></label><label><span>답변 본문 *</span><textarea value={templateForm.body} onChange={(event) => setTemplateForm({ ...templateForm, body: event.target.value })} placeholder="[상품명], [출고일]처럼 확인 후 치환할 값을 대괄호로 표시"/></label><div className="template-form-row"><label><span>키</span><input value={templateForm.key} onChange={(event) => setTemplateForm({ ...templateForm, key: event.target.value })} placeholder="자동 생성 가능"/></label><label><span>버전</span><input value={templateForm.version} onChange={(event) => setTemplateForm({ ...templateForm, version: event.target.value })}/></label></div><div className="template-form-row"><label><span>마켓</span><input value={templateForm.market} onChange={(event) => setTemplateForm({ ...templateForm, market: event.target.value })}/></label><label><span>채널</span><input value={templateForm.channel} onChange={(event) => setTemplateForm({ ...templateForm, channel: event.target.value })}/></label></div><label><span>문의 분류</span><input value={templateForm.intent} onChange={(event) => setTemplateForm({ ...templateForm, intent: event.target.value })}/></label><label><span>필수 확인사항</span><textarea className="checks-input" value={templateForm.checks} onChange={(event) => setTemplateForm({ ...templateForm, checks: event.target.value })} placeholder={'한 줄에 하나씩 입력\n예: 실제 출고 예정일 확인'}/></label><div className="template-form-actions"><button type="button" className="secondary-button" onClick={() => setTemplateForm(EMPTY_TEMPLATE_FORM)}>새로 작성</button><button type="submit" className="primary-button" disabled={!localReviewEnabled || templateSaving || !templateForm.name.trim() || !templateForm.body.trim()}>{templateSaving ? '저장 중…' : templateForm.id ? '수정 저장' : '템플릿 저장'}</button></div><p className="send-boundary">템플릿은 답변 작성 참고자료로만 저장되며 쇼핑몰에 자동 입력하거나 전송하지 않습니다.</p></form></div></section></div>}
+    {sourceGuide && <div className="source-guide-backdrop" role="presentation" onMouseDown={() => setSourceGuide(null)}><section className="source-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="source-guide-title" aria-describedby="source-guide-description" onMouseDown={(event) => event.stopPropagation()}><div className="source-guide-heading"><div><span className="source-guide-kicker">원문 확인</span><h2 id="source-guide-title">개별 문의 링크가 아닙니다.</h2></div><button className="dialog-close" type="button" aria-label="안내 닫기" onClick={() => setSourceGuide(null)}>×</button></div><p id="source-guide-description">이 버튼은 해당 문의를 바로 여는 주소가 아니라 쇼핑몰 문의관리 목록으로 이동합니다. 목록에서 아래 참조값 또는 상품명으로 문의를 확인해 주세요. 판매자센터 로그인 상태를 이어받으려면 이 검수함을 먼저 CS Chrome에서 열어 주세요.</p><dl className="source-guide-reference"><dt>상품</dt><dd>{sourceGuide.product}</dd>{sourceGuide.reference && <><dt>참조값</dt><dd><code>{sourceGuide.reference}</code><button className="copy-reference" type="button" onClick={() => copyText(sourceGuide.reference)}>복사</button></dd></>}</dl><div className="source-guide-actions"><button className="secondary-button" type="button" onClick={() => setSourceGuide(null)}>닫기</button><button className="primary-button" type="button" onClick={() => { setSourceGuide(null); openExternal(sourceGuide.url, '문의관리'); }}>문의관리 새 탭 ↗</button></div></section></div>}{toast && <div className="toast" role="status">{toast}</div>}
   </main>;
 }

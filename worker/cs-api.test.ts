@@ -8,6 +8,7 @@ import {
   type ReviewDraftInput,
   type ReviewLibraryInput,
   type SyncRunInput,
+  type UpdateTemplateStateInput,
   type UpsertDraftInput,
   type UpsertTemplateInput,
 } from "./cs-api.ts";
@@ -25,6 +26,7 @@ class FakeStore implements CsStore {
   async syncRun(input: SyncRunInput) { this.calls.push({ name: "syncRun", value: input }); return { ok: true, run_id: input.run_id }; }
   async upsertDraft(input: UpsertDraftInput) { this.calls.push({ name: "upsertDraft", value: input }); return { ok: true, draft_id: "draft-1", purpose: input.purpose }; }
   async upsertTemplate(input: UpsertTemplateInput) { this.calls.push({ name: "upsertTemplate", value: input }); return { ok: true, template_id: input.template_key }; }
+  async setTemplateState(templateId: string, input: UpdateTemplateStateInput) { this.calls.push({ name: "setTemplateState", value: { templateId, input } }); return { ok: true, template_id: templateId, quality_state: input.quality_state }; }
   async reviewLibraryEntry(entryId: string, input: ReviewLibraryInput) { this.calls.push({ name: "reviewLibraryEntry", value: { entryId, input } }); return { ok: true, library_entry_id: entryId, quality_state: input.quality_state }; }
   async reviewReplyDraft(draftId: string, input: ReviewDraftInput) {
     this.calls.push({ name: "reviewReplyDraft", value: { draftId, input } });
@@ -73,6 +75,12 @@ test("writes require the exact key and fixed development safety", async () => {
   const result = await api(request("/api/cs/sync", json(body)));
   assert.equal(result.status, 200);
   assert.equal(store.calls.at(-1)?.name, "syncRun");
+  const datedReport = { ...body, run_id: "SYNC_dated", report: {
+    range: { start: "2026-09-01", end: "2026-09-01" },
+    summary: { marketplace_write_actions: 0 },
+    records: [{ seller_replies: [{ text: "상품 링크 https://smartstore.naver.com/pink-rocket/products/4991864859" }] }],
+  } };
+  assert.equal((await api(request("/api/cs/sync", json(datedReport)))).status, 200);
   assert.equal((await api(request("/api/cs/sync", json({ ...body, auto_send: true })))).status, 400);
   assert.equal((await api(request("/api/cs/sync", json({ ...body, action: "send_reply" })))).status, 400);
 });
@@ -113,6 +121,9 @@ test("template and answer-library routes expose only review-safe operations", as
   const template = { template_key: "delivery", template_version: "v1", template_name: "배송 확인", template_text: "출고 일정을 확인해 안내드리겠습니다.", required_checks: ["출고 일정 확인"], ...safety };
   assert.equal((await api(request("/api/cs/templates", json(template)))).status, 201);
   assert.equal(store.calls.at(-1)?.name, "upsertTemplate");
+  const templateState = { quality_state: "EXCLUDE", ...safety };
+  assert.equal((await api(request("/api/cs/templates/TEMPLATE_abc", { ...json(templateState), method: "PATCH" }))).status, 200);
+  assert.equal(store.calls.at(-1)?.name, "setTemplateState");
   const libraryReview = { quality_state: "USE", review_note: "검증 완료", ...safety };
   assert.equal((await api(request("/api/cs/library/ANSWER_abc", { ...json(libraryReview), method: "PATCH" }))).status, 200);
   assert.equal(store.calls.at(-1)?.name, "reviewLibraryEntry");

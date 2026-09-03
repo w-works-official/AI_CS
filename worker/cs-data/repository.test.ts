@@ -71,7 +71,7 @@ function input(): SyncRunInput {
 }
 async function repository(): Promise<{ db: SqliteD1; store: CsDataRepository }> {
   const db = new SqliteD1();
-  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql", "0003_review_composition_and_knowledge.sql"]) {
+  for (const migration of ["0001_initial.sql", "0002_draft_decision_diagnostics.sql", "0003_review_composition_and_knowledge.sql", "0004_message_attachments.sql"]) {
     const schemaPath = fileURLToPath(new URL(`./migrations/${migration}`, import.meta.url));
     db.database.exec(await readFile(schemaPath, "utf8"));
   }
@@ -82,7 +82,7 @@ test("actual migrations accept repository sync, detail, overview, and cursor que
   const { db, store } = await repository();
   try {
     assert.deepEqual(await store.health(), { ok: true, service: "ai-cs-d1-repository", schema_version: "v1", write_policy: "MASKED_DTO_ONLY" });
-    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: false, inserted_cases: 1, updated_cases: 0, inserted_messages: 2, inserted_drafts: 1 });
+    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: false, inserted_cases: 1, updated_cases: 0, inserted_messages: 2, inserted_attachments: 0, inserted_drafts: 1 });
     assert.deepEqual(await store.overview(), {
       total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, closed: 0,
       by_market: { SMARTSTORE: 1 },
@@ -91,11 +91,31 @@ test("actual migrations accept repository sync, detail, overview, and cursor que
     const list = await store.listCases({ limit: 1, cursor: 0, filters: { market: "SMARTSTORE", ai_draft_state: "READY" } });
     assert.equal(list.items[0].case_key, caseRow.case_key); assert.equal(list.next_cursor, null);
     const detail = await store.getCase(caseRow.case_key);
-    assert.equal(detail?.messages.length, 2); assert.equal(detail?.drafts.length, 1); assert.equal(detail?.decisions.length, 1);
+    assert.equal(detail?.messages.length, 2); assert.equal(detail?.attachments.length, 0); assert.equal(detail?.drafts.length, 1); assert.equal(detail?.decisions.length, 1);
     assert.equal(detail?.decisions[0].required_checks_json, '["송장 확인"]');
     db.database.prepare("UPDATE cs_cases SET reply_state = 'NO_REPLY' WHERE case_key = ?").run(caseRow.case_key);
     const noReply = await store.listCases({ filters: { reply_state: "NO_REPLY_REQUIRED" } });
     assert.equal(noReply.items[0].case_key, caseRow.case_key);
+  } finally { db.close(); }
+});
+
+test("repository stores attachment metadata with its message and returns it in case detail", async () => {
+  const { db, store } = await repository();
+  try {
+    const withAttachment = input();
+    withAttachment.run_id = "SYNC:attachment";
+    withAttachment.drafts = [];
+    withAttachment.decisions = [];
+    withAttachment.attachments = [{
+      attachment_key: "ATTACHMENT:case-1:1", message_key: "MSG:case-1:customer", case_key: caseRow.case_key,
+      ordinal: 1, asset_url: "https://shop-phinf.pstatic.net/example.jpg", thumbnail_url: "https://shop-phinf.pstatic.net/thumb.jpg",
+      alt_text_masked: "문의 첨부 이미지", media_type: "IMAGE", access_state: "PUBLIC_URL",
+    }];
+    const result = await store.syncRun(withAttachment);
+    assert.equal(result.inserted_attachments, 1);
+    const detail = await store.getCase(caseRow.case_key);
+    assert.equal(detail?.attachments.length, 1);
+    assert.equal(detail?.attachments[0].access_state, "PUBLIC_URL");
   } finally { db.close(); }
 });
 
@@ -146,7 +166,7 @@ test("sync run is idempotent through sync_runs.run_id and uses only bindings", a
   const { db, store } = await repository();
   try {
     await store.syncRun(input());
-    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_drafts: 0 });
+    assert.deepEqual(await store.syncRun(input()), { run_id: "SYNC:case-1", duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_attachments: 0, inserted_drafts: 0 });
     assert.equal(db.calls.every((call) => !call.sql.includes(caseRow.case_key) && !call.sql.includes("DRAFT:case-1")), true);
   } finally { db.close(); }
 });

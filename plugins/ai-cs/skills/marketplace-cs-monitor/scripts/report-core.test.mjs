@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { applyAiDrafts, applyDraftDecisions, buildReport, normalizeMarketplaceUrl } from "./report-core.mjs";
+import { applyAiDrafts, applyDraftDecisions, buildReport, inspectUnmaskedPii, maskSensitiveText, normalizeMarketplaceUrl } from "./report-core.mjs";
 import { selectDraftCandidates } from "./ai-draft-core.mjs";
 import { isCustomerAcknowledgement } from "./conversation-policy.mjs";
 
@@ -39,6 +39,9 @@ assert.equal(first.summary.needs_reply_count, 1);
 assert.equal(first.summary.talktalk_read_state_transitions, 2);
 assert.equal(first.channels.smartstore_talktalk.read_state_transition_count, 2);
 assert.match(first.records[0].preview, /010-\*\*\*\*-\*\*\*\*/);
+assert.match(maskSensitiveText("우리 1002-123-456789 입금"), /우리 \[계좌 마스킹\] 입금/);
+assert.deepEqual(inspectUnmaskedPii("우리 1002-123-456789 입금"), ["ACCOUNT"]);
+assert.deepEqual(inspectUnmaskedPii(maskSensitiveText("우리 1002-123-456789 입금")), []);
 assert.equal(first.records.find((row) => row.market === "ably").reply_state, "NO_REPLY");
 assert.equal(first.records.find((row) => row.market === "zigzag").reply_state, "NEEDS_REPLY");
 assert.equal(first.summary.reconciled_channel_count, 1);
@@ -126,6 +129,33 @@ assert.match(linkedRecord.source_url, /^https:\/\/talk\.naver\.com\/ct\/thread-1
 assert.equal(linkedRecord.source_reference, "TT-0b6d54a12345");
 assert.equal(linkedRecord.product_name, "샘플 피어싱");
 assert.equal(linkedRecord.messages[0].image_count, 1);
+
+const imageInput = structuredClone(base);
+imageInput.range = { start: "2026-09-03", end: "2026-09-03" };
+imageInput.collected_at = "2026-09-03T00:00:00.000Z";
+imageInput.channels.smartstore_talktalk = {
+  market: "smartstore", channel: "talktalk", attempted: true, visible_total: 1,
+  records: [{
+    thread_id: "image-thread",
+    customer_name: "고객",
+    message_date: "2026-09-03",
+    status: "진행중",
+    source_url: "https://sell.smartstore.naver.com/#/talktalk/chat/ct/image-thread",
+    source_url_kind: "EXACT",
+    messages: [{ direction: "customer", text: "사진 확인 부탁드립니다", image_count: 2, images: [
+      { src: "https://shop-phinf.pstatic.net/example.jpg", alt: "첨부 상품 사진" },
+      { src: "https://evil.example/customer.jpg", alt: "외부 사진" },
+    ] }],
+    conversation_complete: true,
+  }],
+};
+const imageReport = buildReport(imageInput, []);
+const imageRecord = imageReport.records.find((row) => row.channel === "talktalk");
+assert.equal(imageRecord.messages[0].image_count, 2);
+assert.equal(imageRecord.messages[0].images.length, 2);
+assert.equal(imageRecord.messages[0].images[0].access_state, "PUBLIC_URL");
+assert.equal(imageRecord.messages[0].images[1].access_state, "SESSION_REQUIRED");
+assert.equal(imageRecord.pii_scan, "PASS");
 assert.equal(linkedRecord.conversation_complete, true);
 const legacyCompletenessInput = structuredClone(linkedTalktalkInput);
 delete legacyCompletenessInput.channels.smartstore_talktalk.records[0].conversation_complete;

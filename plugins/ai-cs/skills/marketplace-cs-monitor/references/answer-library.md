@@ -23,6 +23,8 @@ Build candidates with `buildAnswerLibrary(maskedRecords)` and keep only rows tha
 
 Seller-only TalkTalk previews, metadata-only historical records, AI drafts, and rejected/unused drafts are not human-answer examples. Never promote them automatically.
 
+In the development D1 review desk, saving an approved human revision creates only a `CANDIDATE`. The reviewer must press `AI 학습시키기`, inspect the masked question and answer, and record a reason before the entry becomes `USE`. Rejection or omission must not promote the entry. This is an explicit review action in the local knowledge store, not model fine-tuning and not a marketplace action.
+
 The installed reference pool has two approved inputs:
 
 - current masked Sheet cases that contain the complete customer question and human reply;

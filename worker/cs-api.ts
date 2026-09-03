@@ -78,6 +78,11 @@ export type ReviewLibraryInput = {
   environment: "development"; auto_send: false; marketplace_write_actions: 0;
 };
 
+export type UpdateTemplateStateInput = {
+  quality_state: "USE" | "EXCLUDE";
+  environment: "development"; auto_send: false; marketplace_write_actions: 0;
+};
+
 export interface CsStore {
   health(): Promise<CsStoreResult>;
   overview(): Promise<CsStoreResult>;
@@ -88,6 +93,7 @@ export interface CsStore {
   syncRun(input: SyncRunInput): Promise<CsStoreResult>;
   upsertDraft(input: UpsertDraftInput): Promise<CsStoreResult>;
   upsertTemplate(input: UpsertTemplateInput): Promise<CsStoreResult>;
+  setTemplateState(templateId: string, input: UpdateTemplateStateInput): Promise<CsStoreResult>;
   reviewLibraryEntry(entryId: string, input: ReviewLibraryInput): Promise<CsStoreResult>;
   /** Implementations must reject persisted EVAL drafts with EVAL_REVIEW_FORBIDDEN. */
   reviewReplyDraft(draftId: string, input: ReviewDraftInput): Promise<CsStoreResult>;
@@ -119,6 +125,7 @@ const rootFields = {
   review: new Set(["draft_state", "review_note", "human_revision", "purpose", "composition_source_type", "composition_source_id", "composition_source_version", "base_text_hash", "final_text_hash", "unresolved_variables", "source_content_hash", "environment", "auto_send", "marketplace_write_actions"]),
   template: new Set(["template_key", "template_version", "template_name", "template_text", "market", "channel", "intent", "required_checks", "quality_state", "environment", "auto_send", "marketplace_write_actions"]),
   libraryReview: new Set(["quality_state", "review_note", "environment", "auto_send", "marketplace_write_actions"]),
+  templateState: new Set(["quality_state", "environment", "auto_send", "marketplace_write_actions"]),
 };
 const forbiddenMutationFields = new Set([
   "action", "marketplace_action", "marketplace_reply", "reply_action", "send", "send_reply", "send_message",
@@ -131,9 +138,28 @@ const piiPatterns: Array<[string, RegExp]> = [
   ["RAW_EMAIL", /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i],
   ["RAW_LONG_NUMBER", /\b\d{10,}\b/],
   ["RAW_ACCOUNT", /(?:계좌|은행|bank\s*account|account\s*(?:no|number))\s*[:：#-]?\s*[0-9][0-9 -]{5,}/i],
-  ["RAW_ACCOUNT", /\b\d{2,6}-\d{2,6}-\d{2,8}\b/],
+  ["RAW_ACCOUNT", /\b(?!\d{4}-\d{2}-\d{2}\b)\d{2,6}-\d{2,6}-\d{2,8}\b/],
   ["RAW_ADDRESS", /(?:주소|배송지|수령지|우편번호|address)\s*[:：#-]?\s*[^\n]{2,}/i],
 ];
+const marketplaceUrlSuffixes = ["naver.com", "kakaostyle.com", "a-bly.com", "zigzag.kr"];
+
+function maskPublicProductIdsForPii(value: string): string {
+  return value.replace(/https:\/\/[^\s<>"']+/gi, (rawUrl) => {
+    try {
+      const url = new URL(rawUrl);
+      const host = url.hostname.toLowerCase();
+      if (!marketplaceUrlSuffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return rawUrl;
+      const segments = url.pathname.split("/");
+      for (let index = 1; index < segments.length; index += 1) {
+        if (segments[index - 1] === "products" && /^\d{6,}$/.test(segments[index])) segments[index] = "PUBLIC_PRODUCT_ID";
+      }
+      url.pathname = segments.join("/");
+      return url.toString();
+    } catch {
+      return rawUrl;
+    }
+  });
+}
 
 function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -164,10 +190,11 @@ function requireDevelopmentSafety(body: JsonObject): void {
 function inspectPayload(value: unknown, path = "body", depth = 0): void {
   if (depth > 20) throw new CsApiError("JSON_NESTING_TOO_DEEP", 400);
   if (typeof value === "string") {
-    const structuralValue = /(?:^|\.)(?:run_id|case_key|draft_id|source_key|source_message_id|content_hash|source_content_hash|product_id|reference_ids|source_url|product_url|product_thumbnail_url)(?:\[\d+\])?$/.test(path);
+    const structuralValue = /(?:^|\.)(?:run_id|case_key|draft_id|source_key|source_message_id|content_hash|source_content_hash|product_id|reference_ids|source_url|product_url|product_thumbnail_url|url|src|thumbnail_url|thumbnail)(?:\[\d+\])?$/.test(path);
+    const piiScanValue = maskPublicProductIdsForPii(value);
     for (const [code, pattern] of piiPatterns) {
       if (code === "RAW_LONG_NUMBER" && structuralValue) continue;
-      if (pattern.test(value)) throw new CsApiError(`PII_${code}`, 400);
+      if (pattern.test(piiScanValue)) throw new CsApiError(`PII_${code}`, 400);
     }
     return;
   }
@@ -307,6 +334,15 @@ function parseLibraryReview(body: JsonObject): ReviewLibraryInput {
   };
 }
 
+function parseTemplateState(body: JsonObject): UpdateTemplateStateInput {
+  rejectUnknownFields(body, rootFields.templateState);
+  requireDevelopmentSafety(body);
+  return {
+    quality_state: parseQualityState(body.quality_state, false) as "USE" | "EXCLUDE",
+    environment: "development", auto_send: false, marketplace_write_actions: 0,
+  };
+}
+
 function corsHeaders(request: Request, allowedOrigins: Set<string>): Headers {
   const headers = new Headers({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Vary": "Origin" });
   const origin = request.headers.get("Origin");
@@ -442,6 +478,15 @@ function libraryEntryIdFromPath(pathname: string): string | null {
   return id;
 }
 
+function templateIdFromPath(pathname: string): string | null {
+  const match = /^\/api\/cs\/templates\/([^/]+)$/.exec(pathname);
+  if (!match) return null;
+  let id: string;
+  try { id = decodeURIComponent(match[1]); } catch { throw new CsApiError("INVALID_TEMPLATE_ID", 400); }
+  if (!/^[A-Za-z0-9:_-]{1,300}$/.test(id)) throw new CsApiError("INVALID_TEMPLATE_ID", 400);
+  return id;
+}
+
 function optionalQualityState(url: URL): "CANDIDATE" | "USE" | "EXCLUDE" | undefined {
   for (const [key] of url.searchParams) if (key !== "quality_state") throw new CsApiError("UNKNOWN_QUERY_PARAMETER", 400);
   if (url.searchParams.getAll("quality_state").length > 1) throw new CsApiError("DUPLICATE_QUERY_PARAMETER", 400);
@@ -482,6 +527,12 @@ export function createCsApiHandler(options: CsApiOptions): (request: Request) =>
         if (request.method !== "POST") return methodNotAllowed(request, allowedOrigins, ["GET", "POST"]);
         requireSyncKey(request, options.syncKey);
         return response(request, allowedOrigins, assertSafeStoreResult(await options.store.upsertTemplate(parseTemplate(await parseJson(request, maxJsonBytes)))), 201);
+      }
+      const templateId = templateIdFromPath(url.pathname);
+      if (templateId !== null) {
+        if (request.method !== "PATCH") return methodNotAllowed(request, allowedOrigins, ["PATCH"]);
+        requireSyncKey(request, options.syncKey);
+        return response(request, allowedOrigins, assertSafeStoreResult(await options.store.setTemplateState(templateId, parseTemplateState(await parseJson(request, maxJsonBytes)))));
       }
       if (url.pathname === "/api/cs/library") {
         if (request.method !== "GET") return methodNotAllowed(request, allowedOrigins, ["GET"]);

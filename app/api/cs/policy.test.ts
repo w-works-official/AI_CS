@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeReviewRequest, normalizeSyncRequest } from "./policy.ts";
+import { assertSingletonReadParams, normalizeCaseBatchKeys, normalizeLibraryReviewRequest, normalizeReviewRequest, normalizeSyncRequest, normalizeTemplateRequest, normalizeTemplateStateRequest } from "./policy.ts";
 
 test("case batch accepts one to three distinct safe case keys", () => {
   assert.deepEqual(normalizeCaseBatchKeys("smartstore:talktalk:abc,ably:inquiry:def"), ["smartstore:talktalk:abc", "ably:inquiry:def"]);
@@ -92,6 +92,27 @@ test("sync request accepts only a masked read-only report", () => {
   assert.equal(result.report.records.length, 1);
   assert.equal(result.report.records[0].pii_scan, "PASS");
   assert.equal(result.report.records[0].source_url_kind, "LIST");
+});
+
+test("sync request preserves only allowlisted image metadata", () => {
+  const record = structuredClone(safeRecord);
+  record.messages[0].image_count = 2;
+  (record.messages[0] as typeof record.messages[0] & { images: Array<Record<string, unknown>> }).images = [
+    { url: "https://shop-phinf.pstatic.net/20260901/example.jpg", thumbnail_url: "https://shop-phinf.pstatic.net/20260901/thumb.jpg", alt_text: "상품 사진", access_state: "PUBLIC_URL" },
+    { url: "https://evil.example/private.jpg", alt_text: "", access_state: "PUBLIC_URL" },
+  ];
+  const result = normalizeSyncRequest({ action: "syncRun", report: { schema_version: 1, summary: { marketplace_write_actions: 0 }, records: [record] } });
+  const images = (result.report.records[0].messages as Array<Record<string, unknown>>)[0].images as Array<Record<string, unknown>>;
+  assert.equal(images[0].access_state, "PUBLIC_URL");
+  assert.equal(images[1].url, "");
+  assert.equal(images[1].access_state, "SESSION_REQUIRED");
+});
+
+test("template and learning mutations stay development-only and bounded", () => {
+  assert.equal(normalizeTemplateRequest({ action: "upsertTemplate", template_key: "delivery", template_version: "v1", template_name: "배송", template_text: "확인 후 안내드리겠습니다.", required_checks: ["출고일 확인"], ...{ environment: "development", auto_send: false, marketplace_write_actions: 0 } }).quality_state, "USE");
+  assert.equal(normalizeTemplateStateRequest({ action: "setTemplateState", template_id: "TEMPLATE:delivery", quality_state: "EXCLUDE", environment: "development", auto_send: false, marketplace_write_actions: 0 }).quality_state, "EXCLUDE");
+  assert.equal(normalizeLibraryReviewRequest({ action: "reviewLibraryEntry", library_entry_id: "ANSWER:reviewed", quality_state: "USE", review_note: "사람 검증 완료", environment: "development", auto_send: false, marketplace_write_actions: 0 }).quality_state, "USE");
+  assert.throws(() => normalizeTemplateRequest({ action: "upsertTemplate", template_key: "x", template_version: "v1", template_name: "x", template_text: "x", environment: "production", auto_send: false, marketplace_write_actions: 0 }), /DEVELOPMENT_SAFETY_REQUIRED/);
 });
 
 test("sync request rejects secret overrides, PII, and draft-state mismatches", () => {

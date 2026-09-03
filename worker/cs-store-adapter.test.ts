@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createCsApiHandler } from "./cs-api.ts";
 import { CsStoreAdapter } from "./cs-store-adapter.ts";
-import type { AnswerLibraryEntryInput, CaseDetailResult, CursorListInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, ReplyTemplateInput, SyncRunInput } from "./cs-data/types.ts";
+import type { AnswerLibraryEntryInput, CaseDetailResult, CursorListInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, ReplyTemplateInput, SyncRunInput, TemplateStateInput } from "./cs-data/types.ts";
 
 const safety = { environment: "development", auto_send: false, marketplace_write_actions: 0 } as const;
 const now = "2026-09-01T04:00:00.000Z";
@@ -14,6 +14,7 @@ class FakeRepository {
   template?: ReplyTemplateInput;
   libraryEntry?: AnswerLibraryEntryInput;
   libraryReview?: LibraryEntryReviewInput;
+  templateState?: TemplateStateInput;
   detail: CaseDetailResult | null = null;
   async health() { return { ok: true as const, service: "ai-cs-d1-repository" as const, schema_version: "v1" as const, write_policy: "MASKED_DTO_ONLY" as const }; }
   async overview() { return { total_live: 1, needs_reply: 1, answered: 0, review: 0, no_reply_required: 0, ai_ready: 1, closed: 0, by_market: { SMARTSTORE: 1 }, latest_sync: null }; }
@@ -21,9 +22,10 @@ class FakeRepository {
   async getCase(caseKey: string) { void caseKey; return this.detail; }
   async listTemplates() { return []; }
   async listLibraryEntries() { return []; }
-  async syncRun(input: SyncRunInput) { this.sync = input; return { run_id: input.run_id, duplicate_run: false, inserted_cases: input.cases.length, updated_cases: 0, inserted_messages: input.messages.length, inserted_drafts: input.drafts.length }; }
+  async syncRun(input: SyncRunInput) { this.sync = input; return { run_id: input.run_id, duplicate_run: false, inserted_cases: input.cases.length, updated_cases: 0, inserted_messages: input.messages.length, inserted_attachments: input.attachments?.length ?? 0, inserted_drafts: input.drafts.length }; }
   async upsertDraft(input: DraftInput) { this.draft = input; return { inserted: true }; }
   async upsertTemplate(input: ReplyTemplateInput) { this.template = input; return { inserted: true }; }
+  async setTemplateState(input: TemplateStateInput) { this.templateState = input; return { template_id: input.template_id, quality_state: input.quality_state, updated: true }; }
   async upsertLibraryEntry(input: AnswerLibraryEntryInput) { this.libraryEntry = input; return { inserted: true }; }
   async reviewLibraryEntry(input: LibraryEntryReviewInput) { this.libraryReview = input; return { library_entry_id: input.library_entry_id, quality_state: input.quality_state, reviewed: true }; }
   async reviewReplyDraft(input: DraftReviewInput) {
@@ -80,8 +82,50 @@ test("HTTP sync maps a masked collector report into stable D1 DTOs", async () =>
   assert.match(repository.sync?.messages[0].message_key ?? "", /^MSG:[a-f0-9]{16}:[a-f0-9]{16}$/);
   assert.deepEqual(await response.json(), {
     ok: true, run_id: "SYNC:20260901:001", duplicate_run: false, inserted_cases: 1, updated_cases: 0,
-    inserted_messages: 1, inserted_drafts: 1, ...safety,
+    inserted_messages: 1, inserted_attachments: 0, inserted_drafts: 1, ...safety,
   });
+});
+
+test("HTTP sync maps safe image metadata without storing image bytes or session URLs", async () => {
+  const repository = new FakeRepository();
+  const api = createCsApiHandler({ store: new CsStoreAdapter(repository, () => now), syncKey: "test-key" });
+  const imageReport = report();
+  const message = imageReport.records[0].messages[0] as Record<string, unknown>;
+  message.image_count = 2;
+  message.images = [
+    { url: "https://shop-phinf.pstatic.net/20260901/12345678901234.jpg", thumbnail_url: "https://shop-phinf.pstatic.net/20260901/thumb.jpg", alt_text: "문의 이미지", access_state: "PUBLIC_URL" },
+    { url: "", thumbnail_url: "", alt_text: "", access_state: "SESSION_REQUIRED" },
+  ];
+  const response = await api(jsonRequest("/api/cs/sync", { run_id: "SYNC:images", report: imageReport, ...safety }));
+  assert.equal(response.status, 200);
+  assert.equal(repository.sync?.attachments?.length, 2);
+  assert.equal(repository.sync?.attachments?.[0].access_state, "PUBLIC_URL");
+  assert.equal(repository.sync?.attachments?.[1].access_state, "SESSION_REQUIRED");
+  assert.equal(repository.sync?.attachments?.[0].asset_url.includes("12345678901234.jpg"), true);
+  assert.equal((await response.json() as Record<string, unknown>).inserted_attachments, 2);
+});
+
+test("post EVAL drafts link to synthesized customer preview and observed seller reply", async () => {
+  const repository = new FakeRepository();
+  const api = createCsApiHandler({ store: new CsStoreAdapter(repository, () => now), syncKey: "test-key" });
+  const post = report();
+  const record = post.records[0];
+  record.channel = "comments";
+  record.reply_state = "ANSWERED";
+  record.conversation_complete = null as unknown as boolean;
+  record.messages = [];
+  (record as typeof record & { seller_replies: Array<Record<string, unknown>> }).seller_replies = [
+    { at: now, text: "확인 후 변경해드렸습니다." },
+  ];
+  record.ai_draft_purpose = "EVAL";
+  post.draft_decisions[0].purpose = "EVAL";
+  const response = await api(jsonRequest("/api/cs/sync", { run_id: "SYNC:post-eval", report: post, ...safety }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(repository.sync?.messages.map((message) => message.actor), ["CUSTOMER", "SELLER"]);
+  assert.equal(repository.sync?.messages[0].text_masked, "언제 발송되나요");
+  assert.equal(repository.sync?.drafts[0].purpose, "EVAL");
+  assert.equal(repository.sync?.drafts[0].source_customer_message_key, repository.sync?.messages[0].message_key);
+  assert.equal(repository.sync?.drafts[0].source_seller_message_key, repository.sync?.messages[1].message_key);
 });
 
 test("adapter rejects unsafe URL hosts and incomplete chat drafts", async () => {
@@ -147,7 +191,7 @@ test("direct draft creation and human review remain local and REPLY-only", async
   const repository = new FakeRepository();
   repository.detail = {
     case: { case_key: "smartstore:talktalk:12345678901234", content_hash: "a".repeat(64), reply_state: "NEEDS_REPLY", conversation_complete: 1, last_sync_run_id: "SYNC:20260901:001" },
-    messages: [{ message_key: "MSG:customer", actor: "CUSTOMER", sequence: 1, text_masked: "언제 발송되나요" }], drafts: [], decisions: [], review_events: [],
+    messages: [{ message_key: "MSG:customer", actor: "CUSTOMER", sequence: 1, text_masked: "언제 발송되나요" }], attachments: [], drafts: [], decisions: [], review_events: [], learning_candidates: [],
   };
   const api = createCsApiHandler({ store: new CsStoreAdapter(repository, () => now), syncKey: "test-key" });
   const draft = await api(jsonRequest("/api/cs/drafts", {

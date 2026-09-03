@@ -1,4 +1,4 @@
-import type { AnswerLibraryEntryInput, CaseDetailResult, CaseFilters, CaseListItem, CaseSummaryInput, CsCaseInput, CsMessageInput, CursorListInput, CursorListResult, D1Database, D1PreparedStatement, DraftDecisionInput, DraftInput, DraftReviewInput, DraftReviewResult, HealthResult, LibraryEntryReviewInput, NoReplyPatternInput, OverviewResult, QualityState, ReplyTemplateInput, SyncRunInput, SyncRunResult } from "./types.ts";
+import type { AnswerLibraryEntryInput, CaseDetailResult, CaseFilters, CaseListItem, CaseSummaryInput, CsAttachmentInput, CsCaseInput, CsMessageInput, CursorListInput, CursorListResult, D1Database, D1PreparedStatement, DraftDecisionInput, DraftInput, DraftReviewInput, DraftReviewResult, HealthResult, LibraryEntryReviewInput, NoReplyPatternInput, OverviewResult, QualityState, ReplyTemplateInput, SyncRunInput, SyncRunResult, TemplateStateInput } from "./types.ts";
 
 const MAX_LIST_LIMIT = 100;
 const SERVICE = "ai-cs-d1-repository" as const;
@@ -72,16 +72,18 @@ export class CsDataRepository {
   async getCase(caseKey: string): Promise<CaseDetailResult | null> {
     const item = await this.db.prepare("SELECT * FROM cs_cases WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>();
     if (!item) return null;
-    const [summary, messages, drafts, decisions, reviewEvents] = await Promise.all([
+    const [summary, messages, attachments, drafts, decisions, reviewEvents, learningCandidates] = await Promise.all([
       this.db.prepare("SELECT * FROM case_summaries WHERE case_key = ?").bind(caseKey).first<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM cs_messages WHERE case_key = ? ORDER BY sequence ASC, message_key ASC").bind(caseKey).all<Record<string, unknown>>(),
+      this.db.prepare("SELECT * FROM cs_message_attachments WHERE case_key = ? ORDER BY message_key ASC, ordinal ASC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare(`SELECT d.*, seller.message_key AS comparison_seller_message_key, seller.text_masked AS comparison_seller_text_masked, seller.sent_at AS comparison_seller_sent_at
         FROM ai_drafts d LEFT JOIN cs_messages seller ON seller.message_key = d.source_seller_message_key
         WHERE d.case_key = ? ORDER BY d.created_at DESC, d.draft_id DESC`).bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM draft_decisions WHERE case_key = ? ORDER BY created_at DESC, decision_id DESC").bind(caseKey).all<Record<string, unknown>>(),
       this.db.prepare("SELECT * FROM review_events WHERE case_key = ? ORDER BY created_at DESC, review_event_id DESC").bind(caseKey).all<Record<string, unknown>>(),
+      this.db.prepare("SELECT * FROM answer_library_entries WHERE case_key = ? ORDER BY updated_at DESC, library_entry_id DESC").bind(caseKey).all<Record<string, unknown>>(),
     ]);
-    return { case: item, summary, messages: messages.results, drafts: drafts.results, decisions: decisions.results, review_events: reviewEvents.results };
+    return { case: item, summary, messages: messages.results, attachments: attachments.results, drafts: drafts.results, decisions: decisions.results, review_events: reviewEvents.results, learning_candidates: learningCandidates.results };
   }
 
   async listTemplates(qualityState?: QualityState): Promise<Record<string, unknown>[]> {
@@ -104,7 +106,7 @@ export class CsDataRepository {
       VALUES (?, ?, 'READ_ONLY', ?, ?, ?, ?, ?, 'RUNNING') ON CONFLICT(run_id) DO NOTHING`).bind(
       input.run_id, input.environment ?? "development", input.started_at, input.finished_at, input.cases.length, input.pii_rejected_count ?? 0, input.error_count ?? 0,
     ).run();
-    if (asNumber(claim.meta.changes) === 0) return { run_id: input.run_id, duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_drafts: 0 };
+    if (asNumber(claim.meta.changes) === 0) return { run_id: input.run_id, duplicate_run: true, inserted_cases: 0, updated_cases: 0, inserted_messages: 0, inserted_attachments: 0, inserted_drafts: 0 };
 
     let insertedCases = 0; let updatedCases = 0;
     for (const item of input.cases) {
@@ -113,6 +115,7 @@ export class CsDataRepository {
       if (exists) updatedCases += 1; else insertedCases += 1;
     }
     const messageResults = input.messages.length ? await this.db.batch(input.messages.map((item) => this.insertMessage(item, input.run_id))) : [];
+    const attachmentResults = input.attachments?.length ? await this.db.batch(input.attachments.map((item) => this.insertAttachment(item, input.run_id))) : [];
     let insertedDrafts = 0;
     for (const item of input.drafts) {
       if (item.created_run_id !== input.run_id) throw new Error("DRAFT_RUN_ID_MISMATCH");
@@ -128,7 +131,7 @@ export class CsDataRepository {
       input.finished_at, input.cases.filter((item) => item.processing_state === "NEW").length, input.cases.filter((item) => item.processing_state === "CHANGED").length,
       input.cases.filter((item) => item.processing_state === "UNCHANGED").length, insertedDrafts, input.run_id,
     ).run();
-    return { run_id: input.run_id, duplicate_run: false, inserted_cases: insertedCases, updated_cases: updatedCases, inserted_messages: messageResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_drafts: insertedDrafts };
+    return { run_id: input.run_id, duplicate_run: false, inserted_cases: insertedCases, updated_cases: updatedCases, inserted_messages: messageResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_attachments: attachmentResults.reduce((total, result) => total + asNumber(result.meta.changes), 0), inserted_drafts: insertedDrafts };
   }
 
   async upsertDraft(input: DraftInput): Promise<{ inserted: boolean }> {
@@ -213,6 +216,12 @@ export class CsDataRepository {
     return { library_entry_id: input.library_entry_id, quality_state: input.quality_state, reviewed: asNumber(result.meta.changes) === 1 };
   }
 
+  async setTemplateState(input: TemplateStateInput): Promise<{ template_id: string; quality_state: "USE" | "EXCLUDE"; updated: boolean }> {
+    const result = await this.db.prepare("UPDATE reply_templates SET quality_state = ?, updated_at = ? WHERE template_id = ?")
+      .bind(input.quality_state, input.updated_at, input.template_id).run();
+    return { template_id: input.template_id, quality_state: input.quality_state, updated: asNumber(result.meta.changes) === 1 };
+  }
+
   async reviewReplyDraft(input: DraftReviewInput): Promise<DraftReviewResult> {
     const draft = await this.db.prepare(`SELECT d.case_key, c.content_hash FROM ai_drafts d
       JOIN cs_cases c ON c.case_key = d.case_key WHERE d.draft_id = ? AND d.purpose = 'REPLY'`).bind(input.draft_id).first<ReviewDraftRow>();
@@ -282,6 +291,18 @@ export class CsDataRepository {
   private insertMessage(item: CsMessageInput, runId: string): D1PreparedStatement {
     return this.db.prepare(`INSERT INTO cs_messages (message_key, case_key, sequence, actor, text_masked, sent_at, has_image, image_count, content_hash, captured_run_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(message_key) DO NOTHING`).bind(item.message_key, item.case_key, item.sequence, item.actor, item.text_masked, item.sent_at, asBoolean(item.has_image), item.image_count, item.content_hash, runId);
+  }
+
+  private insertAttachment(item: CsAttachmentInput, runId: string): D1PreparedStatement {
+    return this.db.prepare(`INSERT INTO cs_message_attachments
+      (attachment_key, message_key, case_key, ordinal, asset_url, thumbnail_url, alt_text_masked, media_type, access_state, captured_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'IMAGE', ?, ?)
+      ON CONFLICT(attachment_key) DO UPDATE SET asset_url = excluded.asset_url, thumbnail_url = excluded.thumbnail_url,
+        alt_text_masked = excluded.alt_text_masked, access_state = excluded.access_state,
+        captured_run_id = excluded.captured_run_id, updated_at = CURRENT_TIMESTAMP`).bind(
+      item.attachment_key, item.message_key, item.case_key, item.ordinal, item.asset_url || null,
+      item.thumbnail_url || null, item.alt_text_masked || null, item.access_state, runId,
+    );
   }
 
   private upsertDraftStatement(item: DraftInput): D1PreparedStatement {

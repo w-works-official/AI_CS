@@ -1,8 +1,8 @@
-import { CsApiError, type CaseListQuery, type CsStore, type JsonObject, type ReviewDraftInput, type ReviewLibraryInput, type SyncRunInput as ApiSyncRunInput, type UpsertDraftInput, type UpsertTemplateInput } from "./cs-api.ts";
+import { CsApiError, type CaseListQuery, type CsStore, type JsonObject, type ReviewDraftInput, type ReviewLibraryInput, type SyncRunInput as ApiSyncRunInput, type UpdateTemplateStateInput, type UpsertDraftInput, type UpsertTemplateInput } from "./cs-api.ts";
 import type { CsDataRepository } from "./cs-data/repository.ts";
-import type { Actor, AnswerLibraryEntryInput, AnswerLibrarySourceType, CaseSummaryInput, CsCaseInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, NoReplyPatternInput, ReplyState, ReplyTemplateInput, SyncRunInput } from "./cs-data/types.ts";
+import type { Actor, AnswerLibraryEntryInput, AnswerLibrarySourceType, CaseSummaryInput, CsAttachmentInput, CsCaseInput, CsMessageInput, DraftDecisionInput, DraftInput, DraftReviewInput, LibraryEntryReviewInput, NoReplyPatternInput, ReplyState, ReplyTemplateInput, SyncRunInput, TemplateStateInput } from "./cs-data/types.ts";
 
-type RepositoryPort = Pick<CsDataRepository, "health" | "overview" | "listCases" | "getCase" | "listTemplates" | "listLibraryEntries" | "syncRun" | "upsertDraft" | "upsertTemplate" | "upsertLibraryEntry" | "reviewLibraryEntry" | "reviewReplyDraft">;
+type RepositoryPort = Pick<CsDataRepository, "health" | "overview" | "listCases" | "getCase" | "listTemplates" | "listLibraryEntries" | "syncRun" | "upsertDraft" | "upsertTemplate" | "upsertLibraryEntry" | "reviewLibraryEntry" | "setTemplateState" | "reviewReplyDraft">;
 
 const CHANNELS: Record<string, { market: string; channel: string; ui_type: "CHAT" | "POST" }> = {
   smartstore_comments: { market: "SMARTSTORE", channel: "문의 관리", ui_type: "POST" },
@@ -14,7 +14,7 @@ const CHANNELS: Record<string, { market: string; channel: string; ui_type: "CHAT
   ably_inquiry: { market: "ABLY", channel: "문의 관리", ui_type: "CHAT" },
 };
 
-const SAFE_URL_SUFFIXES = ["naver.com", "pstatic.net", "kakaostyle.com", "kakaocdn.net", "a-bly.com"];
+const SAFE_URL_SUFFIXES = ["naver.com", "pstatic.net", "kakaostyle.com", "kakaocdn.net", "daumcdn.net", "a-bly.com"];
 const SECRET_URL_KEYS = ["token", "secret", "session", "cookie", "auth", "password", "credential", "signature", "jwt", "apikey", "accesskey", "refreshtoken"];
 const ACTORS = new Set<Actor>(["CUSTOMER", "SELLER", "AUTOMATIC", "SYSTEM", "UNKNOWN"]);
 const REPLY_STATES = new Set<ReplyState>(["NEEDS_REPLY", "ANSWERED", "REVIEW", "NO_REPLY", "NO_REPLY_REQUIRED", "CLOSED"]);
@@ -75,6 +75,10 @@ function safeUrl(value: unknown): string {
   return url.toString();
 }
 
+function safeAssetUrl(value: unknown): string {
+  try { return safeUrl(value); } catch { return ""; }
+}
+
 function assertMaskedRecord(record: JsonObject): void {
   const customer = text(record.customer_masked, 500);
   if (customer && !customer.includes("*")) throw new CsApiError("CUSTOMER_NOT_MASKED", 400);
@@ -89,9 +93,33 @@ function assertNoPlainContact(value: string): void {
   if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)) throw new CsApiError("UNMASKED_EMAIL", 400);
 }
 
-function messageInputs(record: JsonObject, caseKey: string): CsMessageInput[] {
+function messageBundle(record: JsonObject, caseKey: string): { messages: CsMessageInput[]; attachments: CsAttachmentInput[] } {
   const raw = rows(record.messages, 2_000, "INVALID_MESSAGES");
-  return raw.map((message, index) => {
+  const channel = channelFor(record);
+  if (channel.ui_type === "POST" && raw.length === 0) {
+    const preview = text(record.preview, 8_000);
+    if (preview) {
+      raw.push({
+        source_message_id: "post-preview",
+        sequence: 1,
+        actor: "CUSTOMER",
+        at: text(record.occurred_at, 50),
+        text: preview,
+        image_count: 0,
+      });
+    }
+    rows(record.seller_replies, 2_000, "INVALID_SELLER_REPLIES").forEach((reply, index) => {
+      raw.push({
+        source_message_id: text(reply.source_message_id, 300) || `seller-reply-${index + 1}`,
+        sequence: raw.length + 1,
+        actor: "SELLER",
+        at: text(reply.at, 50),
+        text: text(reply.text ?? reply.body, 8_000),
+        image_count: 0,
+      });
+    });
+  }
+  const messages = raw.map((message, index) => {
     const sequence = Number.isInteger(Number(message.sequence)) && Number(message.sequence) > 0 ? Number(message.sequence) : index + 1;
     const actor = actorFor(message);
     const messageText = text(message.text, 8_000);
@@ -111,6 +139,32 @@ function messageInputs(record: JsonObject, caseKey: string): CsMessageInput[] {
       content_hash: contentHash,
     };
   });
+  const attachments: CsAttachmentInput[] = [];
+  raw.forEach((message, messageIndex) => {
+    const messageRow = messages[messageIndex];
+    const images = Array.isArray(message.images) ? message.images.slice(0, 20) : [];
+    images.forEach((value, imageIndex) => {
+      const image = value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+      const assetUrl = safeAssetUrl(image.url ?? image.src);
+      const thumbnailUrl = safeAssetUrl(image.thumbnail_url ?? image.thumbnail ?? image.url ?? image.src);
+      const requestedState = text(image.access_state, 30).toUpperCase();
+      const accessState = assetUrl || thumbnailUrl ? "PUBLIC_URL"
+        : requestedState === "UNAVAILABLE" ? "UNAVAILABLE" : "SESSION_REQUIRED";
+      const ordinal = imageIndex + 1;
+      attachments.push({
+        attachment_key: `ATTACHMENT:${stableToken(`${messageRow.message_key}|${ordinal}`)}`,
+        message_key: messageRow.message_key,
+        case_key: caseKey,
+        ordinal,
+        asset_url: assetUrl,
+        thumbnail_url: thumbnailUrl,
+        alt_text_masked: text(image.alt_text ?? image.alt, 500),
+        media_type: "IMAGE",
+        access_state: accessState,
+      });
+    });
+  });
+  return { messages, attachments };
 }
 
 function publicCase(item: Record<string, unknown>): JsonObject {
@@ -133,9 +187,11 @@ function publicDetail(
     ok: true,
     case: publicCase(detail.case),
     messages: detail.messages.map((message) => ({ ...message, message_text_masked: message.text_masked ?? "" })),
+    attachments: detail.attachments,
     drafts: detail.drafts.map((draft) => ({ ...draft, draft_text: draft.draft_text_masked ?? "", draft_state: draft.state ?? "" })),
     decisions: detail.decisions,
     review_events: detail.review_events,
+    learning_candidates: detail.learning_candidates,
     summary: detail.summary ?? null,
     templates: templates.map((item) => ({
       ...item,
@@ -202,6 +258,7 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
   const seen = new Set<string>();
   const cases: CsCaseInput[] = [];
   const messages: CsMessageInput[] = [];
+  const attachments: CsAttachmentInput[] = [];
   const drafts: DraftInput[] = [];
   for (const record of records) {
     assertMaskedRecord(record);
@@ -211,7 +268,8 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
     if (seen.has(caseKey)) throw new CsApiError("DUPLICATE_SOURCE_KEY", 400);
     seen.add(caseKey);
     const channel = channelFor(record);
-    const caseMessages = messageInputs(record, caseKey);
+    const messageData = messageBundle(record, caseKey);
+    const caseMessages = messageData.messages;
     const replyState = text(record.reply_state, 30).toUpperCase() as ReplyState;
     if (!REPLY_STATES.has(replyState)) throw new CsApiError("INVALID_REPLY_STATE", 400);
     const changeState = text(record.change_state, 30).toUpperCase();
@@ -240,6 +298,7 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
       first_seen_at: collectedAt, last_seen_at: collectedAt,
     });
     messages.push(...caseMessages);
+    attachments.push(...messageData.attachments);
     if (!explicitComplete && text(record.ai_draft, 20_000)) {
       throw new CsApiError("CONVERSATION_INCOMPLETE_DRAFT_FORBIDDEN", 400);
     }
@@ -363,7 +422,7 @@ function repositoryInput(input: ApiSyncRunInput): SyncRunInput {
   });
   return {
     run_id: input.run_id, environment: "development", mode: "READ_ONLY",
-    started_at: collectedAt, finished_at: collectedAt, cases, messages, drafts, decisions,
+    started_at: collectedAt, finished_at: collectedAt, cases, messages, attachments, drafts, decisions,
     case_summaries: caseSummaries, answer_library_entries: answerLibraryEntries, no_reply_patterns: noReplyPatterns,
   };
 }
@@ -445,6 +504,13 @@ export class CsStoreAdapter implements CsStore {
       created_at: createdAt,
     };
     return { ok: true, template_id: template.template_id, ...(await this.repository.upsertTemplate(template)) };
+  }
+
+  async setTemplateState(templateId: string, input: UpdateTemplateStateInput): Promise<JsonObject> {
+    const state: TemplateStateInput = { template_id: templateId, quality_state: input.quality_state, updated_at: this.now() };
+    const result = await this.repository.setTemplateState(state);
+    if (!result.updated) throw new CsApiError("TEMPLATE_NOT_FOUND", 404);
+    return { ok: true, ...result };
   }
 
   async reviewLibraryEntry(entryId: string, input: ReviewLibraryInput): Promise<JsonObject> {

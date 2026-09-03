@@ -171,3 +171,37 @@ test('POST uses the development Worker PATCH review route only with the explicit
     if (previousD1Url === undefined) delete process.env.AI_CS_D1_API_URL; else process.env.AI_CS_D1_API_URL = previousD1Url;
   }
 });
+
+test('POST routes template and learning-library mutations only through the development Worker', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousD1SyncKey = process.env.AI_CS_DEV_D1_SYNC_KEY;
+  const previousD1ReviewEnabled = process.env.AI_CS_ENABLE_D1_REVIEW;
+  const captured: Array<{ path: string; method?: string; body: Record<string, unknown> }> = [];
+  process.env.AI_CS_DEV_D1_SYNC_KEY = 'worker-test-sync-key';
+  process.env.AI_CS_ENABLE_D1_REVIEW = 'true';
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    captured.push({ path: url.pathname, method: init?.method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+    return d1Response({ ok: true });
+  };
+  try {
+    const template = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      action: 'upsertTemplate', template_key: 'delivery', template_version: 'v1', template_name: '배송 안내', template_text: '확인 후 안내드리겠습니다.', required_checks: ['출고일 확인'], quality_state: 'USE', ...safety,
+    }) }));
+    assert.equal(template.status, 200);
+    const disable = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'setTemplateState', template_id: 'TEMPLATE:delivery', quality_state: 'EXCLUDE', ...safety }) }));
+    assert.equal(disable.status, 200);
+    const learn = await POST(request('/api/cs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'reviewLibraryEntry', library_entry_id: 'ANSWER:reviewed', quality_state: 'USE', review_note: '사람 검증 완료', ...safety }) }));
+    assert.equal(learn.status, 200);
+    assert.deepEqual(captured.map(({ path, method }) => ({ path, method })), [
+      { path: '/api/cs/templates', method: 'POST' },
+      { path: '/api/cs/templates/TEMPLATE%3Adelivery', method: 'PATCH' },
+      { path: '/api/cs/library/ANSWER%3Areviewed', method: 'PATCH' },
+    ]);
+    assert.equal(captured.every(({ body }) => body.environment === 'development' && body.auto_send === false && body.marketplace_write_actions === 0), true);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousD1SyncKey === undefined) delete process.env.AI_CS_DEV_D1_SYNC_KEY; else process.env.AI_CS_DEV_D1_SYNC_KEY = previousD1SyncKey;
+    if (previousD1ReviewEnabled === undefined) delete process.env.AI_CS_ENABLE_D1_REVIEW; else process.env.AI_CS_ENABLE_D1_REVIEW = previousD1ReviewEnabled;
+  }
+});
